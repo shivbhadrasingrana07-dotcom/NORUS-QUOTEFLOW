@@ -8,6 +8,7 @@ import {
 } from 'lucide-react';
 import { AwardDecision, Quotation, Rfq, Supplier } from '../types.ts';
 import { formatDateShort, formatMoney, rfqStatusLabel } from '../lib/format.ts';
+import { computeEvaluatedSavings, rankQuotations } from '../lib/ranking.ts';
 
 interface DashboardViewProps {
   rfqs: Rfq[];
@@ -36,16 +37,7 @@ export function DashboardView({
   const quotesPendingReview = quotations.filter((q) => !q.isVerified);
   const pendingApprovals = awards.filter((a) => a.approvalStatus === 'pending');
 
-  // Evaluated savings: sum of (mean quote landed total - lowest L1 landed total) across active/awarded RFQs with >=2 quotes
-  let evaluatedSavings = 0;
-  for (const rfq of rfqs) {
-    const rq = quotations.filter((q) => q.rfqId === rfq.id && q.totalLandedCost > 0);
-    if (rq.length >= 2) {
-      const min = Math.min(...rq.map((q) => q.totalLandedCost));
-      const mean = rq.reduce((s, q) => s + q.totalLandedCost, 0) / rq.length;
-      if (mean > min) evaluatedSavings += mean - min;
-    }
-  }
+  const evaluatedSavings = computeEvaluatedSavings(rfqs, quotations);
 
   const getSupplierName = (id: string) =>
     suppliers.find((s) => s.id === id)?.name || 'Unknown Supplier';

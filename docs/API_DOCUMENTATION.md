@@ -1,106 +1,115 @@
 # API Documentation
 
-All endpoints are served under `/api/*` by `server.ts`.
+All API endpoints are served under `/api/*` by `server.ts`.
+Authenticated endpoints require the `nf_session` `HttpOnly` cookie, and all authenticated `POST`/`PATCH`/`DELETE` requests require the matching `X-CSRF-Token` header.
 
-## Health & Workspace
+## Health & Deprecated Sandbox Routes
 
 ### `GET /api/health`
-Returns server and database readiness without leaking secrets.
-- **200 OK:** `{ "status": "ok", "rfqs": number, "quotations": number, "geminiConfigured": boolean }`
-- **500 Error:** `{ "status": "error", "error": string }`
+Returns server and configuration readiness without leaking secrets or DB error details.
+- **200 OK:** `{ "status": "ok", "database": "postgresql", "storageProvider": "local" | "s3", "emailProvider": "dev_outbox" | "resend", "geminiConfigured": boolean, "googleAuthConfigured": true }`
 
-### `GET /api/workspace`
-Returns the full `WorkspaceState` JSON (`settings`, `suppliers`, `items`, `rfqs`, `quotations`, `awards`, `auditLogs`).
-
----
-
-## Sandbox Persona & Settings
-
-### `POST /api/demo/switch-persona`
-Switches the active demonstration persona in `settings` and records a `DEMO_PERSONA_SWITCHED` audit entry.
-- **Body:** `{ "activeUserRole": "admin" | "buyer" | "approver" | "viewer", "activeUserName"?: string, "activeUserTitle"?: string }`
-- **Responses:** `200 OK` (updated `OrganizationSettings`), `400 Bad Request` (invalid role).
-
-### `PATCH /api/settings`
-Updates organization defaults (`name`, `defaultCurrency`, `taxRegime`, `defaultTaxCreditable`, `activeUserRole`).
-- **RBAC:** Blocked (`403`) for `viewer`.
-- **Responses:** `200 OK`, `400 Bad Request`, `403 Forbidden`.
+### `ALL /api/demo/switch-persona`
+Permanently disabled.
+- **410 Gone:** `{ "error": "Demo persona switching has been disabled. Sign in with an authenticated organization account." }`
 
 ---
 
-## RFQs, Suppliers & Catalog
+## Authentication & Sessions
 
-### `POST /api/rfqs`
-Creates a new RFQ with sequential `RFQ-YYYY-XXXX` numbering and auto-links matching catalog items.
-- **RBAC:** Blocked (`403`) for `viewer`.
-- **Body:** `{ title, currency?, incoterms?, deliveryLocation?, deadlineDate?, items: [{ skuCode?, description, quantity, uom?, targetUnitPrice? }], invitedSupplierIds? }`
-- **Responses:** `201 Created` (`Rfq`), `400 Bad Request`, `403 Forbidden`.
+### `GET /api/auth/me`
+Returns `{ authenticated, user, activeOrganization, organizations, csrfToken, googleAuthEnabled }`. Always returns `200` (`authenticated: false` when signed out).
 
-### `POST /api/rfqs/load-sample`
-Appends a fresh multi-format sample manufacturing RFQ and 3 supplier quotations into the workspace.
-- **RBAC:** Blocked (`403`) for `viewer`.
-- **Responses:** `201 Created`, `403 Forbidden`.
+### `POST /api/auth/register` *(Rate Limited)*
+Creates a password user account, creates a personal organization (or accepts an `inviteToken`), queues a verification email, and sets `nf_session`.
+- **Body:** `{ email, password, fullName, title?, organizationName?, inviteToken? }`
+- **Responses:** `201 Created`, `400 Bad Request` (invalid email or weak password), `403 Forbidden` (invite email mismatch), `409 Conflict` (email exists).
 
-### `POST /api/suppliers`
-Creates a supplier profile with case-insensitive duplicate name/Tax ID protection.
-- **RBAC:** Blocked (`403`) for `viewer`.
-- **Responses:** `201 Created` (`Supplier`), `400 Bad Request`, `403 Forbidden`, `409 Conflict`.
+### `POST /api/auth/login` *(Rate Limited)*
+Verifies email + `scrypt` password hash and sets `nf_session`.
+- **Responses:** `200 OK`, `400 Bad Request`, `401 Unauthorized`, `429 Too Many Requests`.
 
-### `POST /api/items`
-Adds a catalog item to Item Price Memory.
-- **RBAC:** Blocked (`403`) for `viewer`.
-- **Responses:** `201 Created` (`CatalogItem`), `400 Bad Request`, `403 Forbidden`.
+### `POST /api/auth/google` *(Rate Limited)*
+Verifies Firebase Google `idToken` via `firebase-admin` on the server, links/provisions the user, optionally accepts `inviteToken`, and sets `nf_session`.
+- **Body:** `{ idToken, inviteToken? }`
+- **Responses:** `200 OK`, `400 Bad Request`, `401 Unauthorized`, `403 Forbidden` (invite email mismatch).
 
----
+### `POST /api/auth/logout` *(Auth + CSRF)*
+Revokes the active PostgreSQL session row and clears `nf_session`.
 
-## Quotation Ingestion, Editing & Verification
+### `POST /api/auth/verify-email` *(Rate Limited)*
+Validates `{ token }` (`SHA-256` lookup) and marks `emailVerified = true`.
 
-### `POST /api/rfqs/:rfqId/quotes/extract`
-Accepts `multipart/form-data` (`supplierId`, optional `file`, optional `rawEmailText`), validates file magic bytes (`PDF`, `XLSX`, `XLS`, `CSV`, `PNG`, `JPG`, `WEBP`; max 25 MB), extracts structured fields via `geminiExtractor.ts`, computes normalized landed costs, and stores the quotation.
-- **RBAC:** Blocked (`403`) for `viewer`.
-- **Responses:**
-  - `201 Created` (`Quotation`)
-  - `400 Bad Request` (missing supplier/input)
-  - `403 Forbidden`
-  - `404 Not Found` (RFQ missing)
-  - `413 Payload Too Large` (> 25 MB)
-  - `415 Unsupported Media Type` (blocked extension or spoofed magic bytes)
-  - `422 Unprocessable Entity` (empty/corrupt spreadsheet)
-  - `429 Too Many Requests` (Gemini rate limit exhausted)
-  - `502 Bad Gateway` (invalid AI JSON or auth error)
-  - `503 Service Unavailable` (`GEMINI_API_KEY` not configured)
-  - `504 Gateway Timeout` (extraction exceeded 45s timeout)
+### `POST /api/auth/resend-verification` *(Auth + CSRF + Rate Limited)*
+Re-issues a 24-hour verification link via `EmailProvider`.
 
-### `PATCH /api/quotations/:quoteId`
-Updates header commercial terms (`freightCharges`, `packingForwarding`, `otherCharges`, `globalDiscount`, `taxIncludedInRates`, `missingFreightWarning`, `exchangeRateToRfq`, `leadTimeDays`, `paymentTerms`, `quoteReference`, `validUntil`), clears `isVerified`, and recomputes all line landed costs.
-- **RBAC:** Blocked (`403`) for `viewer`.
-- **Responses:** `200 OK` (`Quotation`), `400 Bad Request`, `403 Forbidden`, `404 Not Found`.
+### `POST /api/auth/forgot-password` & `POST /api/auth/reset-password` *(Rate Limited)*
+Issues a 1-hour reset token (generic `200` response prevents email enumeration) and resets password while revoking all existing sessions for that user.
 
-### `PATCH /api/quotations/:quoteId/lines/:lineId`
-Updates a single extracted line (`rfqItemId`, `matchStatus`, `quotedQty`, `quotedUnitRate`, `uomConversionFactor`, `taxRatePct`, `taxCreditable`, `discountAmount`, `lineTotalQuoted`), marks `humanEdited: true`, clears `isVerified`, and recomputes totals.
-- **RBAC:** Blocked (`403`) for `viewer`.
-- **Responses:** `200 OK` (`Quotation`), `400 Bad Request`, `403 Forbidden`, `404 Not Found`.
-
-### `POST /api/quotations/:quoteId/verify`
-Marks a quotation verified (`isVerified: true`, `parseStatus: 'verified'`).
-- **RBAC:** Blocked (`403`) for `viewer`.
-- **Responses:** `200 OK` (`Quotation`), `403 Forbidden`, `404 Not Found`, `422 Unprocessable Entity` (if any line has `mathValid === false`).
-
-### `DELETE /api/quotations/:quoteId`
-Deletes a quotation and cleans up any `pending` award referencing it.
-- **RBAC:** Blocked (`403`) for `viewer`.
-- **Responses:** `200 OK` (`{ ok: true }`), `403 Forbidden`, `404 Not Found`, `409 Conflict` (referenced by an `approved` award).
+### `GET /api/auth/sessions` *(Auth)* & `DELETE /api/auth/sessions/:sessionId` *(Auth + CSRF)*
+Lists active non-revoked sessions and lets the user revoke specific sessions.
 
 ---
 
-## Award Recommendation & Approval
+## Organizations, Memberships & Invitations
 
-### `POST /api/rfqs/:rfqId/award`
-Submits a single-package or split-award recommendation. Server validates every referenced line (`mathValid === true`), recomputes `totalAwardedLanded` from authoritative server records, checks against the verified `L1` benchmark, and requires `nonL1Justification` if total exceeds `L1 + 1`.
-- **RBAC:** Blocked (`403`) for `viewer`.
-- **Responses:** `201 Created` (`AwardDecision`), `400 Bad Request`, `403 Forbidden`, `404 Not Found`, `422 Unprocessable Entity`.
+### `POST /api/organizations` *(Auth + CSRF + Rate Limited)*
+Creates a new organization with the caller as `owner` and switches the active session to it (`201 Created`).
 
-### `POST /api/awards/:awardId/decide`
-Approves or rejects a `pending` award (`decision: "approved" | "rejected"`). Approval sets RFQ status to `'awarded'` and updates `CatalogItem.priceHistory` and `lastAwardedUnitPrice`. Rejection returns RFQ status to `'in_review'`.
-- **RBAC:** Allowed **only** for `approver` or `admin` (`403` for `buyer` or `viewer`).
-- **Responses:** `200 OK` (`{ award, rfq }`), `400 Bad Request`, `403 Forbidden`, `404 Not Found`, `409 Conflict` (already finalized).
+### `POST /api/organizations/switch` *(Auth + CSRF)*
+Switches the active organization for the current session (`403` if the caller is not an active member).
+
+### `GET /api/organizations/current/members` *(Auth + `workspace:read`)*
+Lists active members in the active organization.
+
+### `PATCH /api/organizations/current/members/:userId` & `DELETE /api/organizations/current/members/:userId` *(Auth + CSRF + `org:members:manage`)*
+Updates role or removes member. Enforces `canAssignRole` hierarchy (`admin` cannot promote to or modify `owner`) and rejects demoting/removing the last remaining `owner` (`409 Conflict`).
+
+### `GET /api/organizations/current/invitations`, `POST /api/organizations/current/invitations`, `DELETE /api/organizations/current/invitations/:invitationId` *(Auth + CSRF + `org:members:invite`)*
+Creates 7-day email-bound invitations (`409` if already an active member), lists invitations, or revokes pending invitations.
+
+### `POST /api/invitations/accept` *(Auth + CSRF)*
+Accepts an invitation `{ token }` for an already signed-in user whose account email matches the invitation email (`403` on mismatch).
+
+---
+
+## Tenant-Scoped Procurement Routes
+
+All endpoints below require an authenticated session (`401`), valid `X-CSRF-Token` on mutations (`403`), active organization membership (`403`), and the indicated RBAC permission (`403`). Every read/write is strictly scoped to `activeOrganization.id`.
+
+### `GET /api/workspace` *(`workspace:read`)*
+Returns the active organization's `WorkspaceState` (`settings`, `suppliers`, `items`, `rfqs`, `quotations`, `awards`, `auditLogs`).
+
+### `PATCH /api/settings` *(`org:settings:write` — `owner`, `admin`)*
+Updates organization commercial defaults (`name`, `defaultCurrency`, `taxRegime`, `defaultTaxCreditable`). Does **not** accept client-side role overrides.
+
+### `POST /api/rfqs` & `POST /api/rfqs/load-sample` *(`rfq:write` — `owner`, `admin`, `buyer`)*
+Creates sequential `RFQ-YYYY-XXXX` RFQs (scoped per org) or loads a sample manufacturing RFQ + 3 vendor quotes into the active organization.
+
+### `POST /api/suppliers` *(`supplier:write` — `owner`, `admin`, `buyer`)*
+Creates a supplier profile with per-organization duplicate name/Tax ID protection (`409`).
+
+### `POST /api/items` *(`item:write` — `owner`, `admin`, `buyer`)*
+Adds a catalog item to the organization's Item Price Memory.
+
+### `POST /api/rfqs/:rfqId/quotes/extract` *(`quotation:extract` + `extractRateLimiter`)*
+Accepts `multipart/form-data` (`supplierId`, optional `file`, optional `rawEmailText`), validates file magic bytes (`PDF`, `XLSX`, `XLS`, `CSV`, `PNG`, `JPG`, `WEBP`; max 25 MB), extracts fields via `geminiExtractor.ts`, uploads any binary file to private object storage (`stored_documents` + `documentId`), computes normalized landed costs, and returns `201 Created`.
+
+### `PATCH /api/quotations/:quoteId`, `PATCH /api/quotations/:quoteId/lines/:lineId`, `POST /api/quotations/:quoteId/verify`, `DELETE /api/quotations/:quoteId`
+- Edit requires `quotation:edit`; verify requires `quotation:verify` (blocked with `422` if any line has `mathValid === false`); delete requires `quotation:delete` (blocked with `409` if referenced by an `approved` award, and deletes the private object storage file if unapproved).
+
+### `POST /api/rfqs/:rfqId/award` *(`award:recommend` — `owner`, `admin`, `buyer`)*
+Submits single or split-award recommendation after validating all allocations belong to the organization & RFQ and checking `nonL1Justification` against verified `L1`.
+
+### `POST /api/awards/:awardId/decide` *(`award:decide` — `owner`, `admin`, `approver`)*
+Approves or rejects a `pending` award (`403` for `buyer` or `viewer`). Approval updates RFQ status to `'awarded'` and records `price_history` + `catalog_items.last_awarded_unit_price`.
+
+---
+
+## Private Document Access
+
+### `GET /api/documents/:docId/signed-url` *(Auth + `document:download`)*
+Verifies document belongs to `activeOrganization.id` (`404` otherwise) and returns `{ url, expiresAt, mimeType, originalFilename }` (300s TTL).
+
+### `GET /api/documents/:docId/content`
+Serves the private document binary (`Cache-Control: private, no-store`, `X-Content-Type-Options: nosniff`) using either a valid unexpired HMAC-signed token (`?org=...&exp=...&sig=...`) OR an authenticated org session with `document:download` (`403`/`404` on invalid signature or cross-tenant access).

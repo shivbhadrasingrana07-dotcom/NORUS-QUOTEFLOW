@@ -6,3 +6,6 @@ coverage/
 *.log
 .env*
 !.env.example
+data/private-storage/
+data/backups/
+data/*.corrupt.*.bak

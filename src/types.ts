@@ -1,4 +1,4 @@
-export type UserRole = 'admin' | 'buyer' | 'approver' | 'viewer';
+export type UserRole = 'owner' | 'admin' | 'buyer' | 'approver' | 'viewer';
 
 export type TaxRegime = 'INDIA_GST' | 'UK_VAT' | 'US_TAX' | 'NONE';
 
@@ -25,6 +25,7 @@ export type CostBasis = 'base' | 'landed' | 'gross';
 
 export interface OrganizationSettings {
   id: string;
+  slug?: string;
   name: string;
   countryCode: string;
   defaultCurrency: 'INR' | 'USD' | 'GBP' | 'EUR';
@@ -34,6 +35,69 @@ export interface OrganizationSettings {
   activeUserName: string;
   activeUserTitle: string;
   activeUserRole: UserRole;
+}
+
+export interface AuthUser {
+  id: string;
+  email: string;
+  fullName: string;
+  title: string;
+  emailVerified: boolean;
+  hasPassword: boolean;
+  hasGoogleLinked: boolean;
+}
+
+export interface OrganizationSummary {
+  id: string;
+  slug: string;
+  name: string;
+  countryCode: string;
+  defaultCurrency: 'INR' | 'USD' | 'GBP' | 'EUR';
+  taxRegime: TaxRegime;
+  defaultTaxCreditable: boolean;
+  role: UserRole;
+}
+
+export interface OrganizationMember {
+  membershipId: string;
+  userId: string;
+  email: string;
+  fullName: string;
+  title: string;
+  role: UserRole;
+  status: 'active' | 'suspended';
+  emailVerified: boolean;
+  createdAt: string;
+}
+
+export interface OrganizationInvitation {
+  id: string;
+  organizationId: string;
+  email: string;
+  role: UserRole;
+  status: 'pending' | 'accepted' | 'revoked' | 'expired';
+  expiresAt: string;
+  createdAt: string;
+}
+
+export interface SessionInfo {
+  id: string;
+  authMethod: string;
+  ipAddress: string | null;
+  userAgent: string | null;
+  expiresAt: string;
+  lastSeenAt: string;
+  createdAt: string;
+  isCurrent: boolean;
+}
+
+export interface AuthStatePayload {
+  authenticated: boolean;
+  user: AuthUser | null;
+  activeOrganization: OrganizationSummary | null;
+  organizations: OrganizationSummary[];
+  csrfToken: string | null;
+  googleAuthEnabled: boolean;
 }
 
 export interface Supplier {
@@ -142,6 +206,7 @@ export interface Quotation {
   id: string;
   rfqId: string;
   supplierId: string;
+  documentId?: string | null;
   documentName: string;
   documentKind: 'pdf' | 'excel' | 'image' | 'email';
   mimeType: string;
@@ -206,7 +271,16 @@ export interface AuditLogEntry {
   id: string;
   actorName: string;
   actorRole: UserRole;
-  entityType: 'rfq' | 'quotation' | 'quotation_line' | 'award' | 'supplier' | 'settings';
+  entityType:
+    | 'rfq'
+    | 'quotation'
+    | 'quotation_line'
+    | 'award'
+    | 'supplier'
+    | 'settings'
+    | 'auth'
+    | 'membership'
+    | 'document';
   entityId: string;
   action: string;
   detail: string;

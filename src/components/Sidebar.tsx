@@ -6,42 +6,56 @@ import {
   FolderKanban,
   History,
   LayoutDashboard,
+  LogOut,
   Menu,
   Package,
   Settings,
+  Users,
   X,
 } from 'lucide-react';
-import { OrganizationSettings, UserRole } from '../types.ts';
+import {
+  AuthUser,
+  OrganizationSettings,
+  OrganizationSummary,
+} from '../types.ts';
 
-export type NavSection = 'dashboard' | 'rfqs' | 'suppliers' | 'items' | 'reports' | 'settings';
+export type NavSection =
+  | 'dashboard'
+  | 'rfqs'
+  | 'suppliers'
+  | 'items'
+  | 'reports'
+  | 'organization'
+  | 'settings';
 
 interface SidebarProps {
   activeSection: NavSection;
   onNavigate: (section: NavSection) => void;
   settings: OrganizationSettings;
+  user: AuthUser;
+  activeOrganization: OrganizationSummary;
+  organizations: OrganizationSummary[];
   pendingReviewCount: number;
   pendingApprovalCount: number;
-  onRoleSwitch: (role: UserRole, userName: string, title: string) => void;
+  onSwitchOrganization: (orgId: string) => Promise<void>;
+  onSignOut: () => Promise<void>;
 }
-
-const ROLE_PRESETS: Array<{ role: UserRole; name: string; title: string }> = [
-  { role: 'buyer', name: 'Priya Sharma', title: 'Senior Purchase Executive' },
-  { role: 'approver', name: 'Rakesh Verma', title: 'Managing Director (Approver)' },
-  { role: 'admin', name: 'Priya Sharma', title: 'Workspace Admin' },
-  { role: 'viewer', name: 'Neha Kulkarni', title: 'Finance Viewer' },
-];
 
 export function Sidebar({
   activeSection,
   onNavigate,
   settings,
+  user,
+  activeOrganization,
+  organizations,
   pendingReviewCount,
   pendingApprovalCount,
-  onRoleSwitch,
+  onSwitchOrganization,
+  onSignOut,
 }: SidebarProps) {
   const [mobileOpen, setMobileOpen] = useState(false);
-  const [imgFailed, setImgFailed] = useState(false);
-  const [roleMenuOpen, setRoleMenuOpen] = useState(false);
+  const [orgMenuOpen, setOrgMenuOpen] = useState(false);
+  const [switching, setSwitching] = useState(false);
 
   const navItems: Array<{
     id: NavSection;
@@ -59,16 +73,86 @@ export function Sidebar({
     { id: 'suppliers', label: 'Suppliers', icon: Building2 },
     { id: 'items', label: 'Item Price Memory', icon: Package },
     { id: 'reports', label: 'CS Archive & Audit', icon: FileSpreadsheet },
+    { id: 'organization', label: 'Team & Organizations', icon: Users },
     { id: 'settings', label: 'Settings', icon: Settings },
   ];
 
+  const handleSelectOrg = async (orgId: string) => {
+    setOrgMenuOpen(false);
+    if (orgId === activeOrganization.id || switching) return;
+    try {
+      setSwitching(true);
+      await onSwitchOrganization(orgId);
+    } finally {
+      setSwitching(false);
+    }
+  };
+
+  const initials = user.fullName
+    .split(' ')
+    .filter(Boolean)
+    .map((n) => n[0])
+    .join('')
+    .slice(0, 2)
+    .toUpperCase();
+
   const renderNavContent = () => (
     <div className="flex flex-col h-full bg-white border-r border-[#E2E8F0]">
-      <div className="px-5 py-4 border-b border-[#E2E8F0]">
+      <div className="px-4 py-4 border-b border-[#E2E8F0] relative">
         <div className="font-display text-base font-bold tracking-tight text-[#0F172A] whitespace-nowrap">
           NORUS QUOTEFLOW
         </div>
-        <div className="text-xs text-[#475569] mt-0.5 truncate">{settings.name}</div>
+        <button
+          type="button"
+          onClick={() => setOrgMenuOpen((v) => !v)}
+          className="mt-2 w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-md bg-[#F8FAFC] border border-[#E2E8F0] hover:bg-slate-100 text-left transition-colors"
+        >
+          <div className="min-w-0">
+            <div className="text-xs font-medium text-[#0F172A] truncate">
+              {activeOrganization.name}
+            </div>
+            <div className="text-[11px] font-mono text-[#475569]">
+              {activeOrganization.defaultCurrency} · {activeOrganization.role.toUpperCase()}
+            </div>
+          </div>
+          <ChevronDown className="w-3.5 h-3.5 text-[#475569] shrink-0" />
+        </button>
+
+        {orgMenuOpen && (
+          <div className="absolute left-3 right-3 top-[92px] bg-white border border-[#E2E8F0] rounded-lg shadow-lg p-1.5 z-40">
+            <div className="px-2 py-1 text-[11px] font-medium text-[#475569]">
+              Switch Organization
+            </div>
+            {organizations.map((org) => (
+              <button
+                key={org.id}
+                type="button"
+                onClick={() => handleSelectOrg(org.id)}
+                className={`w-full text-left px-2.5 py-2 rounded-md text-xs transition-colors ${
+                  org.id === activeOrganization.id
+                    ? 'bg-[#0F4C81]/10 text-[#0F4C81] font-medium'
+                    : 'text-[#0F172A] hover:bg-[#F8FAFC]'
+                }`}
+              >
+                <div className="truncate">{org.name}</div>
+                <div className="text-[11px] text-[#475569] font-mono">
+                  {org.role} · {org.defaultCurrency}
+                </div>
+              </button>
+            ))}
+            <button
+              type="button"
+              onClick={() => {
+                setOrgMenuOpen(false);
+                onNavigate('organization');
+                setMobileOpen(false);
+              }}
+              className="w-full text-left px-2.5 py-2 mt-1 border-t border-[#E2E8F0] text-xs font-medium text-[#0F4C81] hover:bg-[#F8FAFC]"
+            >
+              + Create or Manage Organizations
+            </button>
+          </div>
+        )}
       </div>
 
       <nav className="flex-1 px-3 py-4 space-y-1">
@@ -102,71 +186,34 @@ export function Sidebar({
         })}
       </nav>
 
-      <div className="p-3 border-t border-[#E2E8F0] relative">
-        <button
-          onClick={() => setRoleMenuOpen((v) => !v)}
-          className="w-full flex items-center gap-3 p-2 rounded-lg hover:bg-[#F8FAFC] transition-colors text-left"
-          title="Switch active persona to test Buyer vs MD Approver permissions"
-        >
-          {!imgFailed ? (
-            <img
-              src="/src/assets/images/avatar_buyer_priya_1795293597100.jpg"
-              alt={settings.activeUserName}
-              referrerPolicy="no-referrer"
-              onError={() => setImgFailed(true)}
-              className="w-9 h-9 rounded-lg object-cover shrink-0 border border-[#E2E8F0]"
-            />
-          ) : (
-            <div className="w-9 h-9 rounded-lg bg-[#0F4C81] text-white flex items-center justify-center text-xs font-semibold shrink-0">
-              {settings.activeUserName
-                .split(' ')
-                .map((n) => n[0])
-                .join('')
-                .slice(0, 2)}
-            </div>
-          )}
+      <div className="p-3 border-t border-[#E2E8F0] space-y-2">
+        <div className="flex items-center gap-2.5 px-2 py-1.5">
+          <div className="w-8 h-8 rounded-lg bg-[#0F4C81] text-white flex items-center justify-center text-xs font-semibold shrink-0">
+            {initials || 'NQ'}
+          </div>
           <div className="min-w-0 flex-1">
-            <div className="text-sm font-medium text-[#0F172A] truncate">
-              {settings.activeUserName}
-            </div>
-            <div className="text-xs text-[#475569] truncate">
+            <div className="text-xs font-semibold text-[#0F172A] truncate">{user.fullName}</div>
+            <div className="text-[11px] text-[#475569] truncate">{user.email}</div>
+            <div className="text-[10px] font-mono text-[#0F4C81] mt-0.5">
               {settings.activeUserRole.toUpperCase()} · {settings.taxRegime.replace('_', ' ')}
             </div>
           </div>
-          <ChevronDown className="w-4 h-4 text-[#475569] shrink-0" />
+        </div>
+        <button
+          type="button"
+          onClick={onSignOut}
+          className="w-full flex items-center justify-center gap-2 px-3 py-1.5 text-xs font-medium text-[#475569] hover:text-[#DC2626] hover:bg-[#FEF2F2] rounded-md border border-[#E2E8F0] transition-colors"
+        >
+          <LogOut className="w-3.5 h-3.5" />
+          <span>Sign Out</span>
         </button>
-
-        {roleMenuOpen && (
-          <div className="absolute bottom-16 left-3 right-3 bg-white border border-[#E2E8F0] rounded-lg shadow-lg p-1.5 z-40">
-            <div className="px-2 py-1 text-[11px] font-medium text-[#475569]">
-              Demo Persona (Sandbox RBAC)
-            </div>
-            {ROLE_PRESETS.map((preset) => (
-              <button
-                key={preset.role}
-                onClick={() => {
-                  onRoleSwitch(preset.role, preset.name, preset.title);
-                  setRoleMenuOpen(false);
-                }}
-                className={`w-full text-left px-2.5 py-2 rounded-md text-xs transition-colors ${
-                  settings.activeUserRole === preset.role
-                    ? 'bg-[#0F4C81]/10 text-[#0F4C81] font-medium'
-                    : 'text-[#0F172A] hover:bg-[#F8FAFC]'
-                }`}
-              >
-                <div>{preset.name}</div>
-                <div className="text-[11px] text-[#475569]">{preset.title}</div>
-              </button>
-            ))}
-          </div>
-        )}
       </div>
     </div>
   );
 
   return (
     <>
-      <div className="hidden lg:block w-[240px] shrink-0 h-screen sticky top-0">
+      <div className="hidden lg:block w-[248px] shrink-0 h-screen sticky top-0">
         {renderNavContent()}
       </div>
 
@@ -201,10 +248,7 @@ export function Sidebar({
             </button>
             {renderNavContent()}
           </div>
-          <div
-            className="flex-1 bg-slate-900/40"
-            onClick={() => setMobileOpen(false)}
-          />
+          <div className="flex-1 bg-slate-900/40" onClick={() => setMobileOpen(false)} />
         </div>
       )}
     </>

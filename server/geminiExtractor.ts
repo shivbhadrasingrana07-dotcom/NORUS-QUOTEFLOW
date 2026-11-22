@@ -509,6 +509,7 @@ export interface ExtractQuoteInput {
   mimeType: string;
   fileBuffer?: Buffer;
   rawEmailText?: string;
+  skipInlineDataUrl?: boolean;
   generateContentOverride?: GenerateContentFn;
   timeoutMs?: number;
 }
@@ -522,6 +523,7 @@ export async function extractQuotationWithGemini(input: ExtractQuoteInput): Prom
     mimeType,
     fileBuffer,
     rawEmailText,
+    skipInlineDataUrl = false,
     generateContentOverride,
     timeoutMs = 45000,
   } = input;
@@ -688,7 +690,7 @@ Instructions:
   const parsed = parseAndValidateAiJson(response.text);
 
   let fileDataUrl: string | undefined;
-  if ((isImage || isPdf) && fileBuffer && fileBuffer.byteLength <= 4 * 1024 * 1024) {
+  if (!skipInlineDataUrl && (isImage || isPdf) && fileBuffer && fileBuffer.byteLength <= 4 * 1024 * 1024) {
     fileDataUrl = `data:${isPdf ? 'application/pdf' : mimeType};base64,${fileBuffer.toString('base64')}`;
   }
 

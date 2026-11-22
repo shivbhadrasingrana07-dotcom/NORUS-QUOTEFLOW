@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useState } from 'react';
-import { NavSection, Sidebar } from './components/Sidebar.tsx';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { AuthView } from './components/AuthView.tsx';
 import { DashboardView } from './components/DashboardView.tsx';
+import { OrganizationView } from './components/OrganizationView.tsx';
 import { RfqCreateModal } from './components/RfqCreateModal.tsx';
 import { RfqTab, RfqWorkspace } from './components/RfqWorkspace.tsx';
 import {
@@ -10,25 +11,47 @@ import {
   SettingsView,
   SuppliersView,
 } from './components/SecondaryViews.tsx';
+import { NavSection, Sidebar } from './components/Sidebar.tsx';
 import {
+  AuthStatePayload,
   AwardAllocation,
   OrganizationSettings,
   Quotation,
   QuotationLine,
-  UserRole,
   WorkspaceState,
 } from './types.ts';
 
-async function apiJson<T>(url: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(url, options);
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(data.error || `Request failed (${res.status})`);
+function readCookie(name: string): string | null {
+  const parts = document.cookie.split(';');
+  for (const part of parts) {
+    const eq = part.indexOf('=');
+    if (eq === -1) continue;
+    const k = part.slice(0, eq).trim();
+    if (k === name) {
+      try {
+        return decodeURIComponent(part.slice(eq + 1).trim());
+      } catch {
+        return part.slice(eq + 1).trim();
+      }
+    }
   }
-  return data as T;
+  return null;
+}
+
+function getInitialUrlTokens() {
+  const params = new URLSearchParams(window.location.search);
+  return {
+    invite: params.get('invite'),
+    verify: params.get('verify'),
+    reset: params.get('reset'),
+  };
 }
 
 export default function App() {
+  const [urlTokens, setUrlTokens] = useState(getInitialUrlTokens);
+  const [authState, setAuthState] = useState<AuthStatePayload | null>(null);
+  const csrfTokenRef = useRef<string | null>(null);
+
   const [workspace, setWorkspace] = useState<WorkspaceState | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -41,21 +64,134 @@ export default function App() {
   const [createModalOpen, setCreateModalOpen] = useState(false);
   const [loadingSample, setLoadingSample] = useState(false);
 
-  const refreshWorkspace = useCallback(async () => {
+  const clearUrlParams = useCallback(() => {
+    if (window.location.search) {
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
+    setUrlTokens({ invite: null, verify: null, reset: null });
+  }, []);
+
+  const apiJson = useCallback(async <T,>(url: string, options?: RequestInit): Promise<T> => {
+    const method = (options?.method || 'GET').toUpperCase();
+    const headers = new Headers(options?.headers || {});
+    if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
+      const csrf = csrfTokenRef.current || readCookie('nf_csrf');
+      if (csrf && !headers.has('X-CSRF-Token')) {
+        headers.set('X-CSRF-Token', csrf);
+      }
+    }
+    const res = await fetch(url, {
+      ...options,
+      headers,
+      credentials: 'include',
+    });
+    const data = await res.json();
+    if (res.status === 401) {
+      csrfTokenRef.current = null;
+      setAuthState({
+        authenticated: false,
+        user: null,
+        activeOrganization: null,
+        organizations: [],
+        csrfToken: null,
+        googleAuthEnabled: true,
+      });
+      setWorkspace(null);
+      throw new Error(data.error || 'Session expired. Please sign in again.');
+    }
+    if (!res.ok) {
+      throw new Error(data.error || `Request failed (${res.status})`);
+    }
+    return data as T;
+  }, []);
+
+  const refreshAll = useCallback(async () => {
     try {
-      const data = await apiJson<WorkspaceState>('/api/workspace');
-      setWorkspace(data);
+      const me = await apiJson<AuthStatePayload>('/api/auth/me');
+      csrfTokenRef.current = me.csrfToken;
+      setAuthState(me);
+
+      if (!me.authenticated) {
+        setWorkspace(null);
+        setLoadError(null);
+        return;
+      }
+
+      // Auto-accept invite link if signed-in user opens an ?invite=... link
+      if (urlTokens.invite && me.csrfToken) {
+        try {
+          await fetch('/api/invitations/accept', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-CSRF-Token': me.csrfToken,
+            },
+            credentials: 'include',
+            body: JSON.stringify({ token: urlTokens.invite }),
+          });
+          clearUrlParams();
+          const updatedMe = await apiJson<AuthStatePayload>('/api/auth/me');
+          csrfTokenRef.current = updatedMe.csrfToken;
+          setAuthState(updatedMe);
+        } catch {
+          // Non-fatal: user can also manage orgs directly
+        }
+      }
+
+      if (me.activeOrganization) {
+        const ws = await apiJson<WorkspaceState>('/api/workspace');
+        setWorkspace(ws);
+      } else {
+        setWorkspace(null);
+      }
       setLoadError(null);
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : 'Failed to load workspace');
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [apiJson, clearUrlParams, urlTokens.invite]);
 
   useEffect(() => {
-    refreshWorkspace();
-  }, [refreshWorkspace]);
+    refreshAll();
+  }, [refreshAll]);
+
+  const handleAuthenticated = async (payload: AuthStatePayload) => {
+    csrfTokenRef.current = payload.csrfToken;
+    setAuthState(payload);
+    setActiveSection('dashboard');
+    setActiveRfqId(null);
+    await refreshAll();
+  };
+
+  const handleSignOut = async () => {
+    try {
+      await apiJson('/api/auth/logout', { method: 'POST' });
+    } catch {
+      // Clear local state regardless
+    }
+    csrfTokenRef.current = null;
+    setWorkspace(null);
+    setAuthState({
+      authenticated: false,
+      user: null,
+      activeOrganization: null,
+      organizations: [],
+      csrfToken: null,
+      googleAuthEnabled: true,
+    });
+  };
+
+  const handleSwitchOrganization = async (organizationId: string) => {
+    await apiJson('/api/organizations/switch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ organizationId }),
+    });
+    setActiveRfqId(null);
+    setSelectedQuoteId(null);
+    await refreshAll();
+  };
 
   const handleOpenRfq = (rfqId: string, tab: RfqTab = 'compare', quoteId?: string) => {
     setActiveRfqId(rfqId);
@@ -70,20 +206,11 @@ export default function App() {
       const result = await apiJson<{ rfq: { id: string } }>('/api/rfqs/load-sample', {
         method: 'POST',
       });
-      await refreshWorkspace();
+      await refreshAll();
       handleOpenRfq(result.rfq.id, 'compare');
     } finally {
       setLoadingSample(false);
     }
-  };
-
-  const handleRoleSwitch = async (role: UserRole, activeUserName: string, activeUserTitle: string) => {
-    await apiJson('/api/demo/switch-persona', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ activeUserRole: role, activeUserName, activeUserTitle }),
-    });
-    await refreshWorkspace();
   };
 
   const handleSaveSettings = async (patch: Partial<OrganizationSettings>) => {
@@ -92,7 +219,7 @@ export default function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(patch),
     });
-    await refreshWorkspace();
+    await refreshAll();
   };
 
   const handleCreateRfq = async (payload: {
@@ -115,7 +242,7 @@ export default function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
-    await refreshWorkspace();
+    await refreshAll();
     handleOpenRfq(created.id, 'upload');
   };
 
@@ -134,7 +261,7 @@ export default function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
-    await refreshWorkspace();
+    await refreshAll();
   };
 
   const handleExtractQuote = async (params: {
@@ -152,7 +279,7 @@ export default function App() {
       method: 'POST',
       body: formData,
     });
-    await refreshWorkspace();
+    await refreshAll();
     return created;
   };
 
@@ -162,7 +289,7 @@ export default function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(patch),
     });
-    await refreshWorkspace();
+    await refreshAll();
   };
 
   const handleUpdateLine = async (
@@ -175,17 +302,17 @@ export default function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(patch),
     });
-    await refreshWorkspace();
+    await refreshAll();
   };
 
   const handleVerifyQuote = async (quoteId: string) => {
     await apiJson(`/api/quotations/${quoteId}/verify`, { method: 'POST' });
-    await refreshWorkspace();
+    await refreshAll();
   };
 
   const handleDeleteQuote = async (quoteId: string) => {
     await apiJson(`/api/quotations/${quoteId}`, { method: 'DELETE' });
-    await refreshWorkspace();
+    await refreshAll();
   };
 
   const handleSubmitAward = async (params: {
@@ -201,7 +328,7 @@ export default function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(params),
     });
-    await refreshWorkspace();
+    await refreshAll();
   };
 
   const handleDecideAward = async (
@@ -214,7 +341,7 @@ export default function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ decision, approverNotes }),
     });
-    await refreshWorkspace();
+    await refreshAll();
   };
 
   if (loading) {
@@ -229,20 +356,63 @@ export default function App() {
     );
   }
 
+  if (!authState?.authenticated || !authState.user) {
+    return (
+      <AuthView
+        initialInviteToken={urlTokens.invite}
+        initialVerifyToken={urlTokens.verify}
+        initialResetToken={urlTokens.reset}
+        onAuthenticated={handleAuthenticated}
+        onClearUrlParams={clearUrlParams}
+      />
+    );
+  }
+
+  if (!authState.activeOrganization) {
+    return (
+      <div className="min-h-screen bg-[#F8FAFC] p-6">
+        <div className="max-w-4xl mx-auto space-y-4">
+          <div className="flex items-center justify-between">
+            <div className="font-display text-lg font-bold text-[#0F172A]">NORUS QUOTEFLOW</div>
+            <button
+              onClick={handleSignOut}
+              className="px-3 py-1.5 text-xs font-medium text-[#475569] bg-white border border-[#E2E8F0] rounded-md"
+            >
+              Sign Out
+            </button>
+          </div>
+          <OrganizationView
+            user={authState.user}
+            activeOrganization={null}
+            organizations={authState.organizations}
+            onApiJson={apiJson}
+            onRefreshAuthAndWorkspace={refreshAll}
+          />
+        </div>
+      </div>
+    );
+  }
+
   if (loadError || !workspace) {
     return (
       <div className="min-h-screen bg-[#F8FAFC] flex items-center justify-center p-6">
         <div className="bg-white border border-[#E2E8F0] rounded-lg p-6 max-w-md space-y-3">
-          <div className="text-sm font-semibold text-[#DC2626]">
-            Unable to load workspace
-          </div>
+          <div className="text-sm font-semibold text-[#DC2626]">Unable to load workspace</div>
           <p className="text-xs text-[#475569]">{loadError || 'Unknown error'}</p>
-          <button
-            onClick={refreshWorkspace}
-            className="px-4 py-2 text-xs font-medium text-white bg-[#0F4C81] rounded-md"
-          >
-            Retry
-          </button>
+          <div className="flex gap-2">
+            <button
+              onClick={refreshAll}
+              className="px-4 py-2 text-xs font-medium text-white bg-[#0F4C81] rounded-md"
+            >
+              Retry
+            </button>
+            <button
+              onClick={handleSignOut}
+              className="px-4 py-2 text-xs font-medium text-[#475569] border border-[#E2E8F0] rounded-md"
+            >
+              Sign Out
+            </button>
+          </div>
         </div>
       </div>
     );
@@ -270,9 +440,13 @@ export default function App() {
           }
         }}
         settings={workspace.settings}
+        user={authState.user}
+        activeOrganization={authState.activeOrganization}
+        organizations={authState.organizations}
         pendingReviewCount={pendingReviewCount}
         pendingApprovalCount={pendingApprovalCount}
-        onRoleSwitch={handleRoleSwitch}
+        onSwitchOrganization={handleSwitchOrganization}
+        onSignOut={handleSignOut}
       />
 
       <main className="flex-1 min-w-0 pt-16 lg:pt-0">
@@ -346,6 +520,16 @@ export default function App() {
               rfqs={workspace.rfqs}
               auditLogs={workspace.auditLogs}
               onOpenRfq={(rfqId) => handleOpenRfq(rfqId, 'approval')}
+            />
+          )}
+
+          {activeSection === 'organization' && (
+            <OrganizationView
+              user={authState.user}
+              activeOrganization={authState.activeOrganization}
+              organizations={authState.organizations}
+              onApiJson={apiJson}
+              onRefreshAuthAndWorkspace={refreshAll}
             />
           )}
 

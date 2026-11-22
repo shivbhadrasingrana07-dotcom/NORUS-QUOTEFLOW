@@ -1,15 +1,19 @@
-# Next Task — Production Authentication, Multi-Tenancy & PostgreSQL Persistence
+# Next Task — Production Secrets, Live Gemini Calibration & Post-MVP Enhancements
 
-## Objective
-Upgrade NORUS QUOTEFLOW from a single-workspace sandbox demo to a multi-tenant, authenticated production platform without regressing existing extraction, normalization, or comparative export capabilities.
+## Completed in Task 003
+- Cloud SQL PostgreSQL (`asia-southeast1`) schema pushed and legacy workspace migrated (`npm run db:migrate -- --apply`).
+- Dual real authentication (Email/Password + Firebase Google Sign-In), PostgreSQL revocable sessions, CSRF, CORS, and rate limiting implemented and verified.
+- Multi-organization isolation, 5-role RBAC, team invitations, and private object storage (`S3CompatibleStorageProvider` + `LocalPrivateStorageProvider`) verified.
 
-## Scope & Concrete Deliverables
-1. **Real Authentication & Session Verification:**
-   - Replace the sandbox `POST /api/demo/switch-persona` switcher with real user authentication (e.g., Firebase Auth or signed HTTP-only session/JWT tokens) and server-side user lookup per request.
-   - Remove client-modifiable `activeUserRole` from `PATCH /api/settings`; manage workspace memberships and roles via dedicated admin-only endpoints.
-2. **PostgreSQL + Object Storage Migration:**
-   - Migrate `server/db.ts` from single-file JSON (`data/quoteflow-db.json`) to transactional PostgreSQL (tenant-scoped schema with foreign keys on `organization_id`, `rfqs`, `quotations`, `quotation_lines`, `awards`, `audit_logs`).
-   - Move uploaded quotation PDFs/images out of inline `fileDataUrl` strings into authenticated private object storage (S3/GCS) with signed short-lived preview URLs.
-3. **API Rate Limiting & Live Gemini Calibration:**
-   - Add per-user/IP rate limiting on `/api/rfqs/:rfqId/quotes/extract` and `/api/rfqs/*` mutations.
-   - Run the gated live Gemini extraction test suite against real vendor PDF/Excel/image/WhatsApp samples using a provisioned `GEMINI_API_KEY`.
+## Recommended Next Priorities
+
+1. **Provision Production Runtime Secrets & External Providers:**
+   - Set a strong random `SESSION_SECRET`, live `GEMINI_API_KEY`, `RESEND_API_KEY` + verified `EMAIL_FROM` domain, and `STORAGE_PROVIDER=s3` credentials (Cloudflare R2 or AWS S3 private bucket) before public launch.
+   - Verify `npm test` with `GEMINI_API_KEY` configured so the live Gemini extraction smoke test executes alongside offline tests.
+2. **Operational Hardening & Cleanup Jobs:**
+   - Add a scheduled cleanup task for expired `sessions`, expired/accepted `invitations`, and stale `rate_limit_buckets`.
+   - Enable automated Cloud SQL point-in-time recovery (PITR) and S3 lifecycle retention policies on the production bucket.
+3. **Pre-PO Domain Expansion (Customer Pilot Feedback):**
+   - Multi-round revised quotation comparison (`Rev 1` vs. `Rev 2` negotiation deltas) linked to the same supplier/RFQ.
+   - Email/WhatsApp inbound forwarding webhook to route supplier replies directly into an RFQ's pending extraction queue.
+   - Organization-customizable approval thresholds (e.g., dual approval required above configurable spend limits).

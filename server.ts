@@ -1,975 +1,1180 @@
 import 'dotenv/config';
+import crypto from 'crypto';
 import express, { NextFunction, Request, Response } from 'express';
 import multer from 'multer';
 import path from 'path';
 import { pathToFileURL } from 'url';
 import { createServer as createViteServer } from 'vite';
-import { loadWorkspace, mutateWorkspace } from './server/db.ts';
+import { db as defaultDb, type DrizzleDb, isSqlEnvConfigured } from './src/db/index.ts';
+import { createEmailProvider, type EmailProvider } from './server/emailService.ts';
 import { validateUploadedFile } from './server/fileSecurity.ts';
+import {
+  verifyFirebaseIdToken,
+  type FirebaseTokenVerifier,
+  type VerifiedFirebaseUser,
+} from './server/firebase-admin.ts';
 import {
   ExtractionServiceError,
   extractQuotationWithGemini,
-  GenerateContentFn,
+  type GenerateContentFn,
 } from './server/geminiExtractor.ts';
-import { recomputeQuotation } from './server/normalization.ts';
-import { createSampleRfqAndQuotes } from './server/seedData.ts';
-import { rankQuotations } from './src/lib/ranking.ts';
 import {
-  AuditLogEntry,
-  AwardAllocation,
-  AwardDecision,
-  CatalogItem,
-  Quotation,
-  Rfq,
-  Supplier,
-  UserRole,
-} from './src/types.ts';
+  buildDocumentStorageKey,
+  createObjectStorageProvider,
+  type ObjectStorageProvider,
+  verifySignedDocumentToken,
+} from './server/objectStorage.ts';
+import { PgDataStore, type SessionAuthContext, StoreError } from './server/pgStore.ts';
+import {
+  createRateLimitMiddleware,
+  getClientIp,
+  MemoryRateLimitStore,
+  PostgresRateLimitStore,
+  type RateLimitStore,
+} from './server/rateLimiter.ts';
+import { hasPermission, type Permission } from './server/rbac.ts';
+import {
+  clearAuthCookies,
+  getSigningSecret,
+  parseCookies,
+  redactSensitiveText,
+  SESSION_COOKIE_NAME,
+  setAuthCookies,
+} from './server/security.ts';
 
-function addAudit(
-  state: ReturnType<typeof loadWorkspace>,
-  entry: Omit<AuditLogEntry, 'id' | 'createdAt' | 'actorName' | 'actorRole'>
-) {
-  state.auditLogs.unshift({
-    id: `aud-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-    actorName: state.settings.activeUserName,
-    actorRole: state.settings.activeUserRole,
-    createdAt: new Date().toISOString(),
-    ...entry,
-  });
-  if (state.auditLogs.length > 300) {
-    state.auditLogs = state.auditLogs.slice(0, 300);
-  }
-}
-
-function nextSequentialRfqNumber(rfqs: Rfq[]): string {
-  const year = new Date().getFullYear();
-  let maxSeq = 42;
-  for (const r of rfqs) {
-    const m = r.rfqNumber.match(/^RFQ-\d{4}-(\d+)$/);
-    if (m) {
-      const n = parseInt(m[1], 10);
-      if (Number.isFinite(n) && n > maxSeq && n < 9000) {
-        maxSeq = n;
-      }
+declare global {
+  namespace Express {
+    interface Request {
+      auth?: SessionAuthContext;
     }
   }
-  return `RFQ-${year}-${String(maxSeq + 1).padStart(4, '0')}`;
 }
-
-function isNonNegativeFinite(val: unknown): val is number {
-  return typeof val === 'number' && Number.isFinite(val) && val >= 0;
-}
-
-function isPositiveFinite(val: unknown): val is number {
-  return typeof val === 'number' && Number.isFinite(val) && val > 0;
-}
-
-const VALID_ROLES = new Set<UserRole>(['admin', 'buyer', 'approver', 'viewer']);
-const VALID_CURRENCIES = new Set(['INR', 'USD', 'GBP', 'EUR']);
-const VALID_TAX_REGIMES = new Set(['INDIA_GST', 'UK_VAT', 'US_TAX', 'NONE']);
 
 export interface AppOptions {
   enableVite?: boolean;
+  db?: DrizzleDb;
+  storageProvider?: ObjectStorageProvider;
+  rateLimitStore?: RateLimitStore;
+  emailProvider?: EmailProvider;
+  firebaseVerifier?: FirebaseTokenVerifier;
   generateContentOverride?: GenerateContentFn;
+  authRateLimitMax?: number;
+}
+
+function safeTimingEqual(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+function getAllowedOrigins(): Set<string> {
+  const origins = new Set<string>();
+  const appUrl = process.env.APP_URL?.trim();
+  if (appUrl) {
+    try {
+      origins.add(new URL(appUrl).origin);
+    } catch {
+      // Ignore malformed APP_URL placeholder
+    }
+  }
+  const extra = process.env.ALLOWED_ORIGINS?.split(',') || [];
+  for (const item of extra) {
+    const trimmed = item.trim();
+    if (!trimmed) continue;
+    try {
+      origins.add(new URL(trimmed).origin);
+    } catch {
+      origins.add(trimmed);
+    }
+  }
+  return origins;
+}
+
+function isOriginAllowed(origin: string, reqHost: string | undefined): boolean {
+  try {
+    const parsed = new URL(origin);
+    if (reqHost && parsed.host === reqHost) return true;
+    if (getAllowedOrigins().has(parsed.origin)) return true;
+    if (
+      process.env.NODE_ENV !== 'production' &&
+      (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1')
+    ) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 export async function createApp(options: AppOptions = {}) {
-  const { enableVite = false, generateContentOverride } = options;
-  const app = express();
+  const {
+    enableVite = false,
+    db = defaultDb,
+    storageProvider = createObjectStorageProvider(),
+    emailProvider = createEmailProvider(),
+    firebaseVerifier = verifyFirebaseIdToken,
+    generateContentOverride,
+    authRateLimitMax = 25,
+  } = options;
 
+  if (process.env.NODE_ENV === 'production') {
+    // Fail closed if required production secrets/database configuration are missing
+    getSigningSecret();
+    if (!options.db && !isSqlEnvConfigured()) {
+      throw new Error(
+        'PostgreSQL configuration (SQL_HOST, SQL_USER, SQL_PASSWORD, SQL_DB_NAME) is required in production.'
+      );
+    }
+  }
+
+  const store = new PgDataStore(db);
+  const rateLimitStore: RateLimitStore =
+    options.rateLimitStore ||
+    (options.db || isSqlEnvConfigured()
+      ? new PostgresRateLimitStore(db)
+      : new MemoryRateLimitStore());
+
+  const app = express();
   app.disable('x-powered-by');
+  app.set('trust proxy', 1);
+
+  // Security headers
   app.use((_req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'SAMEORIGIN');
-    res.setHeader('Referrer-Policy', 'no-referrer');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
     res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
+    res.setHeader(
+      'Permissions-Policy',
+      'camera=(), microphone=(), geolocation=(), payment=()'
+    );
+    if (process.env.NODE_ENV === 'production') {
+      res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    }
     next();
   });
 
-  app.use(express.json({ limit: '10mb' }));
+  // Strict CORS enforcement on /api/*
+  app.use('/api', (req, res, next) => {
+    const origin = req.headers.origin;
+    if (origin) {
+      if (!isOriginAllowed(origin, req.headers.host)) {
+        return res.status(403).json({ error: 'Cross-origin request blocked by CORS policy.' });
+      }
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+      res.setHeader(
+        'Access-Control-Allow-Headers',
+        'Content-Type, Authorization, X-CSRF-Token'
+      );
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+    }
+    if (req.method === 'OPTIONS') {
+      return res.status(204).end();
+    }
+    next();
+  });
+
+  app.use(express.json({ limit: '4mb' }));
 
   const upload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: 25 * 1024 * 1024 },
   });
 
+  const authRateLimiter = createRateLimitMiddleware({
+    store: rateLimitStore,
+    namespace: 'auth',
+    limit: authRateLimitMax,
+    windowMs: 15 * 60 * 1000,
+    keyFn: (req) => `${getClientIp(req)}:${req.path}`,
+  });
+
+  const extractRateLimiter = createRateLimitMiddleware({
+    store: rateLimitStore,
+    namespace: 'extract',
+    limit: 40,
+    windowMs: 15 * 60 * 1000,
+    keyFn: (req) => req.auth?.activeOrganization?.id || getClientIp(req),
+  });
+
+  const mutationRateLimiter = createRateLimitMiddleware({
+    store: rateLimitStore,
+    namespace: 'mutate',
+    limit: 250,
+    windowMs: 15 * 60 * 1000,
+    keyFn: (req) => req.auth?.user.id || getClientIp(req),
+  });
+
+  // Attach authenticated session context if nf_session cookie is present
+  async function attachSession(req: Request, _res: Response, next: NextFunction) {
+    try {
+      const cookies = parseCookies(req);
+      const token = cookies[SESSION_COOKIE_NAME];
+      if (token) {
+        const ctx = await store.getSessionContext(token);
+        if (ctx) {
+          req.auth = ctx;
+        }
+      }
+      next();
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  app.use('/api', attachSession);
+
+  function requireAuth(req: Request, res: Response, next: NextFunction) {
+    if (!req.auth) {
+      return res.status(401).json({ error: 'Authentication required. Please sign in.' });
+    }
+    next();
+  }
+
+  function requireCsrf(req: Request, res: Response, next: NextFunction) {
+    if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') {
+      return next();
+    }
+    if (!req.auth) {
+      return res.status(401).json({ error: 'Authentication required.' });
+    }
+    const headerToken = req.headers['x-csrf-token'];
+    const token = typeof headerToken === 'string' ? headerToken.trim() : '';
+    if (!token || !safeTimingEqual(token, req.auth.csrfToken)) {
+      return res.status(403).json({ error: 'Invalid or missing CSRF token.' });
+    }
+    next();
+  }
+
+  function requireOrgAndPermission(permission: Permission) {
+    return (req: Request, res: Response, next: NextFunction) => {
+      if (!req.auth) {
+        return res.status(401).json({ error: 'Authentication required.' });
+      }
+      const org = req.auth.activeOrganization;
+      if (!org) {
+        return res
+          .status(403)
+          .json({ error: 'No active organization membership found for this account.' });
+      }
+      if (!hasPermission(org.role, permission)) {
+        return res.status(403).json({
+          error: `Your role (${org.role}) does not have permission (${permission}).`,
+        });
+      }
+      next();
+    };
+  }
+
+  function buildAuthResponse(ctx: SessionAuthContext) {
+    return {
+      authenticated: true,
+      user: ctx.user,
+      activeOrganization: ctx.activeOrganization,
+      organizations: ctx.organizations,
+      csrfToken: ctx.csrfToken,
+      googleAuthEnabled: true,
+    };
+  }
+
+  function getAppBaseUrl(req: Request): string {
+    if (process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL') {
+      return process.env.APP_URL.replace(/\/+$/, '');
+    }
+    const proto =
+      (typeof req.headers['x-forwarded-proto'] === 'string' &&
+        req.headers['x-forwarded-proto'].split(',')[0].trim()) ||
+      req.protocol ||
+      'http';
+    const host = req.headers.host || 'localhost:3000';
+    return `${proto}://${host}`;
+  }
+
+  // Health Check
   app.get('/api/health', (_req, res) => {
+    res.json({
+      status: 'ok',
+      database: 'postgresql',
+      storageProvider: storageProvider.mode,
+      emailProvider: emailProvider.mode,
+      geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
+      googleAuthConfigured: true,
+    });
+  });
+
+  // Disabled Demo Role Switcher
+  app.all('/api/demo/switch-persona', (_req, res) => {
+    res.status(410).json({
+      error:
+        'Demo persona switching has been disabled. Sign in with an authenticated organization account.',
+    });
+  });
+
+  // ==================== AUTHENTICATION ROUTES ====================
+
+  app.get('/api/auth/me', (req, res) => {
+    if (!req.auth) {
+      return res.json({
+        authenticated: false,
+        user: null,
+        activeOrganization: null,
+        organizations: [],
+        csrfToken: null,
+        googleAuthEnabled: true,
+      });
+    }
+    res.json(buildAuthResponse(req.auth));
+  });
+
+  app.post('/api/auth/register', authRateLimiter, async (req, res, next) => {
     try {
-      const state = loadWorkspace();
+      const { email, password, fullName, title, organizationName, inviteToken } = req.body || {};
+      const result = await store.registerWithPassword({
+        email,
+        password,
+        fullName,
+        title,
+        organizationName,
+        inviteToken,
+        ipAddress: getClientIp(req),
+        userAgent: typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : null,
+      });
+
+      const verifyUrl = `${getAppBaseUrl(req)}/?verify=${encodeURIComponent(
+        result.rawVerificationToken
+      )}`;
+      await emailProvider.send({
+        to: result.user.email,
+        subject: 'Verify your NORUS QUOTEFLOW email',
+        text: `Welcome to NORUS QUOTEFLOW, ${result.user.fullName}.\n\nVerify your email address by opening this link (valid for 24 hours):\n${verifyUrl}\n`,
+      });
+
+      setAuthCookies(req, res, result.rawSessionToken, result.csrfToken);
+      res.status(201).json(buildAuthResponse(result));
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/auth/login', authRateLimiter, async (req, res, next) => {
+    try {
+      const { email, password } = req.body || {};
+      const result = await store.loginWithPassword({
+        email,
+        password,
+        ipAddress: getClientIp(req),
+        userAgent: typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : null,
+      });
+      setAuthCookies(req, res, result.rawSessionToken, result.csrfToken);
+      res.json(buildAuthResponse(result));
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/auth/google', authRateLimiter, async (req, res, next) => {
+    try {
+      const { idToken, inviteToken } = req.body || {};
+      if (typeof idToken !== 'string' || !idToken.trim()) {
+        return res.status(400).json({ error: 'Firebase Google ID token is required.' });
+      }
+
+      let verified: VerifiedFirebaseUser;
+      try {
+        verified = await firebaseVerifier(idToken.trim());
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Google token verification failed.';
+        return res.status(401).json({ error: msg });
+      }
+
+      if (!verified.email) {
+        return res.status(400).json({ error: 'Google account did not provide an email address.' });
+      }
+
+      const result = await store.loginWithGoogle({
+        firebaseUid: verified.uid,
+        email: verified.email,
+        fullName: verified.name || verified.email.split('@')[0],
+        emailVerified: Boolean(verified.email_verified),
+        inviteToken: typeof inviteToken === 'string' ? inviteToken.trim() : undefined,
+        ipAddress: getClientIp(req),
+        userAgent: typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : null,
+      });
+
+      setAuthCookies(req, res, result.rawSessionToken, result.csrfToken);
+      res.json(buildAuthResponse(result));
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/auth/logout', requireAuth, requireCsrf, async (req, res, next) => {
+    try {
+      const cookies = parseCookies(req);
+      const token = cookies[SESSION_COOKIE_NAME];
+      if (token) {
+        await store.revokeSessionByToken(token);
+      }
+      clearAuthCookies(req, res);
+      res.json({ ok: true });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/auth/verify-email', authRateLimiter, async (req, res, next) => {
+    try {
+      const { token } = req.body || {};
+      const user = await store.verifyEmailByToken(typeof token === 'string' ? token.trim() : '');
+      res.json({ ok: true, user });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post(
+    '/api/auth/resend-verification',
+    requireAuth,
+    requireCsrf,
+    authRateLimiter,
+    async (req, res, next) => {
+      try {
+        if (req.auth!.user.emailVerified) {
+          return res.json({ ok: true, alreadyVerified: true });
+        }
+        const issued = await store.createEmailVerificationToken(req.auth!.user.id);
+        const verifyUrl = `${getAppBaseUrl(req)}/?verify=${encodeURIComponent(issued.rawToken)}`;
+        await emailProvider.send({
+          to: issued.email,
+          subject: 'Verify your NORUS QUOTEFLOW email',
+          text: `Hello ${issued.fullName},\n\nVerify your email address using this link (valid for 24 hours):\n${verifyUrl}\n`,
+        });
+        res.json({ ok: true });
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
+  app.post('/api/auth/forgot-password', authRateLimiter, async (req, res, next) => {
+    try {
+      const { email } = req.body || {};
+      if (typeof email === 'string' && email.trim()) {
+        const issued = await store.createPasswordResetToken(email);
+        if (issued) {
+          const resetUrl = `${getAppBaseUrl(req)}/?reset=${encodeURIComponent(issued.rawToken)}`;
+          await emailProvider.send({
+            to: issued.email,
+            subject: 'NORUS QUOTEFLOW Password Reset',
+            text: `Hello ${issued.fullName},\n\nReset your password using the link below (valid for 1 hour):\n${resetUrl}\n\nIf you did not request this, ignore this email.\n`,
+          });
+        }
+      }
       res.json({
-        status: 'ok',
-        rfqs: state.rfqs.length,
-        quotations: state.quotations.length,
-        geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
+        ok: true,
+        message: 'If an account matches that email, a password reset link has been sent.',
       });
-    } catch (err) {
-      res.status(500).json({
-        status: 'error',
-        error: err instanceof Error ? err.message : 'Database unavailable',
-      });
-    }
-  });
-
-  app.get('/api/workspace', (_req, res, next) => {
-    try {
-      const state = loadWorkspace();
-      res.json(state);
     } catch (err) {
       next(err);
     }
   });
 
-  // Explicit Demo Sandbox Persona Switcher (NOT production authentication)
-  app.post('/api/demo/switch-persona', async (req, res, next) => {
+  app.post('/api/auth/reset-password', authRateLimiter, async (req, res, next) => {
     try {
-      const { activeUserRole, activeUserName, activeUserTitle } = req.body || {};
-      if (!VALID_ROLES.has(activeUserRole)) {
-        return res.status(400).json({ error: 'Invalid role specified.' });
+      const { token, newPassword } = req.body || {};
+      await store.resetPasswordByToken(
+        typeof token === 'string' ? token.trim() : '',
+        typeof newPassword === 'string' ? newPassword : ''
+      );
+      clearAuthCookies(req, res);
+      res.json({ ok: true });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get('/api/auth/sessions', requireAuth, async (req, res, next) => {
+    try {
+      const list = await store.listUserSessions(req.auth!.user.id, req.auth!.sessionId);
+      res.json({ sessions: list });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.delete(
+    '/api/auth/sessions/:sessionId',
+    requireAuth,
+    requireCsrf,
+    async (req, res, next) => {
+      try {
+        await store.revokeSessionById(req.auth!.user.id, req.params.sessionId);
+        if (req.params.sessionId === req.auth!.sessionId) {
+          clearAuthCookies(req, res);
+        }
+        res.json({ ok: true });
+      } catch (err) {
+        next(err);
       }
-      const updated = await mutateWorkspace((state) => {
-        state.settings.activeUserRole = activeUserRole;
-        if (typeof activeUserName === 'string' && activeUserName.trim()) {
-          state.settings.activeUserName = activeUserName.trim().slice(0, 80);
-        }
-        if (typeof activeUserTitle === 'string' && activeUserTitle.trim()) {
-          state.settings.activeUserTitle = activeUserTitle.trim().slice(0, 80);
-        }
-        addAudit(state, {
-          entityType: 'settings',
-          entityId: state.settings.id,
-          action: 'DEMO_PERSONA_SWITCHED',
-          detail: `Switched demo workspace persona to ${state.settings.activeUserName} (${state.settings.activeUserRole}).`,
+    }
+  );
+
+  // ==================== ORGANIZATION & TEAM ROUTES ====================
+
+  app.post(
+    '/api/organizations',
+    requireAuth,
+    requireCsrf,
+    mutationRateLimiter,
+    async (req, res, next) => {
+      try {
+        const { name, countryCode, defaultCurrency, taxRegime } = req.body || {};
+        const org = await store.createOrganization({
+          userId: req.auth!.user.id,
+          userName: req.auth!.user.fullName,
+          sessionId: req.auth!.sessionId,
+          name,
+          countryCode,
+          defaultCurrency,
+          taxRegime,
         });
-        return state.settings;
-      });
-      res.json(updated);
-    } catch (err) {
-      next(err);
-    }
-  });
-
-  // Update organization settings (blocked for viewer)
-  app.patch('/api/settings', async (req, res, next) => {
-    try {
-      const result = await mutateWorkspace((state) => {
-        if (state.settings.activeUserRole === 'viewer') {
-          return { status: 403 as const, body: { error: 'Viewers cannot modify organization settings.' } };
-        }
-        const { name, defaultCurrency, taxRegime, defaultTaxCreditable, activeUserRole } =
-          req.body || {};
-
-        if (name !== undefined) {
-          if (typeof name !== 'string' || !name.trim()) {
-            return { status: 400 as const, body: { error: 'Organization name cannot be empty.' } };
-          }
-          state.settings.name = name.trim().slice(0, 120);
-        }
-        if (defaultCurrency !== undefined) {
-          if (!VALID_CURRENCIES.has(defaultCurrency)) {
-            return { status: 400 as const, body: { error: 'Unsupported currency.' } };
-          }
-          state.settings.defaultCurrency = defaultCurrency;
-        }
-        if (taxRegime !== undefined) {
-          if (!VALID_TAX_REGIMES.has(taxRegime)) {
-            return { status: 400 as const, body: { error: 'Unsupported tax regime.' } };
-          }
-          state.settings.taxRegime = taxRegime;
-        }
-        if (typeof defaultTaxCreditable === 'boolean') {
-          state.settings.defaultTaxCreditable = defaultTaxCreditable;
-        }
-        if (activeUserRole !== undefined) {
-          if (!VALID_ROLES.has(activeUserRole)) {
-            return { status: 400 as const, body: { error: 'Invalid role.' } };
-          }
-          state.settings.activeUserRole = activeUserRole;
-        }
-
-        addAudit(state, {
-          entityType: 'settings',
-          entityId: state.settings.id,
-          action: 'SETTINGS_UPDATED',
-          detail: `Updated workspace settings (${state.settings.name} · ${state.settings.defaultCurrency} · ${state.settings.taxRegime}).`,
-        });
-        return { status: 200 as const, body: state.settings };
-      });
-      res.status(result.status).json(result.body);
-    } catch (err) {
-      next(err);
-    }
-  });
-
-  // Load fresh sample manufacturing RFQ sandbox
-  app.post('/api/rfqs/load-sample', async (_req, res, next) => {
-    try {
-      const result = await mutateWorkspace((state) => {
-        if (state.settings.activeUserRole === 'viewer') {
-          return { status: 403 as const, body: { error: 'Viewers cannot load sample RFQs.' } };
-        }
-        const suffix = String(Date.now()).slice(-4);
-        const sample = createSampleRfqAndQuotes(suffix);
-        state.rfqs.unshift(sample.rfq);
-        state.quotations.unshift(...sample.quotes);
-        addAudit(state, {
-          entityType: 'rfq',
-          entityId: sample.rfq.id,
-          action: 'SAMPLE_RFQ_LOADED',
-          detail: `Loaded sample RFQ ${sample.rfq.rfqNumber} with 3 multi-format supplier quotes.`,
-        });
-        return { status: 201 as const, body: { rfq: sample.rfq, quotes: sample.quotes } };
-      });
-      res.status(result.status).json(result.body);
-    } catch (err) {
-      next(err);
-    }
-  });
-
-  // Create RFQ
-  app.post('/api/rfqs', async (req, res, next) => {
-    try {
-      const result = await mutateWorkspace((state) => {
-        if (state.settings.activeUserRole === 'viewer') {
-          return { status: 403 as const, body: { error: 'Viewers cannot create RFQs.' } };
-        }
-        const { title, currency, incoterms, deliveryLocation, deadlineDate, items, invitedSupplierIds } =
-          req.body || {};
-
-        if (typeof title !== 'string' || !title.trim() || !Array.isArray(items) || items.length === 0) {
-          return {
-            status: 400 as const,
-            body: { error: 'RFQ title and at least one line item are required.' },
-          };
-        }
-
-        const safeCurrency = VALID_CURRENCIES.has(currency)
-          ? currency
-          : state.settings.defaultCurrency;
-
-        for (const it of items) {
-          if (!it || typeof it.description !== 'string' || !it.description.trim()) {
-            return { status: 400 as const, body: { error: 'Every RFQ item needs a description.' } };
-          }
-          const q = Number(it.quantity);
-          if (!Number.isFinite(q) || q <= 0) {
-            return {
-              status: 400 as const,
-              body: { error: `Item "${it.description}" must have quantity > 0.` },
-            };
-          }
-          if (it.targetUnitPrice !== null && it.targetUnitPrice !== undefined && it.targetUnitPrice !== '') {
-            const tp = Number(it.targetUnitPrice);
-            if (!Number.isFinite(tp) || tp < 0) {
-              return { status: 400 as const, body: { error: 'Target unit price cannot be negative.' } };
-            }
-          }
-        }
-
-        const validSupplierSet = new Set(state.suppliers.map((s) => s.id));
-        const safeSuppliers = Array.isArray(invitedSupplierIds)
-          ? invitedSupplierIds.filter((id: unknown): id is string => typeof id === 'string' && validSupplierSet.has(id))
-          : [];
-
-        const rfqId = `rfq-${Date.now()}`;
-        const rfqNumber = nextSequentialRfqNumber(state.rfqs);
-
-        const newRfq: Rfq = {
-          id: rfqId,
-          rfqNumber,
-          title: title.trim().slice(0, 200),
-          status: 'collecting',
-          currency: safeCurrency,
-          incoterms: typeof incoterms === 'string' && incoterms.trim() ? incoterms.trim() : 'FOR Destination',
-          deliveryLocation:
-            typeof deliveryLocation === 'string' && deliveryLocation.trim()
-              ? deliveryLocation.trim()
-              : 'Main Manufacturing Plant',
-          deadlineDate:
-            typeof deadlineDate === 'string' && deadlineDate.trim()
-              ? deadlineDate.trim()
-              : new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10),
-          createdBy: state.settings.activeUserName,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-          invitedSupplierIds: safeSuppliers,
-          items: items.map((it, idx: number) => {
-            const sku = typeof it.skuCode === 'string' ? it.skuCode.trim() : '';
-            const desc = String(it.description).trim();
-            const matchedCatalog = state.items.find(
-              (cat) =>
-                (sku && cat.skuCode.toLowerCase() === sku.toLowerCase()) ||
-                cat.normalizedName === desc.toLowerCase()
-            );
-            return {
-              id: `${rfqId}-item-${idx + 1}`,
-              rfqId,
-              itemId: matchedCatalog?.id ?? null,
-              lineNo: idx + 1,
-              skuCode: sku,
-              description: desc,
-              quantity: Number(it.quantity),
-              uom: typeof it.uom === 'string' && it.uom.trim() ? it.uom.trim() : 'pcs',
-              targetUnitPrice:
-                it.targetUnitPrice !== null && it.targetUnitPrice !== undefined && it.targetUnitPrice !== ''
-                  ? Number(it.targetUnitPrice)
-                  : matchedCatalog?.lastAwardedUnitPrice ?? null,
-            };
-          }),
-        };
-
-        state.rfqs.unshift(newRfq);
-        addAudit(state, {
-          entityType: 'rfq',
-          entityId: newRfq.id,
-          action: 'RFQ_CREATED',
-          detail: `Created ${newRfq.rfqNumber} (${newRfq.title}) with ${newRfq.items.length} line items.`,
-        });
-        return { status: 201 as const, body: newRfq };
-      });
-      res.status(result.status).json(result.body);
-    } catch (err) {
-      next(err);
-    }
-  });
-
-  // Suppliers CRUD
-  app.post('/api/suppliers', async (req, res, next) => {
-    try {
-      const result = await mutateWorkspace((state) => {
-        if (state.settings.activeUserRole === 'viewer') {
-          return { status: 403 as const, body: { error: 'Viewers cannot modify suppliers.' } };
-        }
-        const { name, taxId, city, contactName, email, phoneWhatsapp, defaultPaymentTerms, categories } =
-          req.body || {};
-        if (typeof name !== 'string' || !name.trim()) {
-          return { status: 400 as const, body: { error: 'Supplier name is required.' } };
-        }
-        const trimmedName = name.trim();
-        const trimmedTaxId = typeof taxId === 'string' ? taxId.trim() : '';
-        const duplicate = state.suppliers.find(
-          (s) =>
-            s.name.toLowerCase() === trimmedName.toLowerCase() ||
-            (trimmedTaxId && s.taxId && s.taxId.toLowerCase() === trimmedTaxId.toLowerCase())
-        );
-        if (duplicate) {
-          return {
-            status: 409 as const,
-            body: {
-              error: `Duplicate supplier detected: "${duplicate.name}" matches this name or Tax ID/GSTIN.`,
-            },
-          };
-        }
-
-        const supplier: Supplier = {
-          id: `sup-${Date.now()}`,
-          name: trimmedName,
-          taxId: trimmedTaxId,
-          city: typeof city === 'string' ? city.trim() : '',
-          contactName: typeof contactName === 'string' ? contactName.trim() : '',
-          email: typeof email === 'string' ? email.trim() : '',
-          phoneWhatsapp: typeof phoneWhatsapp === 'string' ? phoneWhatsapp.trim() : '',
-          defaultPaymentTerms:
-            typeof defaultPaymentTerms === 'string' && defaultPaymentTerms.trim()
-              ? defaultPaymentTerms.trim()
-              : 'Net 30 Days',
-          categories: Array.isArray(categories)
-            ? categories.filter((c): c is string => typeof c === 'string' && c.trim().length > 0)
-            : [],
-          createdAt: new Date().toISOString(),
-        };
-
-        state.suppliers.unshift(supplier);
-        addAudit(state, {
-          entityType: 'supplier',
-          entityId: supplier.id,
-          action: 'SUPPLIER_CREATED',
-          detail: `Added supplier ${supplier.name} (${supplier.taxId || 'No Tax ID'}).`,
-        });
-        return { status: 201 as const, body: supplier };
-      });
-      res.status(result.status).json(result.body);
-    } catch (err) {
-      next(err);
-    }
-  });
-
-  // Items CRUD
-  app.post('/api/items', async (req, res, next) => {
-    try {
-      const result = await mutateWorkspace((state) => {
-        if (state.settings.activeUserRole === 'viewer') {
-          return { status: 403 as const, body: { error: 'Viewers cannot modify item catalog.' } };
-        }
-        const { skuCode, name, defaultUom, hsnSacCode } = req.body || {};
-        if (typeof name !== 'string' || !name.trim()) {
-          return { status: 400 as const, body: { error: 'Item name is required.' } };
-        }
-        const newItem: CatalogItem = {
-          id: `item-${Date.now()}`,
-          skuCode: typeof skuCode === 'string' ? skuCode.trim() : '',
-          name: name.trim(),
-          normalizedName: name.trim().toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim(),
-          defaultUom: typeof defaultUom === 'string' && defaultUom.trim() ? defaultUom.trim() : 'pcs',
-          hsnSacCode: typeof hsnSacCode === 'string' ? hsnSacCode.trim() : '',
-          lastAwardedUnitPrice: null,
-          lastAwardedCurrency: null,
-          lastAwardedAt: null,
-          lastSupplierId: null,
-          priceHistory: [],
-        };
-        state.items.unshift(newItem);
-        return { status: 201 as const, body: newItem };
-      });
-      res.status(result.status).json(result.body);
-    } catch (err) {
-      next(err);
-    }
-  });
-
-  // AI Quotation Extraction Endpoint
-  app.post('/api/rfqs/:rfqId/quotes/extract', upload.single('file'), async (req, res, next) => {
-    try {
-      const snapshot = loadWorkspace();
-      if (snapshot.settings.activeUserRole === 'viewer') {
-        return res.status(403).json({ error: 'Viewers cannot upload quotations.' });
+        res.status(201).json({ organization: org });
+      } catch (err) {
+        next(err);
       }
-      const rfq = snapshot.rfqs.find((r) => r.id === req.params.rfqId);
-      if (!rfq) {
-        return res.status(404).json({ error: 'RFQ not found.' });
-      }
-      const supplierId = req.body?.supplierId;
-      if (typeof supplierId !== 'string' || !snapshot.suppliers.some((s) => s.id === supplierId)) {
-        return res.status(400).json({ error: 'Valid supplierId is required.' });
-      }
-
-      const rawEmailText = typeof req.body?.rawEmailText === 'string' ? req.body.rawEmailText.trim() : '';
-      const file = req.file;
-
-      if (!file && !rawEmailText) {
-        return res.status(400).json({
-          error: 'Upload a quotation file (PDF, Excel, CSV, Image) or paste email text.',
-        });
-      }
-
-      let safeName = `Email_Quote_${Date.now().toString().slice(-4)}.txt`;
-      let safeMime = 'text/plain';
-      if (file) {
-        const validation = validateUploadedFile(file.buffer, file.originalname, file.mimetype);
-        if (!validation.ok) {
-          return res.status(validation.status).json({ error: validation.error });
-        }
-        safeName = validation.safeFilename;
-        safeMime = validation.detectedMime;
-      }
-
-      const extracted = await extractQuotationWithGemini({
-        rfq,
-        supplierId,
-        settings: snapshot.settings,
-        documentName: safeName,
-        mimeType: safeMime,
-        fileBuffer: file?.buffer,
-        rawEmailText: rawEmailText || undefined,
-        generateContentOverride,
-      });
-
-      const saved = await mutateWorkspace((state) => {
-        const targetRfq = state.rfqs.find((r) => r.id === req.params.rfqId);
-        if (!targetRfq) {
-          throw new ExtractionServiceError('RFQ was removed while extracting.', 404);
-        }
-        state.quotations.unshift(extracted);
-        if (targetRfq.status === 'draft' || targetRfq.status === 'collecting') {
-          targetRfq.status = 'in_review';
-        }
-        targetRfq.updatedAt = new Date().toISOString();
-
-        const supName = state.suppliers.find((s) => s.id === supplierId)?.name || supplierId;
-        addAudit(state, {
-          entityType: 'quotation',
-          entityId: extracted.id,
-          action: 'QUOTATION_EXTRACTED',
-          detail: `Extracted ${extracted.lines.length} lines from ${extracted.documentName} (${supName}) for ${targetRfq.rfqNumber}.`,
-        });
-        return extracted;
-      });
-
-      res.status(201).json(saved);
-    } catch (err) {
-      if (err instanceof ExtractionServiceError) {
-        return res.status(err.statusCode).json({ error: err.message });
-      }
-      next(err);
     }
-  });
+  );
 
-  // Edit Quotation Header Commercial Terms
-  app.patch('/api/quotations/:quoteId', async (req, res, next) => {
+  app.post('/api/organizations/switch', requireAuth, requireCsrf, async (req, res, next) => {
     try {
-      const result = await mutateWorkspace((state) => {
-        if (state.settings.activeUserRole === 'viewer') {
-          return { status: 403 as const, body: { error: 'Viewers cannot edit quotations.' } };
-        }
-        const qIndex = state.quotations.findIndex((q) => q.id === req.params.quoteId);
-        if (qIndex === -1) return { status: 404 as const, body: { error: 'Quotation not found.' } };
-        const quote = state.quotations[qIndex];
-        const rfq = state.rfqs.find((r) => r.id === quote.rfqId);
-        if (!rfq) return { status: 404 as const, body: { error: 'Parent RFQ not found.' } };
-
-        const body = req.body || {};
-        for (const numField of ['freightCharges', 'packingForwarding', 'otherCharges', 'globalDiscount'] as const) {
-          if (body[numField] !== undefined && !isNonNegativeFinite(body[numField])) {
-            return { status: 400 as const, body: { error: `${numField} must be a non-negative finite number.` } };
-          }
-        }
-        if (body.exchangeRateToRfq !== undefined && !isPositiveFinite(body.exchangeRateToRfq)) {
-          return { status: 400 as const, body: { error: 'exchangeRateToRfq must be greater than 0.' } };
-        }
-        if (
-          body.leadTimeDays !== undefined &&
-          body.leadTimeDays !== null &&
-          (!Number.isFinite(body.leadTimeDays) || body.leadTimeDays < 0)
-        ) {
-          return { status: 400 as const, body: { error: 'leadTimeDays cannot be negative.' } };
-        }
-
-        const updated: Quotation = { ...quote, isVerified: false };
-        if (body.quoteReference !== undefined) updated.quoteReference = String(body.quoteReference).trim();
-        if (body.leadTimeDays !== undefined) updated.leadTimeDays = body.leadTimeDays;
-        if (body.paymentTerms !== undefined) updated.paymentTerms = body.paymentTerms;
-        if (body.freightCharges !== undefined) updated.freightCharges = body.freightCharges;
-        if (body.packingForwarding !== undefined) updated.packingForwarding = body.packingForwarding;
-        if (body.otherCharges !== undefined) updated.otherCharges = body.otherCharges;
-        if (body.globalDiscount !== undefined) updated.globalDiscount = body.globalDiscount;
-        if (body.taxIncludedInRates !== undefined) updated.taxIncludedInRates = Boolean(body.taxIncludedInRates);
-        if (body.missingFreightWarning !== undefined) updated.missingFreightWarning = Boolean(body.missingFreightWarning);
-        if (body.exchangeRateToRfq !== undefined) updated.exchangeRateToRfq = body.exchangeRateToRfq;
-        if (body.validUntil !== undefined) updated.validUntil = body.validUntil;
-
-        const recomputed = recomputeQuotation(updated, rfq);
-        state.quotations[qIndex] = recomputed;
-        addAudit(state, {
-          entityType: 'quotation',
-          entityId: quote.id,
-          action: 'QUOTATION_HEADER_EDITED',
-          detail: `Updated commercial terms on ${quote.quoteReference} (Freight: ${recomputed.freightCharges}, P&F: ${recomputed.packingForwarding}, FX: ${recomputed.exchangeRateToRfq}).`,
-        });
-        return { status: 200 as const, body: recomputed };
+      const { organizationId } = req.body || {};
+      if (typeof organizationId !== 'string' || !organizationId.trim()) {
+        return res.status(400).json({ error: 'organizationId is required.' });
+      }
+      const org = await store.switchActiveOrganization({
+        sessionId: req.auth!.sessionId,
+        userId: req.auth!.user.id,
+        organizationId: organizationId.trim(),
       });
-      res.status(result.status).json(result.body);
+      res.json({ organization: org });
     } catch (err) {
       next(err);
     }
   });
 
-  // Edit a specific Quotation Line Item
-  app.patch('/api/quotations/:quoteId/lines/:lineId', async (req, res, next) => {
-    try {
-      const result = await mutateWorkspace((state) => {
-        if (state.settings.activeUserRole === 'viewer') {
-          return { status: 403 as const, body: { error: 'Viewers cannot edit quotation lines.' } };
-        }
-        const qIndex = state.quotations.findIndex((q) => q.id === req.params.quoteId);
-        if (qIndex === -1) return { status: 404 as const, body: { error: 'Quotation not found.' } };
-        const quote = state.quotations[qIndex];
-        const rfq = state.rfqs.find((r) => r.id === quote.rfqId);
-        if (!rfq) return { status: 404 as const, body: { error: 'Parent RFQ not found.' } };
+  app.get(
+    '/api/organizations/current/members',
+    requireAuth,
+    requireOrgAndPermission('workspace:read'),
+    async (req, res, next) => {
+      try {
+        const members = await store.listOrganizationMembers(req.auth!.activeOrganization!.id);
+        res.json({ members });
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
 
-        const lineIndex = quote.lines.findIndex((l) => l.id === req.params.lineId);
-        if (lineIndex === -1) return { status: 404 as const, body: { error: 'Quotation line not found.' } };
+  app.patch(
+    '/api/organizations/current/members/:userId',
+    requireAuth,
+    requireCsrf,
+    mutationRateLimiter,
+    requireOrgAndPermission('org:members:manage'),
+    async (req, res, next) => {
+      try {
+        const { role } = req.body || {};
+        const org = req.auth!.activeOrganization!;
+        const updated = await store.updateMemberRole({
+          organizationId: org.id,
+          actorUserId: req.auth!.user.id,
+          actorName: req.auth!.user.fullName,
+          actorRole: org.role,
+          targetUserId: req.params.userId,
+          newRole: role,
+        });
+        res.json({ member: updated });
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
 
-        const body = req.body || {};
-        if (body.rfqItemId !== undefined && body.rfqItemId !== null) {
-          if (!rfq.items.some((it) => it.id === body.rfqItemId)) {
-            return { status: 400 as const, body: { error: 'rfqItemId does not belong to this RFQ.' } };
-          }
-        }
-        if (body.quotedQty !== undefined && body.quotedQty !== null && !isPositiveFinite(body.quotedQty)) {
-          return { status: 400 as const, body: { error: 'quotedQty must be greater than 0.' } };
-        }
-        if (body.quotedUnitRate !== undefined && body.quotedUnitRate !== null && !isNonNegativeFinite(body.quotedUnitRate)) {
-          return { status: 400 as const, body: { error: 'quotedUnitRate cannot be negative.' } };
-        }
-        if (body.uomConversionFactor !== undefined && !isPositiveFinite(body.uomConversionFactor)) {
-          return { status: 400 as const, body: { error: 'uomConversionFactor must be greater than 0.' } };
-        }
-        if (body.taxRatePct !== undefined && (!isNonNegativeFinite(body.taxRatePct) || body.taxRatePct > 100)) {
-          return { status: 400 as const, body: { error: 'taxRatePct must be between 0 and 100.' } };
-        }
-        if (body.discountAmount !== undefined && !isNonNegativeFinite(body.discountAmount)) {
-          return { status: 400 as const, body: { error: 'discountAmount cannot be negative.' } };
-        }
-        if (body.lineTotalQuoted !== undefined && body.lineTotalQuoted !== null && !isNonNegativeFinite(body.lineTotalQuoted)) {
-          return { status: 400 as const, body: { error: 'lineTotalQuoted cannot be negative.' } };
-        }
+  app.delete(
+    '/api/organizations/current/members/:userId',
+    requireAuth,
+    requireCsrf,
+    mutationRateLimiter,
+    requireOrgAndPermission('org:members:manage'),
+    async (req, res, next) => {
+      try {
+        const org = req.auth!.activeOrganization!;
+        await store.removeMember({
+          organizationId: org.id,
+          actorUserId: req.auth!.user.id,
+          actorName: req.auth!.user.fullName,
+          actorRole: org.role,
+          targetUserId: req.params.userId,
+        });
+        res.json({ ok: true });
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
 
-        const prevLine = quote.lines[lineIndex];
-        const updatedLine = {
-          ...prevLine,
-          ...(body.rfqItemId !== undefined ? { rfqItemId: body.rfqItemId } : {}),
-          ...(body.matchStatus !== undefined ? { matchStatus: body.matchStatus } : {}),
-          ...(body.quotedQty !== undefined ? { quotedQty: body.quotedQty } : {}),
-          ...(body.quotedUnitRate !== undefined ? { quotedUnitRate: body.quotedUnitRate } : {}),
-          ...(body.uomConversionFactor !== undefined ? { uomConversionFactor: body.uomConversionFactor } : {}),
-          ...(body.taxRatePct !== undefined ? { taxRatePct: body.taxRatePct } : {}),
-          ...(body.taxCreditable !== undefined ? { taxCreditable: Boolean(body.taxCreditable) } : {}),
-          ...(body.discountAmount !== undefined ? { discountAmount: body.discountAmount } : {}),
-          ...(body.lineTotalQuoted !== undefined ? { lineTotalQuoted: body.lineTotalQuoted } : {}),
-          humanEdited: true,
-          verifiedField: body.verifiedField ?? true,
-        };
+  app.get(
+    '/api/organizations/current/invitations',
+    requireAuth,
+    requireOrgAndPermission('org:members:invite'),
+    async (req, res, next) => {
+      try {
+        const list = await store.listInvitations(req.auth!.activeOrganization!.id);
+        res.json({ invitations: list });
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
 
-        const nextQuote: Quotation = {
-          ...quote,
-          isVerified: false,
-          lines: quote.lines.map((l, idx) => (idx === lineIndex ? updatedLine : l)),
-        };
-
-        const recomputed = recomputeQuotation(nextQuote, rfq);
-        state.quotations[qIndex] = recomputed;
-
-        addAudit(state, {
-          entityType: 'quotation_line',
-          entityId: prevLine.id,
-          action: 'LINE_HUMAN_OVERRIDE',
-          detail: `Edited line "${prevLine.rawDescription}" on ${quote.quoteReference}: rate ${prevLine.quotedUnitRate} -> ${updatedLine.quotedUnitRate}, UOM factor ${prevLine.uomConversionFactor} -> ${updatedLine.uomConversionFactor}.`,
+  app.post(
+    '/api/organizations/current/invitations',
+    requireAuth,
+    requireCsrf,
+    mutationRateLimiter,
+    requireOrgAndPermission('org:members:invite'),
+    async (req, res, next) => {
+      try {
+        const { email, role } = req.body || {};
+        const org = req.auth!.activeOrganization!;
+        const created = await store.createInvitation({
+          organizationId: org.id,
+          email,
+          role,
+          invitedByUserId: req.auth!.user.id,
+          actorName: req.auth!.user.fullName,
+          actorRole: org.role,
         });
 
-        return { status: 200 as const, body: recomputed };
+        const inviteUrl = `${getAppBaseUrl(req)}/?invite=${encodeURIComponent(created.rawToken)}`;
+        await emailProvider.send({
+          to: created.invitation.email,
+          subject: `Invitation to join ${created.organizationName} on NORUS QUOTEFLOW`,
+          text: `${req.auth!.user.fullName} invited you to join ${created.organizationName} as ${created.invitation.role}.\n\nAccept your invitation:\n${inviteUrl}\n`,
+        });
+
+        res.status(201).json({ invitation: created.invitation });
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
+  app.delete(
+    '/api/organizations/current/invitations/:invitationId',
+    requireAuth,
+    requireCsrf,
+    mutationRateLimiter,
+    requireOrgAndPermission('org:members:invite'),
+    async (req, res, next) => {
+      try {
+        const org = req.auth!.activeOrganization!;
+        await store.revokeInvitation({
+          organizationId: org.id,
+          invitationId: req.params.invitationId,
+          actorUserId: req.auth!.user.id,
+          actorName: req.auth!.user.fullName,
+          actorRole: org.role,
+        });
+        res.json({ ok: true });
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
+  app.post('/api/invitations/accept', requireAuth, requireCsrf, async (req, res, next) => {
+    try {
+      const { token } = req.body || {};
+      const org = await store.acceptInvitation({
+        userId: req.auth!.user.id,
+        userEmail: req.auth!.user.email,
+        userName: req.auth!.user.fullName,
+        sessionId: req.auth!.sessionId,
+        rawToken: typeof token === 'string' ? token.trim() : '',
       });
-      res.status(result.status).json(result.body);
+      res.json({ organization: org });
     } catch (err) {
       next(err);
     }
   });
 
-  // Verify Quotation (Gate: blocks if mathValid === false)
-  app.post('/api/quotations/:quoteId/verify', async (req, res, next) => {
-    try {
-      const result = await mutateWorkspace((state) => {
-        if (state.settings.activeUserRole === 'viewer') {
-          return { status: 403 as const, body: { error: 'Viewers cannot verify quotations.' } };
-        }
-        const qIndex = state.quotations.findIndex((q) => q.id === req.params.quoteId);
-        if (qIndex === -1) return { status: 404 as const, body: { error: 'Quotation not found.' } };
-        const quote = state.quotations[qIndex];
-        const rfq = state.rfqs.find((r) => r.id === quote.rfqId);
-        if (!rfq) return { status: 404 as const, body: { error: 'Parent RFQ not found.' } };
+  // ==================== TENANT PROCUREMENT ROUTES ====================
 
-        const recomputedPre = recomputeQuotation(quote, rfq);
-        const unresolvedMath = recomputedPre.lines.filter((l) => !l.mathValid);
-        if (unresolvedMath.length > 0) {
-          return {
-            status: 422 as const,
-            body: {
-              error: `Cannot verify quotation: ${unresolvedMath.length} line item(s) still have unresolved arithmetic mismatches.`,
-            },
-          };
-        }
-
-        const verifiedQuote = recomputeQuotation(
-          {
-            ...recomputedPre,
-            isVerified: true,
-            parseStatus: 'verified',
-            verifiedBy: state.settings.activeUserName,
-            verifiedAt: new Date().toISOString(),
-            lines: recomputedPre.lines.map((l) => ({ ...l, verifiedField: true })),
-          },
-          rfq
-        );
-
-        state.quotations[qIndex] = verifiedQuote;
-        addAudit(state, {
-          entityType: 'quotation',
-          entityId: verifiedQuote.id,
-          action: 'QUOTATION_VERIFIED',
-          detail: `Verified ${verifiedQuote.quoteReference} (${verifiedQuote.documentName}) for ${rfq.rfqNumber}.`,
-        });
-        return { status: 200 as const, body: verifiedQuote };
-      });
-      res.status(result.status).json(result.body);
-    } catch (err) {
-      next(err);
+  app.get(
+    '/api/workspace',
+    requireAuth,
+    requireOrgAndPermission('workspace:read'),
+    async (req, res, next) => {
+      try {
+        const org = req.auth!.activeOrganization!;
+        const state = await store.loadTenantWorkspace(org.id, req.auth!.user, org.role);
+        res.json(state);
+      } catch (err) {
+        next(err);
+      }
     }
-  });
+  );
 
-  // Delete Quotation (referential integrity protected)
-  app.delete('/api/quotations/:quoteId', async (req, res, next) => {
-    try {
-      const result = await mutateWorkspace((state) => {
-        if (state.settings.activeUserRole === 'viewer') {
-          return { status: 403 as const, body: { error: 'Viewers cannot delete quotations.' } };
-        }
-        const idx = state.quotations.findIndex((q) => q.id === req.params.quoteId);
-        if (idx === -1) return { status: 404 as const, body: { error: 'Quotation not found.' } };
-        const target = state.quotations[idx];
-
-        const linkedApprovedAward = state.awards.find(
-          (a) =>
-            a.approvalStatus === 'approved' &&
-            a.allocations.some((al) => al.quotationId === target.id)
-        );
-        if (linkedApprovedAward) {
-          return {
-            status: 409 as const,
-            body: {
-              error: 'Cannot delete a quotation that is part of an approved award decision.',
-            },
-          };
-        }
-
-        state.quotations.splice(idx, 1);
-
-        // Clean up any pending award referencing this deleted quotation
-        const hadPending = state.awards.some(
-          (a) =>
-            a.approvalStatus === 'pending' &&
-            a.allocations.some((al) => al.quotationId === target.id)
-        );
-        if (hadPending) {
-          state.awards = state.awards.filter(
-            (a) =>
-              !(
-                a.approvalStatus === 'pending' &&
-                a.allocations.some((al) => al.quotationId === target.id)
-              )
-          );
-          const parentRfq = state.rfqs.find((r) => r.id === target.rfqId);
-          if (parentRfq && parentRfq.status === 'pending_approval') {
-            parentRfq.status = 'in_review';
-          }
-        }
-
-        addAudit(state, {
-          entityType: 'quotation',
-          entityId: target.id,
-          action: 'QUOTATION_DELETED',
-          detail: `Removed quotation ${target.quoteReference} (${target.documentName}).`,
+  app.patch(
+    '/api/settings',
+    requireAuth,
+    requireCsrf,
+    mutationRateLimiter,
+    requireOrgAndPermission('org:settings:write'),
+    async (req, res, next) => {
+      try {
+        const org = req.auth!.activeOrganization!;
+        const { name, defaultCurrency, taxRegime, defaultTaxCreditable } = req.body || {};
+        const updated = await store.updateOrganizationSettings({
+          organizationId: org.id,
+          actorUserId: req.auth!.user.id,
+          actorName: req.auth!.user.fullName,
+          actorRole: org.role,
+          patch: { name, defaultCurrency, taxRegime, defaultTaxCreditable },
         });
-        return { status: 200 as const, body: { ok: true } };
-      });
-      res.status(result.status).json(result.body);
-    } catch (err) {
-      next(err);
+        updated.activeUserTitle = req.auth!.user.title;
+        res.json(updated);
+      } catch (err) {
+        next(err);
+      }
     }
-  });
+  );
 
-  // Submit Award Recommendation (recomputes totals & validates referential integrity server-side)
-  app.post('/api/rfqs/:rfqId/award', async (req, res, next) => {
-    try {
-      const result = await mutateWorkspace((state) => {
-        if (state.settings.activeUserRole === 'viewer') {
-          return {
-            status: 403 as const,
-            body: { error: 'Viewers cannot submit award recommendations.' },
-          };
+  app.post(
+    '/api/rfqs/load-sample',
+    requireAuth,
+    requireCsrf,
+    mutationRateLimiter,
+    requireOrgAndPermission('rfq:write'),
+    async (req, res, next) => {
+      try {
+        const org = req.auth!.activeOrganization!;
+        const result = await store.loadSampleRfq({
+          organizationId: org.id,
+          actorUserId: req.auth!.user.id,
+          actorName: req.auth!.user.fullName,
+          actorRole: org.role,
+        });
+        res.status(201).json(result);
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
+  app.post(
+    '/api/rfqs',
+    requireAuth,
+    requireCsrf,
+    mutationRateLimiter,
+    requireOrgAndPermission('rfq:write'),
+    async (req, res, next) => {
+      try {
+        const org = req.auth!.activeOrganization!;
+        const created = await store.createRfq({
+          organizationId: org.id,
+          actorUserId: req.auth!.user.id,
+          actorName: req.auth!.user.fullName,
+          actorRole: org.role,
+          input: req.body || {},
+        });
+        res.status(201).json(created);
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
+  app.post(
+    '/api/suppliers',
+    requireAuth,
+    requireCsrf,
+    mutationRateLimiter,
+    requireOrgAndPermission('supplier:write'),
+    async (req, res, next) => {
+      try {
+        const org = req.auth!.activeOrganization!;
+        const supplier = await store.createSupplier({
+          organizationId: org.id,
+          actorUserId: req.auth!.user.id,
+          actorName: req.auth!.user.fullName,
+          actorRole: org.role,
+          input: req.body || {},
+        });
+        res.status(201).json(supplier);
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
+  app.post(
+    '/api/items',
+    requireAuth,
+    requireCsrf,
+    mutationRateLimiter,
+    requireOrgAndPermission('item:write'),
+    async (req, res, next) => {
+      try {
+        const org = req.auth!.activeOrganization!;
+        const item = await store.createCatalogItem({
+          organizationId: org.id,
+          input: req.body || {},
+        });
+        res.status(201).json(item);
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
+  app.post(
+    '/api/rfqs/:rfqId/quotes/extract',
+    requireAuth,
+    requireCsrf,
+    requireOrgAndPermission('quotation:extract'),
+    extractRateLimiter,
+    upload.single('file'),
+    async (req, res, next) => {
+      let uploadedKeyForRollback: string | null = null;
+      try {
+        const org = req.auth!.activeOrganization!;
+        const supplierId = req.body?.supplierId;
+        if (typeof supplierId !== 'string' || !supplierId.trim()) {
+          return res.status(400).json({ error: 'Valid supplierId is required.' });
         }
-        const rfq = state.rfqs.find((r) => r.id === req.params.rfqId);
-        if (!rfq) return { status: 404 as const, body: { error: 'RFQ not found.' } };
 
-        const { isSplitAward, nonL1Justification, allocations } = req.body || {};
-        if (!Array.isArray(allocations) || allocations.length === 0) {
-          return {
-            status: 400 as const,
-            body: { error: 'Award recommendation must include at least one item allocation.' },
-          };
-        }
+        const { rfq, settings, supplierName } = await store.getExtractionContext({
+          organizationId: org.id,
+          rfqId: req.params.rfqId,
+          supplierId: supplierId.trim(),
+        });
 
-        const rfqQuotes = state.quotations.filter((q) => q.rfqId === rfq.id);
-        const verifiedAllocations: AwardAllocation[] = [];
-        let computedTotalLanded = 0;
+        const rawEmailText =
+          typeof req.body?.rawEmailText === 'string' ? req.body.rawEmailText.trim() : '';
+        const file = req.file;
 
-        for (const al of allocations) {
-          const rfqItem = rfq.items.find((it) => it.id === al.rfqItemId);
-          const quote = rfqQuotes.find((q) => q.id === al.quotationId);
-          const line = quote?.lines.find((l) => l.id === al.quotationLineId);
-
-          if (!rfqItem || !quote || !line || line.matchStatus === 'not_quoted') {
-            return {
-              status: 400 as const,
-              body: { error: 'Invalid allocation reference to RFQ item or quotation line.' },
-            };
-          }
-          if (!line.mathValid || line.normalizedUnitLanded === null) {
-            return {
-              status: 422 as const,
-              body: {
-                error: `Cannot include line "${line.rawDescription}" in an award while arithmetic mismatch or missing price remains.`,
-              },
-            };
-          }
-
-          const qty = rfqItem.quantity;
-          const unitLanded = line.normalizedUnitLanded;
-          computedTotalLanded += unitLanded * qty;
-          verifiedAllocations.push({
-            rfqItemId: rfqItem.id,
-            quotationId: quote.id,
-            quotationLineId: line.id,
-            supplierId: quote.supplierId,
-            awardedQty: qty,
-            awardedUnitLanded: unitLanded,
+        if (!file && !rawEmailText) {
+          return res.status(400).json({
+            error: 'Upload a quotation file (PDF, Excel, CSV, Image) or paste email text.',
           });
         }
 
-        // For single-package awards, use the quote's authoritative totalLandedCost to avoid rounding drift
-        const distinctQuoteIds = new Set(verifiedAllocations.map((a) => a.quotationId));
-        if (!isSplitAward && distinctQuoteIds.size === 1) {
-          const soleQuote = rfqQuotes.find((q) => q.id === [...distinctQuoteIds][0]);
-          if (soleQuote && verifiedAllocations.length === rfq.items.length) {
-            computedTotalLanded = soleQuote.totalLandedCost;
+        let safeName = `Email_Quote_${Date.now().toString().slice(-4)}.txt`;
+        let safeMime = 'text/plain';
+        if (file) {
+          const validation = validateUploadedFile(file.buffer, file.originalname, file.mimetype);
+          if (!validation.ok) {
+            return res.status(validation.status).json({ error: validation.error });
           }
+          safeName = validation.safeFilename;
+          safeMime = validation.detectedMime;
         }
-        computedTotalLanded = Math.round(computedTotalLanded * 100) / 100;
 
-        // Server-side L1 check: compare against lowest complete/eligible L1 quote (or complete math-valid quote)
-        const ranked = rankQuotations(rfqQuotes, 'landed');
-        const l1Eligible = ranked.find((r) => r.rankIndex === 1);
-        const isNonL1Server = l1Eligible
-          ? computedTotalLanded > l1Eligible.totalForBasis + 1
-          : false;
+        const extracted = await extractQuotationWithGemini({
+          rfq,
+          supplierId: supplierId.trim(),
+          settings,
+          documentName: safeName,
+          mimeType: safeMime,
+          fileBuffer: file?.buffer,
+          rawEmailText: rawEmailText || undefined,
+          skipInlineDataUrl: true,
+          generateContentOverride,
+        });
 
-        if (isNonL1Server && (typeof nonL1Justification !== 'string' || !nonL1Justification.trim())) {
-          return {
-            status: 400 as const,
-            body: {
-              error: 'Justification is mandatory when awarding above the L1 lowest landed cost.',
-            },
+        let storedDoc = null;
+        if (file) {
+          const docId = `doc-${Date.now().toString(36)}-${crypto.randomBytes(4).toString('hex')}`;
+          const storageKey = buildDocumentStorageKey(org.id, docId, safeName);
+          await storageProvider.putObject({
+            key: storageKey,
+            buffer: file.buffer,
+            contentType: safeMime,
+          });
+          uploadedKeyForRollback = storageKey;
+          storedDoc = {
+            id: docId,
+            organizationId: org.id,
+            uploadedByUserId: req.auth!.user.id,
+            storageProvider: storageProvider.mode,
+            storageKey,
+            originalFilename: safeName,
+            mimeType: safeMime,
+            byteSize: file.buffer.byteLength,
+            sha256: crypto.createHash('sha256').update(file.buffer).digest('hex'),
+            createdAt: new Date().toISOString(),
           };
         }
 
-        const award: AwardDecision = {
-          id: `award-${Date.now()}`,
+        const saved = await store.saveExtractedQuotation({
+          organizationId: org.id,
           rfqId: rfq.id,
-          isSplitAward: Boolean(isSplitAward),
-          recommendedBy: state.settings.activeUserName,
-          approvedBy: null,
-          approvalStatus: 'pending',
-          nonL1Justification:
-            typeof nonL1Justification === 'string' && nonL1Justification.trim()
-              ? nonL1Justification.trim()
-              : null,
-          approverNotes: null,
-          totalAwardedLanded: computedTotalLanded,
-          allocations: verifiedAllocations,
-          decidedAt: null,
-          createdAt: new Date().toISOString(),
-        };
-
-        state.awards = state.awards.filter(
-          (a) => !(a.rfqId === rfq.id && a.approvalStatus === 'pending')
-        );
-        state.awards.unshift(award);
-        rfq.status = 'pending_approval';
-        rfq.updatedAt = new Date().toISOString();
-
-        addAudit(state, {
-          entityType: 'award',
-          entityId: award.id,
-          action: 'AWARD_RECOMMENDED',
-          detail: `Submitted ${award.isSplitAward ? 'Split' : 'Full'} award recommendation for ${rfq.rfqNumber} (Landed total: ${award.totalAwardedLanded}).`,
+          supplierName,
+          quotation: extracted,
+          storedDoc,
+          actorUserId: req.auth!.user.id,
+          actorName: req.auth!.user.fullName,
+          actorRole: org.role,
         });
+        uploadedKeyForRollback = null;
 
-        return { status: 201 as const, body: award };
-      });
-      res.status(result.status).json(result.body);
-    } catch (err) {
-      next(err);
+        res.status(201).json(saved);
+      } catch (err) {
+        if (uploadedKeyForRollback) {
+          await storageProvider.deleteObject(uploadedKeyForRollback).catch(() => undefined);
+        }
+        next(err);
+      }
     }
-  });
+  );
 
-  // Approve or Reject Award
-  app.post('/api/awards/:awardId/decide', async (req, res, next) => {
-    try {
-      const result = await mutateWorkspace((state) => {
-        if (state.settings.activeUserRole !== 'approver' && state.settings.activeUserRole !== 'admin') {
-          return {
-            status: 403 as const,
-            body: {
-              error: 'Only Approver (MD) or Admin roles can approve or reject awards. Switch role in Settings or sidebar.',
-            },
-          };
-        }
-
-        const award = state.awards.find((a) => a.id === req.params.awardId);
-        if (!award) return { status: 404 as const, body: { error: 'Award decision not found.' } };
-        if (award.approvalStatus !== 'pending') {
-          return { status: 409 as const, body: { error: 'This award decision has already been finalized.' } };
-        }
-        const rfq = state.rfqs.find((r) => r.id === award.rfqId);
-        if (!rfq) return { status: 404 as const, body: { error: 'Parent RFQ not found.' } };
-
-        const { decision, approverNotes } = req.body || {};
-        if (decision !== 'approved' && decision !== 'rejected') {
-          return { status: 400 as const, body: { error: 'Decision must be "approved" or "rejected".' } };
-        }
-
-        award.approvalStatus = decision;
-        award.approvedBy = state.settings.activeUserName;
-        award.approverNotes =
-          typeof approverNotes === 'string' && approverNotes.trim() ? approverNotes.trim() : null;
-        award.decidedAt = new Date().toISOString();
-
-        if (decision === 'approved') {
-          rfq.status = 'awarded';
-          for (const alloc of award.allocations) {
-            const rfqItem = rfq.items.find((it) => it.id === alloc.rfqItemId);
-            if (!rfqItem) continue;
-            const supplier = state.suppliers.find((s) => s.id === alloc.supplierId);
-            let catalogItem = state.items.find(
-              (ci) =>
-                ci.id === rfqItem.itemId ||
-                (rfqItem.skuCode && ci.skuCode.toLowerCase() === rfqItem.skuCode.toLowerCase()) ||
-                ci.normalizedName === rfqItem.description.toLowerCase().trim()
-            );
-            if (!catalogItem) {
-              catalogItem = {
-                id: `item-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
-                skuCode: rfqItem.skuCode || `SKU-${rfqItem.lineNo}`,
-                name: rfqItem.description,
-                normalizedName: rfqItem.description.toLowerCase().trim(),
-                defaultUom: rfqItem.uom,
-                hsnSacCode: '',
-                lastAwardedUnitPrice: null,
-                lastAwardedCurrency: null,
-                lastAwardedAt: null,
-                lastSupplierId: null,
-                priceHistory: [],
-              };
-              state.items.unshift(catalogItem);
-              rfqItem.itemId = catalogItem.id;
-            }
-
-            catalogItem.lastAwardedUnitPrice = alloc.awardedUnitLanded;
-            catalogItem.lastAwardedCurrency = rfq.currency;
-            catalogItem.lastAwardedAt = award.decidedAt;
-            catalogItem.lastSupplierId = alloc.supplierId;
-            catalogItem.priceHistory.unshift({
-              rfqId: rfq.id,
-              rfqNumber: rfq.rfqNumber,
-              supplierId: alloc.supplierId,
-              supplierName: supplier?.name || 'Supplier',
-              unitLandedPrice: alloc.awardedUnitLanded,
-              currency: rfq.currency,
-              awardedAt: award.decidedAt,
-            });
-          }
-        } else {
-          rfq.status = 'in_review';
-        }
-        rfq.updatedAt = new Date().toISOString();
-
-        addAudit(state, {
-          entityType: 'award',
-          entityId: award.id,
-          action: decision === 'approved' ? 'AWARD_APPROVED' : 'AWARD_REJECTED',
-          detail: `${decision === 'approved' ? 'Approved' : 'Returned for revision'} award for ${rfq.rfqNumber}. ${award.approverNotes || ''}`.trim(),
+  app.patch(
+    '/api/quotations/:quoteId',
+    requireAuth,
+    requireCsrf,
+    mutationRateLimiter,
+    requireOrgAndPermission('quotation:edit'),
+    async (req, res, next) => {
+      try {
+        const org = req.auth!.activeOrganization!;
+        const updated = await store.updateQuotationHeader({
+          organizationId: org.id,
+          quoteId: req.params.quoteId,
+          body: req.body || {},
+          actorUserId: req.auth!.user.id,
+          actorName: req.auth!.user.fullName,
+          actorRole: org.role,
         });
+        res.json(updated);
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
 
-        return { status: 200 as const, body: { award, rfq } };
-      });
-      res.status(result.status).json(result.body);
+  app.patch(
+    '/api/quotations/:quoteId/lines/:lineId',
+    requireAuth,
+    requireCsrf,
+    mutationRateLimiter,
+    requireOrgAndPermission('quotation:edit'),
+    async (req, res, next) => {
+      try {
+        const org = req.auth!.activeOrganization!;
+        const updated = await store.updateQuotationLine({
+          organizationId: org.id,
+          quoteId: req.params.quoteId,
+          lineId: req.params.lineId,
+          body: req.body || {},
+          actorUserId: req.auth!.user.id,
+          actorName: req.auth!.user.fullName,
+          actorRole: org.role,
+        });
+        res.json(updated);
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
+  app.post(
+    '/api/quotations/:quoteId/verify',
+    requireAuth,
+    requireCsrf,
+    mutationRateLimiter,
+    requireOrgAndPermission('quotation:verify'),
+    async (req, res, next) => {
+      try {
+        const org = req.auth!.activeOrganization!;
+        const verified = await store.verifyQuotation({
+          organizationId: org.id,
+          quoteId: req.params.quoteId,
+          actorUserId: req.auth!.user.id,
+          actorName: req.auth!.user.fullName,
+          actorRole: org.role,
+        });
+        res.json(verified);
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
+  app.delete(
+    '/api/quotations/:quoteId',
+    requireAuth,
+    requireCsrf,
+    mutationRateLimiter,
+    requireOrgAndPermission('quotation:delete'),
+    async (req, res, next) => {
+      try {
+        const org = req.auth!.activeOrganization!;
+        const result = await store.deleteQuotation({
+          organizationId: org.id,
+          quoteId: req.params.quoteId,
+          actorUserId: req.auth!.user.id,
+          actorName: req.auth!.user.fullName,
+          actorRole: org.role,
+        });
+        if (result.deletedDocument) {
+          await storageProvider
+            .deleteObject(result.deletedDocument.storageKey)
+            .catch(() => undefined);
+        }
+        res.json({ ok: true });
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
+  app.post(
+    '/api/rfqs/:rfqId/award',
+    requireAuth,
+    requireCsrf,
+    mutationRateLimiter,
+    requireOrgAndPermission('award:recommend'),
+    async (req, res, next) => {
+      try {
+        const org = req.auth!.activeOrganization!;
+        const { isSplitAward, nonL1Justification, allocations } = req.body || {};
+        const award = await store.submitAward({
+          organizationId: org.id,
+          rfqId: req.params.rfqId,
+          isSplitAward: Boolean(isSplitAward),
+          nonL1Justification,
+          allocations,
+          actorUserId: req.auth!.user.id,
+          actorName: req.auth!.user.fullName,
+          actorRole: org.role,
+        });
+        res.status(201).json(award);
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
+  app.post(
+    '/api/awards/:awardId/decide',
+    requireAuth,
+    requireCsrf,
+    mutationRateLimiter,
+    requireOrgAndPermission('award:decide'),
+    async (req, res, next) => {
+      try {
+        const org = req.auth!.activeOrganization!;
+        const { decision, approverNotes } = req.body || {};
+        const result = await store.decideAward({
+          organizationId: org.id,
+          awardId: req.params.awardId,
+          decision,
+          approverNotes,
+          actorUserId: req.auth!.user.id,
+          actorName: req.auth!.user.fullName,
+          actorRole: org.role,
+        });
+        res.json(result);
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
+  // ==================== PRIVATE DOCUMENT ACCESS ====================
+
+  app.get(
+    '/api/documents/:docId/signed-url',
+    requireAuth,
+    requireOrgAndPermission('document:download'),
+    async (req, res, next) => {
+      try {
+        const org = req.auth!.activeOrganization!;
+        const doc = await store.getStoredDocumentForOrg(org.id, req.params.docId);
+        if (!doc) {
+          return res.status(404).json({ error: 'Document not found in active organization.' });
+        }
+        const signed = await storageProvider.createSignedDownloadUrl({
+          documentId: doc.id,
+          storageKey: doc.storageKey,
+          organizationId: org.id,
+          filename: doc.originalFilename,
+          expiresInSec: 300,
+        });
+        res.json({
+          url: signed.url,
+          expiresAt: signed.expiresAt,
+          mimeType: doc.mimeType,
+          originalFilename: doc.originalFilename,
+        });
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
+  app.get('/api/documents/:docId/content', async (req, res, next) => {
+    try {
+      const orgParam = typeof req.query.org === 'string' ? req.query.org : '';
+      const expParam = typeof req.query.exp === 'string' ? Number(req.query.exp) : NaN;
+      const sigParam = typeof req.query.sig === 'string' ? req.query.sig : '';
+
+      let authorizedOrgId: string | null = null;
+      if (sigParam || orgParam || req.query.exp) {
+        const validSig = verifySignedDocumentToken({
+          documentId: req.params.docId,
+          organizationId: orgParam,
+          exp: expParam,
+          sig: sigParam,
+        });
+        if (!validSig) {
+          return res.status(403).json({ error: 'Signed document URL is invalid or expired.' });
+        }
+        authorizedOrgId = orgParam;
+      } else {
+        if (!req.auth) {
+          return res.status(401).json({ error: 'Authentication required.' });
+        }
+        if (!req.auth.activeOrganization) {
+          return res.status(403).json({ error: 'No active organization membership.' });
+        }
+        if (!hasPermission(req.auth.activeOrganization.role, 'document:download')) {
+          return res.status(403).json({ error: 'Permission denied.' });
+        }
+        authorizedOrgId = req.auth.activeOrganization.id;
+      }
+
+      const doc = await store.getStoredDocumentForOrg(authorizedOrgId, req.params.docId);
+      if (!doc) {
+        return res.status(404).json({ error: 'Document not found.' });
+      }
+
+      const obj = await storageProvider.getObject(doc.storageKey);
+      res.setHeader('Content-Type', doc.mimeType || obj.contentType || 'application/octet-stream');
+      res.setHeader(
+        'Content-Disposition',
+        `inline; filename="${doc.originalFilename.replace(/["\r\n]/g, '_')}"`
+      );
+      res.setHeader('Cache-Control', 'private, no-store');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.send(obj.buffer);
     } catch (err) {
       next(err);
     }
@@ -991,7 +1196,7 @@ export async function createApp(options: AppOptions = {}) {
     }
   }
 
-  // Centralized error handler (Multer limits + safe error output without secret/stack leakage)
+  // Centralized error handler (never leaks raw SQL/stack/secrets)
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     if (err instanceof multer.MulterError) {
       if (err.code === 'LIMIT_FILE_SIZE') {
@@ -1000,11 +1205,15 @@ export async function createApp(options: AppOptions = {}) {
       return res.status(400).json({ error: `File upload error: ${err.message}` });
     }
     const status =
-      err instanceof ExtractionServiceError ? err.statusCode : 500;
-    const message =
-      err instanceof Error ? err.message : 'Internal server error.';
+      err instanceof StoreError
+        ? err.statusCode
+        : err instanceof ExtractionServiceError
+        ? err.statusCode
+        : 500;
+    const rawMessage = err instanceof Error ? err.message : 'Internal server error.';
+    const message = status >= 500 ? 'Internal server error.' : redactSensitiveText(rawMessage);
     if (status >= 500) {
-      console.error('[server error]', message);
+      console.error('[server error]', redactSensitiveText(rawMessage));
     }
     res.status(status).json({ error: message });
   });

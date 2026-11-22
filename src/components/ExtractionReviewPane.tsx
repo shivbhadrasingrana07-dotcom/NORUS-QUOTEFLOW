@@ -61,6 +61,7 @@ export function ExtractionReviewPane({
   const [zoom, setZoom] = useState(100);
   const [savingId, setSavingId] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [signedDocUrl, setSignedDocUrl] = useState<string | null>(null);
 
   // Buffered header state to prevent per-keystroke API races
   const [headerDraft, setHeaderDraft] = useState({
@@ -100,6 +101,28 @@ export function ExtractionReviewPane({
     setErrorMsg(null);
   }, [activeQuote]);
 
+  useEffect(() => {
+    setSignedDocUrl(null);
+    if (!activeQuote?.documentId || activeQuote.fileDataUrl) return;
+    let active = true;
+    fetch(`/api/documents/${encodeURIComponent(activeQuote.documentId)}/signed-url`, {
+      credentials: 'include',
+    })
+      .then(async (res) => {
+        if (!res.ok) return null;
+        return (await res.json()) as { url?: string };
+      })
+      .then((data) => {
+        if (active && data?.url) {
+          setSignedDocUrl(data.url);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, [activeQuote?.id, activeQuote?.documentId, activeQuote?.fileDataUrl]);
+
   if (!activeQuote) {
     return (
       <div className="bg-white border border-[#E2E8F0] rounded-lg p-10 text-center">
@@ -109,6 +132,8 @@ export function ExtractionReviewPane({
       </div>
     );
   }
+
+  const resolvedDocumentUrl = activeQuote.fileDataUrl || signedDocUrl;
 
   const supplier = suppliers.find((s) => s.id === activeQuote.supplierId);
   const unresolvedMathCount = activeQuote.lines.filter((l) => !l.mathValid).length;
@@ -434,13 +459,13 @@ export function ExtractionReviewPane({
                   </div>
                 ))}
               </div>
-            ) : activeQuote.fileDataUrl && activeQuote.documentKind === 'image' ? (
+            ) : resolvedDocumentUrl && activeQuote.documentKind === 'image' ? (
               <div
                 className="relative inline-block bg-white shadow-sm border border-[#CBD5E1]"
                 style={{ width: `${zoom}%` }}
               >
                 <img
-                  src={activeQuote.fileDataUrl}
+                  src={resolvedDocumentUrl}
                   alt={activeQuote.documentName}
                   className="w-full h-auto block"
                 />
@@ -471,9 +496,9 @@ export function ExtractionReviewPane({
                   );
                 })}
               </div>
-            ) : activeQuote.fileDataUrl && activeQuote.documentKind === 'pdf' ? (
+            ) : resolvedDocumentUrl && activeQuote.documentKind === 'pdf' ? (
               <iframe
-                src={activeQuote.fileDataUrl}
+                src={resolvedDocumentUrl}
                 title={activeQuote.documentName}
                 className="w-full h-[640px] bg-white border border-[#CBD5E1] rounded"
               />

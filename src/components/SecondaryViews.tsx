@@ -595,14 +595,16 @@ export function SettingsView({
   const [currency, setCurrency] = useState(settings.defaultCurrency);
   const [taxRegime, setTaxRegime] = useState<TaxRegime>(settings.taxRegime);
   const [itc, setItc] = useState(settings.defaultTaxCreditable);
-  const [role, setRole] = useState<UserRole>(settings.activeUserRole);
   const [saved, setSaved] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const canEditSettings =
+    settings.activeUserRole === 'owner' || settings.activeUserRole === 'admin';
+
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (saving) return;
+    if (saving || !canEditSettings) return;
     setError(null);
     try {
       setSaving(true);
@@ -611,7 +613,6 @@ export function SettingsView({
         defaultCurrency: currency,
         taxRegime,
         defaultTaxCreditable: itc,
-        activeUserRole: role,
       });
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
@@ -641,9 +642,10 @@ export function SettingsView({
           </label>
           <input
             type="text"
+            disabled={!canEditSettings}
             value={name}
             onChange={(e) => setName(e.target.value)}
-            className="w-full px-3 py-2 border border-[#E2E8F0] rounded-md"
+            className="w-full px-3 py-2 border border-[#E2E8F0] rounded-md disabled:bg-[#F8FAFC]"
           />
         </div>
 
@@ -653,11 +655,12 @@ export function SettingsView({
               Default Currency
             </label>
             <select
+              disabled={!canEditSettings}
               value={currency}
               onChange={(e) =>
                 setCurrency(e.target.value as OrganizationSettings['defaultCurrency'])
               }
-              className="w-full px-3 py-2 border border-[#E2E8F0] rounded-md bg-white"
+              className="w-full px-3 py-2 border border-[#E2E8F0] rounded-md bg-white disabled:bg-[#F8FAFC]"
             >
               <option value="INR">INR (₹)</option>
               <option value="USD">USD ($)</option>
@@ -671,9 +674,10 @@ export function SettingsView({
               Tax Regime
             </label>
             <select
+              disabled={!canEditSettings}
               value={taxRegime}
               onChange={(e) => setTaxRegime(e.target.value as TaxRegime)}
-              className="w-full px-3 py-2 border border-[#E2E8F0] rounded-md bg-white"
+              className="w-full px-3 py-2 border border-[#E2E8F0] rounded-md bg-white disabled:bg-[#F8FAFC]"
             >
               <option value="INDIA_GST">India GST (CGST+SGST / IGST)</option>
               <option value="UK_VAT">UK / EU VAT</option>
@@ -686,6 +690,7 @@ export function SettingsView({
         <label className="flex items-center gap-2.5 text-xs text-[#0F172A] cursor-pointer">
           <input
             type="checkbox"
+            disabled={!canEditSettings}
             checked={itc}
             onChange={(e) => setItc(e.target.checked)}
             className="rounded border-[#CBD5E1]"
@@ -695,20 +700,12 @@ export function SettingsView({
           </span>
         </label>
 
-        <div>
-          <label className="block text-xs font-medium text-[#475569] mb-1">
-            Active User Role (RBAC Simulation)
-          </label>
-          <select
-            value={role}
-            onChange={(e) => setRole(e.target.value as UserRole)}
-            className="w-full px-3 py-2 border border-[#E2E8F0] rounded-md bg-white"
-          >
-            <option value="buyer">Buyer (Create RFQs, Upload/Verify Quotes, Recommend Awards)</option>
-            <option value="approver">Approver / MD (Approve/Reject Awards)</option>
-            <option value="admin">Admin (Full Workspace & Approval Access)</option>
-            <option value="viewer">Viewer (Read-Only Finance / Audit)</option>
-          </select>
+        <div className="p-3 bg-[#F8FAFC] border border-[#E2E8F0] rounded-md text-xs text-[#475569]">
+          <strong>Authenticated Membership Role:</strong>{' '}
+          <span className="font-mono font-semibold text-[#0F4C81]">
+            {settings.activeUserRole.toUpperCase()}
+          </span>
+          . Only Organization Owners and Admins can modify organization normalization defaults or manage team roles under Team & Organizations.
         </div>
 
         {error && (
@@ -717,14 +714,10 @@ export function SettingsView({
           </div>
         )}
 
-        <div className="p-3 bg-[#F8FAFC] border border-[#E2E8F0] rounded-md text-xs text-[#475569]">
-          <strong>Security Note:</strong> The role selector below controls server-enforced RBAC checks for this single-workspace sandbox demo. It is not multi-user authentication; real deployment requires signed session/JWT authentication.
-        </div>
-
         <div className="pt-2 flex items-center gap-3">
           <button
             type="submit"
-            disabled={saving}
+            disabled={saving || !canEditSettings}
             className="px-4 py-2 text-sm font-medium text-white bg-[#0F4C81] rounded-lg hover:bg-[#0A365C] disabled:opacity-50"
           >
             {saving ? 'Saving...' : 'Save Settings'}
