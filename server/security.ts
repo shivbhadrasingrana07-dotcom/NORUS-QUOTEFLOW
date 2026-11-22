@@ -168,13 +168,28 @@ export function clearAuthCookies(req: Request, res: Response): void {
 
 export function redactSensitiveText(raw: string): string {
   let msg = raw || '';
-  for (const envName of ['GEMINI_API_KEY', 'SESSION_SECRET', 'SQL_PASSWORD', 'SQL_ADMIN_PASSWORD', 'S3_SECRET_ACCESS_KEY', 'RESEND_API_KEY']) {
+  for (const envName of [
+    'GEMINI_API_KEY',
+    'SESSION_SECRET',
+    'SQL_PASSWORD',
+    'SQL_ADMIN_PASSWORD',
+    'S3_SECRET_ACCESS_KEY',
+    'S3_ACCESS_KEY_ID',
+    'RESEND_API_KEY',
+  ]) {
     const val = process.env[envName];
     if (val && val.length > 4) {
       msg = msg.split(val).join('[REDACTED]');
     }
   }
-  return msg.replace(/AIza[0-9A-Za-z_-]{20,}/g, '[REDACTED]');
+  return msg
+    .replace(/AIza[0-9A-Za-z_-]{20,}/g, '[REDACTED]')
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, 'Bearer [REDACTED]')
+    .replace(/\bre_(?:live|test)_[A-Za-z0-9_]{8,}/g, '[REDACTED]')
+    .replace(
+      /\b(secretAccessKey|secret_access_key|apiKey|api_key|password|passwd|sessionSecret)\s*([=:])\s*([^\s,;]+)/gi,
+      '$1$2[REDACTED]'
+    );
 }
 
 export function slugifyOrgName(name: string): string {

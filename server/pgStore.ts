@@ -631,9 +631,77 @@ export class PgDataStore {
 
           [userRow] = await tx.select().from(users).where(eq(users.id, userId)).limit(1);
         } else {
+          if (!userRow.firebaseUid && !params.emailVerified) {
+            throw new StoreError(
+              403,
+              'Google account email must be verified before linking to an existing account.'
+            );
+          }
+
+          let invitedOrgId: string | null = null;
+          if (params.inviteToken) {
+            const inviteHash = sha256Hex(params.inviteToken);
+            const [inv] = await tx
+              .select()
+              .from(invitations)
+              .where(eq(invitations.tokenHash, inviteHash))
+              .limit(1);
+            if (!inv || inv.status !== 'pending' || inv.expiresAt.getTime() <= Date.now()) {
+              throw new StoreError(400, 'This invitation is invalid or has expired.');
+            }
+            if (normalizeEmail(inv.email) !== email) {
+              throw new StoreError(
+                403,
+                'Your Google email does not match the invited email address.'
+              );
+            }
+
+            const [existingMem] = await tx
+              .select()
+              .from(organizationMemberships)
+              .where(
+                and(
+                  eq(organizationMemberships.organizationId, inv.organizationId),
+                  eq(organizationMemberships.userId, userRow.id)
+                )
+              )
+              .limit(1);
+
+            if (!existingMem) {
+              await tx.insert(organizationMemberships).values({
+                id: makeId('mem'),
+                organizationId: inv.organizationId,
+                userId: userRow.id,
+                role: inv.role as UserRole,
+                status: 'active',
+              });
+            }
+
+            await tx
+              .update(invitations)
+              .set({ status: 'accepted', acceptedAt: new Date() })
+              .where(eq(invitations.id, inv.id));
+
+            await this.appendAuditTx(tx, {
+              organizationId: inv.organizationId,
+              actorUserId: userRow.id,
+              actorName: userRow.fullName,
+              actorRole: (existingMem?.role || inv.role) as UserRole,
+              entityType: 'membership',
+              entityId: userRow.id,
+              action: 'INVITATION_ACCEPTED',
+              detail: `${userRow.fullName} (${email}) accepted invitation via Google Sign-In as ${
+                existingMem?.role || inv.role
+              }.`,
+            });
+
+            invitedOrgId = inv.organizationId;
+          }
+
           const patch: Partial<typeof users.$inferInsert> = { updatedAt: new Date() };
           if (!userRow.firebaseUid) patch.firebaseUid = params.firebaseUid;
           if (!userRow.emailVerified && params.emailVerified) patch.emailVerified = true;
+          if (invitedOrgId) patch.lastActiveOrgId = invitedOrgId;
           await tx.update(users).set(patch).where(eq(users.id, userRow.id));
           [userRow] = await tx.select().from(users).where(eq(users.id, userRow.id)).limit(1);
         }

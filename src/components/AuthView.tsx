@@ -154,11 +154,22 @@ export function AuthView({
       onClearUrlParams();
       await onAuthenticated(data as AuthStatePayload);
     } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : 'Google Sign-In could not be completed. Check popup permissions.'
-      );
+      const code = (err as { code?: string })?.code;
+      if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
+        setError('Google Sign-In window was closed before completing sign-in.');
+      } else if (code === 'auth/popup-blocked') {
+        setError('Browser blocked the Google Sign-In popup. Allow popups for this site and retry.');
+      } else if (code === 'auth/unauthorized-domain') {
+        setError(
+          'This domain is not yet added to Firebase Authorized Domains. Use email/password sign-in or authorize this domain in Firebase Console.'
+        );
+      } else {
+        setError(
+          err instanceof Error
+            ? err.message
+            : 'Google Sign-In could not be completed. Check popup permissions.'
+        );
+      }
     } finally {
       setBusy(false);
     }

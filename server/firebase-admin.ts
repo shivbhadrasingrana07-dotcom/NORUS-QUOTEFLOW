@@ -15,10 +15,21 @@ export interface VerifiedFirebaseUser {
   email?: string;
   name?: string;
   email_verified?: boolean;
+  aud?: string;
+  iss?: string;
 }
 
 export type FirebaseTokenVerifier = (idToken: string) => Promise<VerifiedFirebaseUser>;
 
 export async function verifyFirebaseIdToken(idToken: string): Promise<DecodedIdToken> {
-  return adminAuth.verifyIdToken(idToken);
+  // checkRevoked=true rejects tokens for disabled accounts or revoked refresh tokens
+  const decoded = await adminAuth.verifyIdToken(idToken, true);
+  const expectedIssuer = `https://securetoken.google.com/${firebaseConfig.projectId}`;
+  if (decoded.aud !== firebaseConfig.projectId) {
+    throw new Error('Firebase ID token audience mismatch.');
+  }
+  if (decoded.iss !== expectedIssuer) {
+    throw new Error('Firebase ID token issuer mismatch.');
+  }
+  return decoded;
 }

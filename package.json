@@ -11,7 +11,9 @@
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
     "test": "tsx --test tests/*.test.ts",
-    "db:migrate": "tsx scripts/migrate-json-to-postgres.ts"
+    "db:migrate": "tsx scripts/migrate-json-to-postgres.ts",
+    "ops:maintenance": "tsx scripts/run-maintenance.ts",
+    "org:bootstrap-owner": "tsx scripts/bootstrap-org-owner.ts"
   },
   "dependencies": {
     "@google/genai": "^3.6.1",

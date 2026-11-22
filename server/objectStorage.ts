@@ -20,6 +20,7 @@ export interface ObjectStorageProvider {
     filename: string;
     expiresInSec?: number;
   }): Promise<SignedDownloadResult>;
+  checkReadiness(): Promise<{ ok: boolean; error?: string }>;
 }
 
 export function sanitizeStorageKey(rawKey: string): string {
@@ -127,6 +128,19 @@ export class LocalPrivateStorageProvider implements ObjectStorageProvider {
       organizationId: params.organizationId,
       expiresInSec: params.expiresInSec,
     });
+  }
+
+  async checkReadiness(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      await fs.promises.mkdir(this.rootDir, { recursive: true });
+      await fs.promises.access(this.rootDir, fs.constants.R_OK | fs.constants.W_OK);
+      return { ok: true };
+    } catch (err) {
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : 'Local storage directory inaccessible.',
+      };
+    }
   }
 }
 
@@ -349,6 +363,26 @@ export class S3CompatibleStorageProvider implements ObjectStorageProvider {
       url: `${url.origin}${canonicalUri}?${canonicalQuery}&X-Amz-Signature=${signature}`,
       expiresAt: new Date(now.getTime() + ttl * 1000).toISOString(),
     };
+  }
+
+  async checkReadiness(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const signed = this.signRequest({
+        method: 'GET',
+        storageKey: '.healthcheck',
+        payloadHash: sha256HexBuf(''),
+      });
+      const res = await fetch(signed.url, { method: 'GET', headers: signed.headers });
+      if (res.ok || res.status === 404) {
+        return { ok: true };
+      }
+      return { ok: false, error: `S3 storage returned status ${res.status}` };
+    } catch (err) {
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : 'S3 connectivity check failed.',
+      };
+    }
   }
 }
 

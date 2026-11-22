@@ -2,12 +2,17 @@
 
 All API endpoints are served under `/api/*` by `server.ts`.
 Authenticated endpoints require the `nf_session` `HttpOnly` cookie, and all authenticated `POST`/`PATCH`/`DELETE` requests require the matching `X-CSRF-Token` header.
+Every response echoes or generates an `X-Request-Id` correlation header, and unhandled `500` responses return `{ "error": "Internal server error.", "requestId": "..." }`.
 
-## Health & Deprecated Sandbox Routes
+## Liveness, Readiness & Deprecated Sandbox Routes
 
 ### `GET /api/health`
-Returns server and configuration readiness without leaking secrets or DB error details.
-- **200 OK:** `{ "status": "ok", "database": "postgresql", "storageProvider": "local" | "s3", "emailProvider": "dev_outbox" | "resend", "geminiConfigured": boolean, "googleAuthConfigured": true }`
+Fast process liveness probe (does not block on external database startup checks or expose credentials).
+- **200 OK:** `{ "status": "ok", "database": "postgresql", "storageProvider": "local" | "s3", "emailProvider": "dev_outbox" | "resend", "geminiConfigured": boolean, "googleAuthConfigured": true, "timestamp": string, "uptimeSec": number }`
+
+### `GET /api/health/ready`
+Dependency readiness probe executing PostgreSQL `SELECT 1`, private object storage readiness (`checkReadiness()`), email sender configuration status, and AI/OAuth readiness flags (never exposes secrets, stack traces, or connection strings).
+- **200 OK / 503 Service Unavailable:** `{ "status": "ready" | "degraded", "timestamp": string, "uptimeSec": number, "checks": { "database": { "ok", "latencyMs", "error?" }, "storage": { "ok", "mode", "latencyMs", "error?" }, "email": { "mode", "configured", "senderValid" }, "gemini": { "configured" }, "googleAuth": { "configured" } } }`
 
 ### `ALL /api/demo/switch-persona`
 Permanently disabled.
@@ -30,15 +35,15 @@ Verifies email + `scrypt` password hash and sets `nf_session`.
 - **Responses:** `200 OK`, `400 Bad Request`, `401 Unauthorized`, `429 Too Many Requests`.
 
 ### `POST /api/auth/google` *(Rate Limited)*
-Verifies Firebase Google `idToken` via `firebase-admin` on the server, links/provisions the user, optionally accepts `inviteToken`, and sets `nf_session`.
+Verifies Firebase Google `idToken` via `firebase-admin` (`checkRevoked=true`, `aud`/`iss` checked), enforces `email_verified === true` before linking to an existing password account, optionally accepts `inviteToken` for both new and existing users, and sets `nf_session`.
 - **Body:** `{ idToken, inviteToken? }`
-- **Responses:** `200 OK`, `400 Bad Request`, `401 Unauthorized`, `403 Forbidden` (invite email mismatch).
+- **Responses:** `200 OK`, `400 Bad Request`, `401 Unauthorized`, `403 Forbidden` (unverified email link attempt or invite email mismatch).
 
 ### `POST /api/auth/logout` *(Auth + CSRF)*
 Revokes the active PostgreSQL session row and clears `nf_session`.
 
 ### `POST /api/auth/verify-email` *(Rate Limited)*
-Validates `{ token }` (`SHA-256` lookup) and marks `emailVerified = true`.
+Validates `{ token }` (`SHA-256` lookup, rejects expired or reused tokens) and marks `emailVerified = true`.
 
 ### `POST /api/auth/resend-verification` *(Auth + CSRF + Rate Limited)*
 Re-issues a 24-hour verification link via `EmailProvider`.

@@ -18,6 +18,14 @@ import {
   extractQuotationWithGemini,
   type GenerateContentFn,
 } from './server/geminiExtractor.ts';
+import { runScheduledMaintenance } from './server/maintenance.ts';
+import {
+  checkDependencyReadiness,
+  createCorrelationMiddleware,
+  dispatchErrorTrackerHook,
+  type ErrorTrackerHook,
+  logEvent,
+} from './server/monitoring.ts';
 import {
   buildDocumentStorageKey,
   createObjectStorageProvider,
@@ -46,6 +54,7 @@ declare global {
   namespace Express {
     interface Request {
       auth?: SessionAuthContext;
+      requestId?: string;
     }
   }
 }
@@ -59,6 +68,7 @@ export interface AppOptions {
   firebaseVerifier?: FirebaseTokenVerifier;
   generateContentOverride?: GenerateContentFn;
   authRateLimitMax?: number;
+  errorTrackerHook?: ErrorTrackerHook;
 }
 
 function safeTimingEqual(a: string, b: string): boolean {
@@ -139,11 +149,13 @@ export async function createApp(options: AppOptions = {}) {
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', 1);
+  app.use(createCorrelationMiddleware());
 
   // Security headers
   app.use((_req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
     res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
     res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
     res.setHeader(
@@ -294,16 +306,30 @@ export async function createApp(options: AppOptions = {}) {
     return `${proto}://${host}`;
   }
 
-  // Health Check
+  // Liveness Check (fast, never leaks credentials or executes blocking startup probes)
   app.get('/api/health', (_req, res) => {
     res.json({
       status: 'ok',
       database: 'postgresql',
       storageProvider: storageProvider.mode,
       emailProvider: emailProvider.mode,
-      geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
+      geminiConfigured: Boolean(
+        process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'
+      ),
       googleAuthConfigured: true,
+      timestamp: new Date().toISOString(),
+      uptimeSec: Math.floor(process.uptime()),
     });
+  });
+
+  // Dependency Readiness Check (PostgreSQL SELECT 1 + private object storage + email/AI config)
+  app.get('/api/health/ready', async (_req, res) => {
+    const report = await checkDependencyReadiness({
+      db,
+      storageProvider,
+      emailProvider,
+    });
+    res.status(report.status === 'ready' ? 200 : 503).json(report);
   });
 
   // Disabled Demo Role Switcher
@@ -1197,12 +1223,18 @@ export async function createApp(options: AppOptions = {}) {
   }
 
   // Centralized error handler (never leaks raw SQL/stack/secrets)
-  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
     if (err instanceof multer.MulterError) {
       if (err.code === 'LIMIT_FILE_SIZE') {
-        return res.status(413).json({ error: 'Uploaded file exceeds the 25 MB limit.' });
+        return res.status(413).json({
+          error: 'Uploaded file exceeds the 25 MB limit.',
+          requestId: req.requestId,
+        });
       }
-      return res.status(400).json({ error: `File upload error: ${err.message}` });
+      return res.status(400).json({
+        error: `File upload error: ${err.message}`,
+        requestId: req.requestId,
+      });
     }
     const status =
       err instanceof StoreError
@@ -1211,11 +1243,30 @@ export async function createApp(options: AppOptions = {}) {
         ? err.statusCode
         : 500;
     const rawMessage = err instanceof Error ? err.message : 'Internal server error.';
-    const message = status >= 500 ? 'Internal server error.' : redactSensitiveText(rawMessage);
+    const safeRaw = redactSensitiveText(rawMessage);
+    const message = status >= 500 ? 'Internal server error.' : safeRaw;
     if (status >= 500) {
-      console.error('[server error]', redactSensitiveText(rawMessage));
+      logEvent('error', 'unhandled_server_error', {
+        requestId: req.requestId,
+        method: req.method,
+        path: req.path,
+        statusCode: status,
+        message: safeRaw,
+        organizationId: req.auth?.activeOrganization?.id ?? null,
+        userId: req.auth?.user.id ?? null,
+      });
+      dispatchErrorTrackerHook(options.errorTrackerHook, {
+        requestId: req.requestId,
+        method: req.method,
+        path: req.path,
+        statusCode: status,
+        message: safeRaw,
+        organizationId: req.auth?.activeOrganization?.id ?? null,
+        userId: req.auth?.user.id ?? null,
+        ts: new Date().toISOString(),
+      });
     }
-    res.status(status).json({ error: message });
+    res.status(status).json({ error: message, requestId: req.requestId });
   });
 
   return app;
@@ -1226,9 +1277,26 @@ const isDirectExecution =
 
 if (isDirectExecution) {
   const PORT = Number(process.env.PORT) || 3000;
-  createApp({ enableVite: true }).then((app) => {
+  const storageProvider = createObjectStorageProvider();
+  createApp({ enableVite: true, storageProvider }).then((app) => {
     app.listen(PORT, '0.0.0.0', () => {
-      console.log(`NORUS QUOTEFLOW server running on http://0.0.0.0:${PORT}`);
+      logEvent('info', 'server_started', {
+        port: PORT,
+        nodeEnv: process.env.NODE_ENV || 'development',
+        storageProvider: storageProvider.mode,
+      });
     });
+
+    const intervalMinutes = Number(process.env.MAINTENANCE_INTERVAL_MINUTES ?? '360');
+    if (Number.isFinite(intervalMinutes) && intervalMinutes > 0 && isSqlEnvConfigured()) {
+      const timer = setInterval(() => {
+        runScheduledMaintenance({ db: defaultDb, storageProvider }).catch((err) => {
+          logEvent('error', 'scheduled_maintenance_failed', {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }, intervalMinutes * 60 * 1000);
+      timer.unref();
+    }
   });
 }
