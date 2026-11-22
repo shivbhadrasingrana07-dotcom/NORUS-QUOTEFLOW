@@ -260,10 +260,9 @@ export function DashboardView({
             <tbody className="divide-y divide-[#E2E8F0] text-sm">
               {rfqs.map((rfq) => {
                 const rQuotes = quotations.filter((q) => q.rfqId === rfq.id);
-                const bestLanded =
-                  rQuotes.length > 0
-                    ? Math.min(...rQuotes.map((q) => q.totalLandedCost))
-                    : null;
+                const ranked = rankQuotations(rQuotes, 'landed');
+                const l1 = ranked.find((r) => r.rankIndex === 1);
+                const bestLanded = l1 ? l1.totalForBasis : null;
                 return (
                   <tr
                     key={rfq.id}
@@ -283,7 +282,11 @@ export function DashboardView({
                       {rQuotes.length} / {Math.max(rQuotes.length, rfq.invitedSupplierIds.length)}
                     </td>
                     <td className="py-3 px-4 font-mono tabular-nums text-right font-semibold text-[#0F172A] whitespace-nowrap">
-                      {bestLanded !== null ? formatMoney(bestLanded, rfq.currency) : '—'}
+                      {bestLanded !== null
+                        ? formatMoney(bestLanded, rfq.currency)
+                        : rQuotes.length > 0
+                        ? 'Pending Audit'
+                        : '—'}
                     </td>
                     <td className="py-3 px-4 font-mono text-xs text-[#475569] whitespace-nowrap">
                       {formatDateShort(rfq.deadlineDate)}

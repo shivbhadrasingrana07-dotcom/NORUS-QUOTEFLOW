@@ -17,6 +17,7 @@ import {
   Supplier,
 } from '../types.ts';
 import { formatMoney, formatPct } from '../lib/format.ts';
+import { rankQuotations } from '../lib/ranking.ts';
 
 interface ComparisonMatrixPaneProps {
   rfq: Rfq;
@@ -68,23 +69,17 @@ export function ComparisonMatrixPane({
     );
   }
 
-  const getQuoteTotalForBasis = (q: Quotation) => {
-    if (basis === 'base') return q.subtotalBase;
-    if (basis === 'gross') return q.totalGrossPayable;
-    return q.totalLandedCost;
-  };
-
   const getLineUnitForBasis = (line: QuotationLine) => {
     if (basis === 'base') return line.normalizedUnitBase;
     if (basis === 'gross') return line.normalizedUnitGross;
     return line.normalizedUnitLanded;
   };
 
-  const sortedQuotes = [...quotes].sort(
-    (a, b) => getQuoteTotalForBasis(a) - getQuoteTotalForBasis(b)
-  );
-  const l1Total = getQuoteTotalForBasis(sortedQuotes[0]);
-  const activePackageId = selectedPackageQuoteId || sortedQuotes[0].id;
+  const rankedQuotes = rankQuotations(quotes, basis);
+  const sortedQuotes = rankedQuotes.map((r) => r.quotation);
+  const l1Eligible = rankedQuotes.find((r) => r.rankIndex === 1) || null;
+  const baselineTotal = l1Eligible ? l1Eligible.totalForBasis : rankedQuotes[0].totalForBasis;
+  const activePackageId = selectedPackageQuoteId || (l1Eligible ? l1Eligible.quotation.id : sortedQuotes[0].id);
 
   const getSupplier = (id: string) => suppliers.find((s) => s.id === id);
 
@@ -97,14 +92,16 @@ export function ComparisonMatrixPane({
     return cat?.lastAwardedUnitPrice ?? item.targetUnitPrice ?? null;
   };
 
-  // Compute default L1 vendor per line for Split Mode
   const getEffectiveSplitQuoteForItem = (rfqItemId: string): string => {
     if (splitSelection[rfqItemId]) return splitSelection[rfqItemId];
     let bestQuoteId = sortedQuotes[0].id;
     let bestUnit = Infinity;
     for (const q of sortedQuotes) {
       const line = q.lines.find((l) => l.rfqItemId === rfqItemId);
-      const u = line && line.matchStatus !== 'not_quoted' ? getLineUnitForBasis(line) : null;
+      const u =
+        line && line.matchStatus !== 'not_quoted' && line.mathValid
+          ? getLineUnitForBasis(line)
+          : null;
       if (u !== null && u < bestUnit) {
         bestUnit = u;
         bestQuoteId = q.id;
@@ -127,24 +124,26 @@ export function ComparisonMatrixPane({
     });
   });
 
-  // Compute Split Award Blended Total
+  // Compute Split Award Blended Total (in Landed basis for award submission)
   const splitAllocations: AwardAllocation[] = [];
   let splitTotalLanded = 0;
+  let splitHasInvalidSelection = false;
 
   for (const item of rfq.items) {
     const qId = getEffectiveSplitQuoteForItem(item.id);
     const quote = sortedQuotes.find((q) => q.id === qId) || sortedQuotes[0];
     const line = quote.lines.find((l) => l.rfqItemId === item.id);
-    const unitLanded = line?.normalizedUnitLanded ?? 0;
-    splitTotalLanded += unitLanded * item.quantity;
-    if (line) {
+    if (!line || line.matchStatus === 'not_quoted' || !line.mathValid || line.normalizedUnitLanded === null) {
+      splitHasInvalidSelection = true;
+    } else {
+      splitTotalLanded += line.normalizedUnitLanded * item.quantity;
       splitAllocations.push({
         rfqItemId: item.id,
         quotationId: quote.id,
         quotationLineId: line.id,
         supplierId: quote.supplierId,
         awardedQty: item.quantity,
-        awardedUnitLanded: unitLanded,
+        awardedUnitLanded: line.normalizedUnitLanded,
       });
     }
   }
@@ -155,31 +154,34 @@ export function ComparisonMatrixPane({
       const allocs: AwardAllocation[] = rfq.items
         .map((item) => {
           const line = chosen.lines.find((l) => l.rfqItemId === item.id);
-          if (!line || line.matchStatus === 'not_quoted') return null;
+          if (!line || line.matchStatus === 'not_quoted' || !line.mathValid || line.normalizedUnitLanded === null) {
+            return null;
+          }
           return {
             rfqItemId: item.id,
             quotationId: chosen.id,
             quotationLineId: line.id,
             supplierId: chosen.supplierId,
             awardedQty: item.quantity,
-            awardedUnitLanded: line.normalizedUnitLanded ?? 0,
+            awardedUnitLanded: line.normalizedUnitLanded,
           };
         })
         .filter((x): x is AwardAllocation => x !== null);
 
+      const l1Landed = l1Eligible ? l1Eligible.quotation.totalLandedCost : chosen.totalLandedCost;
       onProceedToAward({
         isSplitAward: false,
         allocations: allocs,
         totalAwardedLanded: chosen.totalLandedCost,
-        isNonL1: chosen.id !== sortedQuotes[0].id,
+        isNonL1: l1Eligible ? chosen.totalLandedCost > l1Landed + 1 : false,
       });
     } else {
-      const l1LandedTotal = Math.min(...sortedQuotes.map((q) => q.totalLandedCost));
+      const l1LandedTotal = l1Eligible ? l1Eligible.quotation.totalLandedCost : splitTotalLanded;
       onProceedToAward({
         isSplitAward: true,
         allocations: splitAllocations,
         totalAwardedLanded: Math.round(splitTotalLanded * 100) / 100,
-        isNonL1: splitTotalLanded > l1LandedTotal + 1,
+        isNonL1: l1Eligible ? splitTotalLanded > l1LandedTotal + 1 : false,
       });
     }
   };
@@ -189,7 +191,6 @@ export function ComparisonMatrixPane({
       {/* Controls Bar */}
       <div className="bg-white border border-[#E2E8F0] rounded-lg p-3.5 flex flex-col xl:flex-row xl:items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-3">
-          {/* Cost Basis Switcher */}
           <div className="flex items-center gap-1 p-1 bg-[#F8FAFC] border border-[#E2E8F0] rounded-lg">
             {(
               [
@@ -212,7 +213,6 @@ export function ComparisonMatrixPane({
             ))}
           </div>
 
-          {/* Package vs Split Award Simulator */}
           <div className="flex items-center gap-1 p-1 bg-[#F8FAFC] border border-[#E2E8F0] rounded-lg">
             <button
               onClick={() => setAwardMode('package')}
@@ -264,7 +264,13 @@ export function ComparisonMatrixPane({
           </button>
           <button
             onClick={handleRecommendClick}
-            className="px-3.5 py-1.5 text-xs font-medium text-white bg-[#0F4C81] rounded-md hover:bg-[#0A365C] whitespace-nowrap"
+            disabled={awardMode === 'split' && splitHasInvalidSelection}
+            className="px-3.5 py-1.5 text-xs font-medium text-white bg-[#0F4C81] rounded-md hover:bg-[#0A365C] disabled:opacity-50 whitespace-nowrap"
+            title={
+              awardMode === 'split' && splitHasInvalidSelection
+                ? 'Select valid, quoted lines for all items before recommending a split award'
+                : 'Proceed to award approval'
+            }
           >
             {awardMode === 'split'
               ? `Proceed with Split Award (${formatMoney(splitTotalLanded, rfq.currency)})`
@@ -272,6 +278,15 @@ export function ComparisonMatrixPane({
           </button>
         </div>
       </div>
+
+      {!l1Eligible && (
+        <div className="p-3 bg-[#FFFBEB] border border-[#FDE68A] text-[#92400E] text-xs rounded-md flex items-center gap-2">
+          <AlertTriangle className="w-4 h-4 text-[#D97706] shrink-0" />
+          <span>
+            No quotation is currently both 100% complete and verified. Incomplete or unverified quotes are excluded from L1 ranking until audited.
+          </span>
+        </div>
+      )}
 
       {/* Main Comparison Matrix Table */}
       <div className="bg-white border border-[#E2E8F0] rounded-lg overflow-hidden">
@@ -288,30 +303,41 @@ export function ComparisonMatrixPane({
                   </div>
                 </th>
 
-                {sortedQuotes.map((q, idx) => {
+                {rankedQuotes.map((rk) => {
+                  const q = rk.quotation;
                   const sup = getSupplier(q.supplierId);
-                  const total = getQuoteTotalForBasis(q);
-                  const delta = total - l1Total;
-                  const deltaPct = l1Total > 0 ? (delta / l1Total) * 100 : 0;
-                  const isL1 = idx === 0;
+                  const total = rk.totalForBasis;
+                  const delta = total - baselineTotal;
+                  const deltaPct = baselineTotal > 0 ? (delta / baselineTotal) * 100 : 0;
+                  const isL1 = rk.rankIndex === 1;
                   const isSelectedPkg = awardMode === 'package' && activePackageId === q.id;
                   const mathErrCount = q.lines.filter((l) => !l.mathValid).length;
+                  const unmappedCount = q.lines.filter((l) => l.matchStatus === 'unmapped').length;
 
                   return (
                     <th
                       key={q.id}
                       onClick={() => awardMode === 'package' && setSelectedPackageQuoteId(q.id)}
-                      className={`py-3 px-4 min-w-[230px] border-r border-[#E2E8F0] last:border-r-0 align-top transition-colors ${
+                      className={`py-3 px-4 min-w-[235px] border-r border-[#E2E8F0] last:border-r-0 align-top transition-colors ${
                         awardMode === 'package' ? 'cursor-pointer' : ''
                       } ${isSelectedPkg ? 'bg-[#0F4C81]/5' : ''}`}
                     >
                       <div className="flex items-center justify-between gap-2">
                         <span
                           className={`font-mono text-xs font-bold ${
-                            isL1 ? 'text-[#059669]' : 'text-[#475569]'
+                            isL1
+                              ? 'text-[#059669]'
+                              : rk.eligibleForAwardRank
+                              ? 'text-[#0F4C81]'
+                              : 'text-[#D97706]'
                           }`}
                         >
-                          L{idx + 1} {isL1 ? '· Lowest' : `· ${formatPct(deltaPct)}`}
+                          {rk.rankLabel}
+                          {isL1
+                            ? ' · Lowest Verified'
+                            : rk.eligibleForAwardRank
+                            ? ` · ${formatPct(deltaPct)}`
+                            : ' · Excluded'}
                         </span>
                         <button
                           type="button"
@@ -336,9 +362,11 @@ export function ComparisonMatrixPane({
 
                       <div className="text-[11px] text-[#475569] mt-1 font-normal space-y-0.5">
                         <div className="font-mono tabular-nums">
-                          {delta > 0 ? `+${formatMoney(delta, rfq.currency)} vs L1` : 'Baseline L1'}
-                          {' · '}
-                          {Math.round(q.completenessRatio * 100)}% items
+                          {rk.eligibleForAwardRank
+                            ? isL1
+                              ? 'Baseline L1'
+                              : `${delta >= 0 ? '+' : ''}${formatMoney(delta, rfq.currency)} vs L1`
+                            : `${Math.round(q.completenessRatio * 100)}% BOM coverage`}
                         </div>
                         <div className="flex items-center gap-1.5 flex-wrap">
                           {q.isVerified ? (
@@ -355,6 +383,9 @@ export function ComparisonMatrixPane({
                               · {mathErrCount} Math Mismatch
                             </span>
                           )}
+                          {unmappedCount > 0 && (
+                            <span className="text-[#D97706]">· {unmappedCount} Unmapped</span>
+                          )}
                           {q.missingFreightWarning && (
                             <span className="text-[#D97706]">· Freight To-Pay</span>
                           )}
@@ -367,15 +398,16 @@ export function ComparisonMatrixPane({
             </thead>
 
             <tbody className="divide-y divide-[#E2E8F0] text-xs">
-              {/* Line Item Rows */}
               {visibleItems.map((item) => {
                 const lastPaid = getLastPaidPrice(item);
 
-                // Find lowest unit price on this row
                 let minRowUnit = Infinity;
                 for (const q of sortedQuotes) {
                   const l = q.lines.find((ql) => ql.rfqItemId === item.id);
-                  const val = l && l.matchStatus !== 'not_quoted' ? getLineUnitForBasis(l) : null;
+                  const val =
+                    l && l.matchStatus !== 'not_quoted' && l.mathValid
+                      ? getLineUnitForBasis(l)
+                      : null;
                   if (val !== null && val < minRowUnit) minRowUnit = val;
                 }
 
@@ -422,7 +454,8 @@ export function ComparisonMatrixPane({
                       }
 
                       const unitVal = getLineUnitForBasis(line);
-                      const isRowBest = unitVal !== null && Math.abs(unitVal - minRowUnit) < 0.01;
+                      const isRowBest =
+                        line.mathValid && unitVal !== null && Math.abs(unitVal - minRowUnit) < 0.01;
                       const vsLastPaid =
                         lastPaid && unitVal ? ((unitVal - lastPaid) / lastPaid) * 100 : null;
                       const isSplitChosen = awardMode === 'split' && splitSelectedQid === q.id;
@@ -431,12 +464,12 @@ export function ComparisonMatrixPane({
                         <td
                           key={q.id}
                           onClick={() => {
-                            if (awardMode === 'split') {
+                            if (awardMode === 'split' && line.mathValid) {
                               setSplitSelection((prev) => ({ ...prev, [item.id]: q.id }));
                             }
                           }}
                           className={`py-3 px-4 border-r border-[#E2E8F0] last:border-r-0 align-top transition-colors ${
-                            awardMode === 'split' ? 'cursor-pointer' : ''
+                            awardMode === 'split' && line.mathValid ? 'cursor-pointer' : ''
                           } ${
                             isSplitChosen
                               ? 'bg-[#0F4C81]/10 ring-1 ring-inset ring-[#0F4C81]'
@@ -450,7 +483,11 @@ export function ComparisonMatrixPane({
                           <div className="flex items-baseline justify-between gap-2">
                             <span
                               className={`font-mono tabular-nums text-sm font-bold ${
-                                isRowBest ? 'text-[#059669]' : 'text-[#0F172A]'
+                                !line.mathValid
+                                  ? 'text-[#DC2626]'
+                                  : isRowBest
+                                  ? 'text-[#059669]'
+                                  : 'text-[#0F172A]'
                               }`}
                             >
                               {formatMoney(unitVal, rfq.currency)}
@@ -463,6 +500,7 @@ export function ComparisonMatrixPane({
                               <input
                                 type="radio"
                                 name={`split-${item.id}`}
+                                disabled={!line.mathValid}
                                 checked={isSplitChosen}
                                 onChange={() =>
                                   setSplitSelection((prev) => ({ ...prev, [item.id]: q.id }))
@@ -474,11 +512,7 @@ export function ComparisonMatrixPane({
 
                           <div className="text-[11px] text-[#475569] mt-1 font-mono tabular-nums space-y-0.5">
                             <div>
-                              Line:{' '}
-                              {formatMoney(
-                                (unitVal ?? 0) * item.quantity,
-                                rfq.currency
-                              )}
+                              Line: {formatMoney((unitVal ?? 0) * item.quantity, rfq.currency)}
                             </div>
 
                             {line.uomConversionFactor !== 1 && (
@@ -541,14 +575,15 @@ export function ComparisonMatrixPane({
                 );
               })}
 
-              {/* Commercial Terms Comparison Rows */}
               <tr className="bg-[#F8FAFC] font-medium">
                 <td className="sticky left-0 z-10 bg-[#F8FAFC] py-2.5 px-4 border-r border-[#E2E8F0] text-[#0F172A]">
-                  Freight, P&F & Discounts
+                  Freight, P&F & Discounts ({rfq.currency})
                 </td>
                 {sortedQuotes.map((q) => {
+                  const fx = q.exchangeRateToRfq > 0 ? q.exchangeRateToRfq : 1;
                   const overhead =
-                    q.freightCharges + q.packingForwarding + q.otherCharges - q.globalDiscount;
+                    (q.freightCharges + q.packingForwarding + q.otherCharges - q.globalDiscount) *
+                    fx;
                   return (
                     <td
                       key={q.id}
@@ -556,9 +591,10 @@ export function ComparisonMatrixPane({
                     >
                       {formatMoney(overhead, rfq.currency)}
                       <div className="text-[11px] font-sans font-normal text-[#475569]">
-                        Freight: {formatMoney(q.freightCharges, rfq.currency)} · P&F:{' '}
-                        {formatMoney(q.packingForwarding, rfq.currency)}
-                        {q.globalDiscount > 0 && ` · Disc: -${formatMoney(q.globalDiscount, rfq.currency)}`}
+                        Freight: {formatMoney(q.freightCharges * fx, rfq.currency)} · P&F:{' '}
+                        {formatMoney(q.packingForwarding * fx, rfq.currency)}
+                        {q.globalDiscount > 0 &&
+                          ` · Disc: -${formatMoney(q.globalDiscount * fx, rfq.currency)}`}
                       </div>
                     </td>
                   );
@@ -574,7 +610,7 @@ export function ComparisonMatrixPane({
                     key={q.id}
                     className="py-2.5 px-4 border-r border-[#E2E8F0] last:border-r-0 font-mono tabular-nums text-[#0F172A]"
                   >
-                    {q.leadTimeDays ? `${q.leadTimeDays} Days` : 'Not specified'}
+                    {q.leadTimeDays !== null ? `${q.leadTimeDays} Days` : 'Not specified'}
                   </td>
                 ))}
               </tr>
@@ -600,7 +636,6 @@ export function ComparisonMatrixPane({
         </div>
       </div>
 
-      {/* Source Trace Inspection Popover Modal */}
       {inspectedCell && (
         <div className="bg-white border border-[#0F4C81]/40 rounded-lg p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <div className="space-y-1">

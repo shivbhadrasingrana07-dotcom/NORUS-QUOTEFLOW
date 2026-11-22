@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   AlertTriangle,
   Check,
@@ -26,6 +26,24 @@ interface ExtractionReviewPaneProps {
   onGoToCompare: () => void;
 }
 
+function colIndexToLetter(index: number): string {
+  let letter = '';
+  let n = index;
+  while (n >= 0) {
+    letter = String.fromCharCode((n % 26) + 65) + letter;
+    n = Math.floor(n / 26) - 1;
+  }
+  return letter;
+}
+
+interface LineDraft {
+  quotedQty: string;
+  quotedUnitRate: string;
+  uomConversionFactor: string;
+  taxRatePct: string;
+  lineTotalQuoted: string;
+}
+
 export function ExtractionReviewPane({
   rfq,
   quotes,
@@ -44,6 +62,44 @@ export function ExtractionReviewPane({
   const [savingId, setSavingId] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
+  // Buffered header state to prevent per-keystroke API races
+  const [headerDraft, setHeaderDraft] = useState({
+    freightCharges: '0',
+    packingForwarding: '0',
+    globalDiscount: '0',
+    leadTimeDays: '',
+    paymentTerms: '',
+    exchangeRateToRfq: '1',
+  });
+
+  // Buffered line drafts keyed by lineId
+  const [lineDrafts, setLineDrafts] = useState<Record<string, LineDraft>>({});
+
+  useEffect(() => {
+    if (!activeQuote) return;
+    setHeaderDraft({
+      freightCharges: String(activeQuote.freightCharges),
+      packingForwarding: String(activeQuote.packingForwarding),
+      globalDiscount: String(activeQuote.globalDiscount),
+      leadTimeDays: activeQuote.leadTimeDays !== null ? String(activeQuote.leadTimeDays) : '',
+      paymentTerms: activeQuote.paymentTerms ?? '',
+      exchangeRateToRfq: String(activeQuote.exchangeRateToRfq),
+    });
+
+    const nextLines: Record<string, LineDraft> = {};
+    for (const l of activeQuote.lines) {
+      nextLines[l.id] = {
+        quotedQty: l.quotedQty !== null ? String(l.quotedQty) : '',
+        quotedUnitRate: l.quotedUnitRate !== null ? String(l.quotedUnitRate) : '',
+        uomConversionFactor: String(l.uomConversionFactor),
+        taxRatePct: String(l.taxRatePct),
+        lineTotalQuoted: l.lineTotalQuoted !== null ? String(l.lineTotalQuoted) : '',
+      };
+    }
+    setLineDrafts(nextLines);
+    setErrorMsg(null);
+  }, [activeQuote]);
+
   if (!activeQuote) {
     return (
       <div className="bg-white border border-[#E2E8F0] rounded-lg p-10 text-center">
@@ -58,10 +114,8 @@ export function ExtractionReviewPane({
   const unresolvedMathCount = activeQuote.lines.filter((l) => !l.mathValid).length;
   const focusedLine = activeQuote.lines.find((l) => l.id === focusedLineId) || null;
 
-  const colLetter = (idx: number) => String.fromCharCode(65 + idx);
-
   const isCellHighlighted = (sheetName: string, rowIdx: number, colIdx: number) => {
-    const coord = `${colLetter(colIdx)}${rowIdx + 1}`;
+    const coord = `${colIndexToLetter(colIdx)}${rowIdx + 1}`;
     if (focusedLine?.sourceTrace.sheet === sheetName && focusedLine.sourceTrace.cell) {
       const ref = focusedLine.sourceTrace.cell;
       if (ref.includes(':')) {
@@ -70,7 +124,7 @@ export function ExtractionReviewPane({
         const endRow = parseInt(end.replace(/[^0-9]/g, ''), 10);
         const startCol = start.replace(/[0-9]/g, '');
         const endCol = end.replace(/[0-9]/g, '');
-        const curCol = colLetter(colIdx);
+        const curCol = colIndexToLetter(colIdx);
         return (
           rowIdx + 1 >= startRow &&
           rowIdx + 1 <= endRow &&
@@ -121,6 +175,89 @@ export function ExtractionReviewPane({
     } finally {
       setSavingId(null);
     }
+  };
+
+  const commitHeaderBlur = () => {
+    const freight = Number(headerDraft.freightCharges);
+    const pf = Number(headerDraft.packingForwarding);
+    const disc = Number(headerDraft.globalDiscount);
+    const fx = Number(headerDraft.exchangeRateToRfq);
+    const lead = headerDraft.leadTimeDays.trim() === '' ? null : Number(headerDraft.leadTimeDays);
+
+    if (
+      !Number.isFinite(freight) ||
+      freight < 0 ||
+      !Number.isFinite(pf) ||
+      pf < 0 ||
+      !Number.isFinite(disc) ||
+      disc < 0 ||
+      !Number.isFinite(fx) ||
+      fx <= 0
+    ) {
+      setErrorMsg('Commercial overheads must be >= 0 and exchange rate must be > 0.');
+      return;
+    }
+
+    const changed =
+      freight !== activeQuote.freightCharges ||
+      pf !== activeQuote.packingForwarding ||
+      disc !== activeQuote.globalDiscount ||
+      fx !== activeQuote.exchangeRateToRfq ||
+      lead !== activeQuote.leadTimeDays ||
+      headerDraft.paymentTerms !== (activeQuote.paymentTerms ?? '');
+
+    if (!changed) return;
+
+    handleSaveHeaderPatch({
+      freightCharges: freight,
+      packingForwarding: pf,
+      globalDiscount: disc,
+      exchangeRateToRfq: fx,
+      leadTimeDays: lead,
+      paymentTerms: headerDraft.paymentTerms,
+      missingFreightWarning: freight > 0 ? false : activeQuote.missingFreightWarning,
+    });
+  };
+
+  const commitLineNumericBlur = (line: QuotationLine) => {
+    const draft = lineDrafts[line.id];
+    if (!draft) return;
+
+    const quotedQty = draft.quotedQty.trim() === '' ? null : Number(draft.quotedQty);
+    const quotedUnitRate = draft.quotedUnitRate.trim() === '' ? null : Number(draft.quotedUnitRate);
+    const uomConversionFactor = Number(draft.uomConversionFactor);
+    const taxRatePct = Number(draft.taxRatePct);
+    const lineTotalQuoted = draft.lineTotalQuoted.trim() === '' ? null : Number(draft.lineTotalQuoted);
+
+    if (
+      (quotedQty !== null && (!Number.isFinite(quotedQty) || quotedQty <= 0)) ||
+      (quotedUnitRate !== null && (!Number.isFinite(quotedUnitRate) || quotedUnitRate < 0)) ||
+      !Number.isFinite(uomConversionFactor) ||
+      uomConversionFactor <= 0 ||
+      !Number.isFinite(taxRatePct) ||
+      taxRatePct < 0 ||
+      taxRatePct > 100
+    ) {
+      setErrorMsg('Check line numeric fields: Qty > 0, Rate >= 0, UOM Factor > 0, Tax 0-100%.');
+      return;
+    }
+
+    const changed =
+      quotedQty !== line.quotedQty ||
+      quotedUnitRate !== line.quotedUnitRate ||
+      uomConversionFactor !== line.uomConversionFactor ||
+      taxRatePct !== line.taxRatePct ||
+      lineTotalQuoted !== line.lineTotalQuoted;
+
+    if (!changed) return;
+
+    handleSaveLinePatch(line.id, {
+      quotedQty,
+      quotedUnitRate,
+      uomConversionFactor,
+      taxRatePct,
+      lineTotalQuoted,
+    });
   };
 
   return (
@@ -209,7 +346,7 @@ export function ExtractionReviewPane({
 
       {/* Split Pane: Left 60% Source Viewer / Right 40% Structured Editor */}
       <div className="grid grid-cols-1 xl:grid-cols-12 gap-4 items-start">
-        {/* LEFT PANE (7 cols ~ 58%) */}
+        {/* LEFT PANE */}
         <div className="xl:col-span-7 bg-white border border-[#E2E8F0] rounded-lg overflow-hidden">
           <div className="px-4 py-2.5 border-b border-[#E2E8F0] bg-[#F8FAFC] flex items-center justify-between gap-2">
             <div className="flex items-center gap-2 text-xs font-medium text-[#0F172A] min-w-0">
@@ -246,7 +383,6 @@ export function ExtractionReviewPane({
           </div>
 
           <div className="p-4 bg-slate-100 min-h-[540px] max-h-[720px] overflow-auto">
-            {/* Case 1: Spreadsheet Preview */}
             {activeQuote.sheetPreview && activeQuote.sheetPreview.length > 0 ? (
               <div
                 style={{ transform: `scale(${zoom / 100})`, transformOrigin: 'top left' }}
@@ -264,7 +400,7 @@ export function ExtractionReviewPane({
                             <th className="w-8 py-1 px-2 border border-[#E2E8F0] text-center">#</th>
                             {(sheet.rows[0] || []).map((_, cIdx) => (
                               <th key={cIdx} className="py-1 px-2 border border-[#E2E8F0] text-center">
-                                {colLetter(cIdx)}
+                                {colIndexToLetter(cIdx)}
                               </th>
                             ))}
                           </tr>
@@ -299,7 +435,6 @@ export function ExtractionReviewPane({
                 ))}
               </div>
             ) : activeQuote.fileDataUrl && activeQuote.documentKind === 'image' ? (
-              /* Case 2: Uploaded Real Image with BBox Overlays */
               <div
                 className="relative inline-block bg-white shadow-sm border border-[#CBD5E1]"
                 style={{ width: `${zoom}%` }}
@@ -337,19 +472,16 @@ export function ExtractionReviewPane({
                 })}
               </div>
             ) : activeQuote.fileDataUrl && activeQuote.documentKind === 'pdf' ? (
-              /* Case 3: Uploaded Real PDF */
               <iframe
                 src={activeQuote.fileDataUrl}
                 title={activeQuote.documentName}
                 className="w-full h-[640px] bg-white border border-[#CBD5E1] rounded"
               />
             ) : activeQuote.rawEmailText ? (
-              /* Case 4: Pasted Email / WhatsApp Quote Text */
               <div className="bg-white border border-[#CBD5E1] rounded p-5 font-mono text-xs leading-relaxed text-[#0F172A] whitespace-pre-wrap">
                 {activeQuote.rawEmailText}
               </div>
             ) : (
-              /* Case 5: High-Fidelity Reconstructed Document Sheet (Digital PDF or WhatsApp Scan) with Exact Interactive BBoxes */
               <div
                 style={{ transform: `scale(${zoom / 100})`, transformOrigin: 'top left' }}
                 className={`relative bg-white border border-[#CBD5E1] shadow-sm p-6 mx-auto max-w-[680px] ${
@@ -438,7 +570,7 @@ export function ExtractionReviewPane({
                       Payment: {activeQuote.paymentTerms || 'Not stated'}
                     </div>
                     <div className="text-[#475569]">
-                      Delivery: {activeQuote.leadTimeDays ? `${activeQuote.leadTimeDays} days` : '—'}
+                      Delivery: {activeQuote.leadTimeDays !== null ? `${activeQuote.leadTimeDays} days` : '—'}
                     </div>
                   </div>
 
@@ -482,9 +614,8 @@ export function ExtractionReviewPane({
           </div>
         </div>
 
-        {/* RIGHT PANE (5 cols ~ 42%): Structured Header + Line Editor */}
+        {/* RIGHT PANE: Buffered Structured Header + Line Editor */}
         <div className="xl:col-span-5 space-y-4">
-          {/* Commercial Header Card */}
           <div className="bg-white border border-[#E2E8F0] rounded-lg p-4 space-y-3">
             <div className="flex items-center justify-between">
               <h3 className="font-display text-sm font-semibold text-[#0F172A]">
@@ -496,38 +627,36 @@ export function ExtractionReviewPane({
             </div>
 
             <div className="grid grid-cols-2 gap-3 text-xs">
-              <div
-                onClick={() => setFocusedHeaderField('freightCharges')}
-                className="cursor-pointer"
-              >
+              <div onClick={() => setFocusedHeaderField('freightCharges')}>
                 <label className="block text-[#475569] mb-1">
                   Freight Charges ({activeQuote.currency})
                 </label>
                 <input
                   type="number"
+                  min="0"
                   step="any"
-                  value={activeQuote.freightCharges}
+                  value={headerDraft.freightCharges}
                   onChange={(e) =>
-                    handleSaveHeaderPatch({
-                      freightCharges: Number(e.target.value) || 0,
-                      missingFreightWarning: false,
-                    })
+                    setHeaderDraft((d) => ({ ...d, freightCharges: e.target.value }))
                   }
+                  onBlur={commitHeaderBlur}
                   className="w-full px-2.5 py-1.5 border border-[#E2E8F0] rounded font-mono tabular-nums"
                 />
               </div>
 
               <div>
                 <label className="block text-[#475569] mb-1">
-                  Packing & Forwarding
+                  Packing & Forwarding ({activeQuote.currency})
                 </label>
                 <input
                   type="number"
+                  min="0"
                   step="any"
-                  value={activeQuote.packingForwarding}
+                  value={headerDraft.packingForwarding}
                   onChange={(e) =>
-                    handleSaveHeaderPatch({ packingForwarding: Number(e.target.value) || 0 })
+                    setHeaderDraft((d) => ({ ...d, packingForwarding: e.target.value }))
                   }
+                  onBlur={commitHeaderBlur}
                   className="w-full px-2.5 py-1.5 border border-[#E2E8F0] rounded font-mono tabular-nums"
                 />
               </div>
@@ -536,11 +665,13 @@ export function ExtractionReviewPane({
                 <label className="block text-[#475569] mb-1">Global Discount</label>
                 <input
                   type="number"
+                  min="0"
                   step="any"
-                  value={activeQuote.globalDiscount}
+                  value={headerDraft.globalDiscount}
                   onChange={(e) =>
-                    handleSaveHeaderPatch({ globalDiscount: Number(e.target.value) || 0 })
+                    setHeaderDraft((d) => ({ ...d, globalDiscount: e.target.value }))
                   }
+                  onBlur={commitHeaderBlur}
                   className="w-full px-2.5 py-1.5 border border-[#E2E8F0] rounded font-mono tabular-nums"
                 />
               </div>
@@ -549,26 +680,43 @@ export function ExtractionReviewPane({
                 <label className="block text-[#475569] mb-1">Lead Time (Days)</label>
                 <input
                   type="number"
-                  value={activeQuote.leadTimeDays ?? ''}
+                  min="0"
+                  value={headerDraft.leadTimeDays}
                   onChange={(e) =>
-                    handleSaveHeaderPatch({
-                      leadTimeDays: e.target.value ? Number(e.target.value) : null,
-                    })
+                    setHeaderDraft((d) => ({ ...d, leadTimeDays: e.target.value }))
                   }
+                  onBlur={commitHeaderBlur}
                   className="w-full px-2.5 py-1.5 border border-[#E2E8F0] rounded font-mono tabular-nums"
                 />
               </div>
 
-              <div
-                onClick={() => setFocusedHeaderField('paymentTerms')}
-                className="col-span-2"
-              >
+              <div onClick={() => setFocusedHeaderField('paymentTerms')}>
                 <label className="block text-[#475569] mb-1">Payment Terms</label>
                 <input
                   type="text"
-                  value={activeQuote.paymentTerms ?? ''}
-                  onChange={(e) => handleSaveHeaderPatch({ paymentTerms: e.target.value })}
+                  value={headerDraft.paymentTerms}
+                  onChange={(e) =>
+                    setHeaderDraft((d) => ({ ...d, paymentTerms: e.target.value }))
+                  }
+                  onBlur={commitHeaderBlur}
                   className="w-full px-2.5 py-1.5 border border-[#E2E8F0] rounded"
+                />
+              </div>
+
+              <div>
+                <label className="block text-[#475569] mb-1">
+                  FX Rate ({activeQuote.currency} → {rfq.currency})
+                </label>
+                <input
+                  type="number"
+                  min="0.0001"
+                  step="any"
+                  value={headerDraft.exchangeRateToRfq}
+                  onChange={(e) =>
+                    setHeaderDraft((d) => ({ ...d, exchangeRateToRfq: e.target.value }))
+                  }
+                  onBlur={commitHeaderBlur}
+                  className="w-full px-2.5 py-1.5 border border-[#E2E8F0] rounded font-mono tabular-nums"
                 />
               </div>
             </div>
@@ -593,18 +741,33 @@ export function ExtractionReviewPane({
             </div>
           </div>
 
-          {/* Line Items Extraction Review */}
           <div className="bg-white border border-[#E2E8F0] rounded-lg overflow-hidden">
             <div className="px-4 py-3 border-b border-[#E2E8F0] flex items-center justify-between">
               <h3 className="font-display text-sm font-semibold text-[#0F172A]">
                 Extracted Line Items ({activeQuote.lines.length})
               </h3>
-              <span className="text-xs text-[#475569]">Click row to highlight source</span>
+              <span className="text-xs text-[#475569]">Edits commit on blur</span>
             </div>
 
             <div className="divide-y divide-[#E2E8F0] max-h-[480px] overflow-y-auto">
               {activeQuote.lines.map((line) => {
                 const isFocused = line.id === focusedLineId;
+                const draft = lineDrafts[line.id] || {
+                  quotedQty: '',
+                  quotedUnitRate: '',
+                  uomConversionFactor: '1',
+                  taxRatePct: '0',
+                  lineTotalQuoted: '',
+                };
+                const mappedRfqItem = rfq.items.find((it) => it.id === line.rfqItemId);
+                const effectiveQty =
+                  line.quotedQty !== null ? line.quotedQty * line.uomConversionFactor : null;
+                const qtyMismatch =
+                  mappedRfqItem &&
+                  effectiveQty !== null &&
+                  line.matchStatus !== 'not_quoted' &&
+                  Math.abs(effectiveQty - mappedRfqItem.quantity) > 0.01;
+
                 return (
                   <div
                     key={line.id}
@@ -631,15 +794,21 @@ export function ExtractionReviewPane({
                           </span>
                           <span aria-hidden="true">·</span>
                           {!line.mathValid ? (
-                            <span className="text-[#DC2626] font-semibold">
-                              Math Mismatch
-                            </span>
+                            <span className="text-[#DC2626] font-semibold">Math Mismatch</span>
                           ) : line.matchStatus === 'not_quoted' ? (
                             <span className="text-[#D97706] font-medium">Not Quoted</span>
                           ) : line.matchStatus === 'alternate_spec' ? (
                             <span className="text-[#D97706] font-medium">Alternate Spec</span>
                           ) : (
                             <span className="text-[#059669] font-medium">Math Valid</span>
+                          )}
+                          {qtyMismatch && mappedRfqItem && (
+                            <>
+                              <span aria-hidden="true">·</span>
+                              <span className="text-[#D97706] font-medium">
+                                Qty {effectiveQty} vs RFQ {mappedRfqItem.quantity}
+                              </span>
+                            </>
                           )}
                           {line.humanEdited && (
                             <>
@@ -678,7 +847,6 @@ export function ExtractionReviewPane({
                       </div>
                     )}
 
-                    {/* Inline Editable Fields */}
                     <div
                       className="grid grid-cols-4 gap-2 text-[11px]"
                       onClick={(e) => e.stopPropagation()}
@@ -730,14 +898,16 @@ export function ExtractionReviewPane({
                         <label className="block text-[#475569] mb-0.5">UOM Factor</label>
                         <input
                           type="number"
-                          min="0.01"
+                          min="0.0001"
                           step="any"
-                          value={line.uomConversionFactor}
+                          value={draft.uomConversionFactor}
                           onChange={(e) =>
-                            handleSaveLinePatch(line.id, {
-                              uomConversionFactor: Number(e.target.value) || 1,
-                            })
+                            setLineDrafts((prev) => ({
+                              ...prev,
+                              [line.id]: { ...draft, uomConversionFactor: e.target.value },
+                            }))
                           }
+                          onBlur={() => commitLineNumericBlur(line)}
                           title="Number of RFQ units per quoted UOM (e.g. 10 for Box of 10)"
                           className="w-full px-2 py-1 border border-[#E2E8F0] rounded font-mono tabular-nums text-right"
                         />
@@ -747,13 +917,16 @@ export function ExtractionReviewPane({
                         <label className="block text-[#475569] mb-0.5">Quoted Qty</label>
                         <input
                           type="number"
+                          min="0.0001"
                           step="any"
-                          value={line.quotedQty ?? ''}
+                          value={draft.quotedQty}
                           onChange={(e) =>
-                            handleSaveLinePatch(line.id, {
-                              quotedQty: e.target.value === '' ? null : Number(e.target.value),
-                            })
+                            setLineDrafts((prev) => ({
+                              ...prev,
+                              [line.id]: { ...draft, quotedQty: e.target.value },
+                            }))
                           }
+                          onBlur={() => commitLineNumericBlur(line)}
                           className="w-full px-2 py-1 border border-[#E2E8F0] rounded font-mono tabular-nums text-right"
                         />
                       </div>
@@ -762,13 +935,16 @@ export function ExtractionReviewPane({
                         <label className="block text-[#475569] mb-0.5">Unit Rate</label>
                         <input
                           type="number"
+                          min="0"
                           step="any"
-                          value={line.quotedUnitRate ?? ''}
+                          value={draft.quotedUnitRate}
                           onChange={(e) =>
-                            handleSaveLinePatch(line.id, {
-                              quotedUnitRate: e.target.value === '' ? null : Number(e.target.value),
-                            })
+                            setLineDrafts((prev) => ({
+                              ...prev,
+                              [line.id]: { ...draft, quotedUnitRate: e.target.value },
+                            }))
                           }
+                          onBlur={() => commitLineNumericBlur(line)}
                           className="w-full px-2 py-1 border border-[#E2E8F0] rounded font-mono tabular-nums text-right"
                         />
                       </div>
@@ -777,13 +953,17 @@ export function ExtractionReviewPane({
                         <label className="block text-[#475569] mb-0.5">Tax %</label>
                         <input
                           type="number"
+                          min="0"
+                          max="100"
                           step="any"
-                          value={line.taxRatePct}
+                          value={draft.taxRatePct}
                           onChange={(e) =>
-                            handleSaveLinePatch(line.id, {
-                              taxRatePct: Number(e.target.value) || 0,
-                            })
+                            setLineDrafts((prev) => ({
+                              ...prev,
+                              [line.id]: { ...draft, taxRatePct: e.target.value },
+                            }))
                           }
+                          onBlur={() => commitLineNumericBlur(line)}
                           className="w-full px-2 py-1 border border-[#E2E8F0] rounded font-mono tabular-nums text-right"
                         />
                       </div>
@@ -792,15 +972,35 @@ export function ExtractionReviewPane({
                         <label className="block text-[#475569] mb-0.5">Printed Total</label>
                         <input
                           type="number"
+                          min="0"
                           step="any"
-                          value={line.lineTotalQuoted ?? ''}
+                          value={draft.lineTotalQuoted}
                           onChange={(e) =>
-                            handleSaveLinePatch(line.id, {
-                              lineTotalQuoted: e.target.value === '' ? null : Number(e.target.value),
-                            })
+                            setLineDrafts((prev) => ({
+                              ...prev,
+                              [line.id]: { ...draft, lineTotalQuoted: e.target.value },
+                            }))
                           }
+                          onBlur={() => commitLineNumericBlur(line)}
                           className="w-full px-2 py-1 border border-[#E2E8F0] rounded font-mono tabular-nums text-right"
                         />
+                      </div>
+
+                      <div className="col-span-4 pt-1 flex items-center justify-between text-[11px] text-[#475569]">
+                        <label className="flex items-center gap-1.5 cursor-pointer text-[#0F172A]">
+                          <input
+                            type="checkbox"
+                            checked={line.taxCreditable}
+                            onChange={(e) =>
+                              handleSaveLinePatch(line.id, { taxCreditable: e.target.checked })
+                            }
+                            className="rounded border-[#CBD5E1]"
+                          />
+                          <span>ITC / VAT Creditable (excluded from Net Landed)</span>
+                        </label>
+                        {savingId === line.id && (
+                          <span className="text-[#0F4C81] font-medium">Saving...</span>
+                        )}
                       </div>
                     </div>
                   </div>

@@ -139,7 +139,7 @@ export function Sidebar({
         {roleMenuOpen && (
           <div className="absolute bottom-16 left-3 right-3 bg-white border border-[#E2E8F0] rounded-lg shadow-lg p-1.5 z-40">
             <div className="px-2 py-1 text-[11px] font-medium text-[#475569]">
-              Switch Active Role
+              Demo Persona (Sandbox RBAC)
             </div>
             {ROLE_PRESETS.map((preset) => (
               <button

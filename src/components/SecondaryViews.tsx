@@ -20,6 +20,7 @@ import {
   UserRole,
 } from '../types.ts';
 import { formatDateShort, formatMoney, rfqStatusLabel } from '../lib/format.ts';
+import { rankQuotations } from '../lib/ranking.ts';
 
 export function RfqsListView({
   rfqs,
@@ -113,7 +114,8 @@ export function RfqsListView({
             <tbody className="divide-y divide-[#E2E8F0]">
               {filtered.map((rfq) => {
                 const rq = quotations.filter((q) => q.rfqId === rfq.id);
-                const best = rq.length ? Math.min(...rq.map((q) => q.totalLandedCost)) : null;
+                const l1 = rankQuotations(rq, 'landed').find((r) => r.rankIndex === 1);
+                const best = l1 ? l1.totalForBasis : null;
                 return (
                   <tr
                     key={rfq.id}
@@ -130,7 +132,11 @@ export function RfqsListView({
                     </td>
                     <td className="py-3 px-4 text-right font-mono tabular-nums">{rq.length}</td>
                     <td className="py-3 px-4 text-right font-mono tabular-nums font-semibold">
-                      {best !== null ? formatMoney(best, rfq.currency) : '—'}
+                      {best !== null
+                        ? formatMoney(best, rfq.currency)
+                        : rq.length > 0
+                        ? 'Pending Audit'
+                        : '—'}
                     </td>
                     <td className="py-3 px-4 text-xs font-medium text-[#0F172A]">
                       {rfqStatusLabel(rfq.status)}
@@ -179,6 +185,7 @@ export function SuppliersView({
     categoriesText: '',
   });
   const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
 
   const filtered = suppliers.filter(
     (s) =>
@@ -189,8 +196,10 @@ export function SuppliersView({
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (submitting) return;
     setError(null);
     try {
+      setSubmitting(true);
       await onAddSupplier({
         name: form.name,
         taxId: form.taxId,
@@ -217,6 +226,8 @@ export function SuppliersView({
       setAdding(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to add supplier');
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -311,9 +322,10 @@ export function SuppliersView({
             </button>
             <button
               type="submit"
-              className="px-4 py-1.5 text-xs font-medium text-white bg-[#0F4C81] rounded-md"
+              disabled={submitting}
+              className="px-4 py-1.5 text-xs font-medium text-white bg-[#0F4C81] rounded-md disabled:opacity-50"
             >
-              Save Supplier
+              {submitting ? 'Saving...' : 'Save Supplier'}
             </button>
           </div>
         </form>
@@ -585,18 +597,29 @@ export function SettingsView({
   const [itc, setItc] = useState(settings.defaultTaxCreditable);
   const [role, setRole] = useState<UserRole>(settings.activeUserRole);
   const [saved, setSaved] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
-    await onSaveSettings({
-      name,
-      defaultCurrency: currency,
-      taxRegime,
-      defaultTaxCreditable: itc,
-      activeUserRole: role,
-    });
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2000);
+    if (saving) return;
+    setError(null);
+    try {
+      setSaving(true);
+      await onSaveSettings({
+        name,
+        defaultCurrency: currency,
+        taxRegime,
+        defaultTaxCreditable: itc,
+        activeUserRole: role,
+      });
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to save settings');
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -688,12 +711,23 @@ export function SettingsView({
           </select>
         </div>
 
+        {error && (
+          <div className="p-3 bg-[#FEF2F2] border border-[#FECACA] text-[#DC2626] text-xs rounded-md">
+            {error}
+          </div>
+        )}
+
+        <div className="p-3 bg-[#F8FAFC] border border-[#E2E8F0] rounded-md text-xs text-[#475569]">
+          <strong>Security Note:</strong> The role selector below controls server-enforced RBAC checks for this single-workspace sandbox demo. It is not multi-user authentication; real deployment requires signed session/JWT authentication.
+        </div>
+
         <div className="pt-2 flex items-center gap-3">
           <button
             type="submit"
-            className="px-4 py-2 text-sm font-medium text-white bg-[#0F4C81] rounded-lg hover:bg-[#0A365C]"
+            disabled={saving}
+            className="px-4 py-2 text-sm font-medium text-white bg-[#0F4C81] rounded-lg hover:bg-[#0A365C] disabled:opacity-50"
           >
-            Save Settings
+            {saving ? 'Saving...' : 'Save Settings'}
           </button>
           {saved && <span className="text-xs font-medium text-[#059669]">Saved</span>}
         </div>

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   AlertTriangle,
   ArrowLeft,
@@ -26,6 +26,7 @@ import {
 } from '../types.ts';
 import { formatDateShort, formatMoney, rfqStatusLabel } from '../lib/format.ts';
 import { exportComparativeStatementExcel, exportComparativeStatementPdf } from '../lib/exporters.ts';
+import { rankQuotations } from '../lib/ranking.ts';
 import { ExtractionReviewPane } from './ExtractionReviewPane.tsx';
 import { ComparisonMatrixPane } from './ComparisonMatrixPane.tsx';
 
@@ -114,6 +115,17 @@ export function RfqWorkspace({
   const [approverNotes, setApproverNotes] = useState('');
   const [awardBusy, setAwardBusy] = useState(false);
   const [awardError, setAwardError] = useState<string | null>(null);
+  const [deletingQuoteId, setDeletingQuoteId] = useState<string | null>(null);
+
+  // Reset per-RFQ transient state when switching RFQs
+  useEffect(() => {
+    setDraftAward(null);
+    setNonL1Justification('');
+    setApproverNotes('');
+    setAwardError(null);
+    setUploadError(null);
+    setUploadSupplierId(rfq.invitedSupplierIds[0] || suppliers[0]?.id || '');
+  }, [rfq.id]);
 
   const existingAward = awards.find((a) => a.rfqId === rfq.id) || null;
   const getSupplierName = (id: string) =>
@@ -164,9 +176,9 @@ export function RfqWorkspace({
     }
   };
 
-  // Default award payload if user opens Approval tab directly
-  const sortedQuotes = [...quotes].sort((a, b) => a.totalLandedCost - b.totalLandedCost);
-  const l1Quote = sortedQuotes[0];
+  // Default award payload if user opens Approval tab directly (uses verified-complete L1 if available)
+  const rankedQuotes = rankQuotations(quotes, 'landed');
+  const l1Quote = rankedQuotes.find((r) => r.rankIndex === 1)?.quotation || rankedQuotes[0]?.quotation;
   const effectiveDraft =
     draftAward ||
     (l1Quote
@@ -175,14 +187,16 @@ export function RfqWorkspace({
           allocations: rfq.items
             .map((item) => {
               const line = l1Quote.lines.find((l) => l.rfqItemId === item.id);
-              if (!line || line.matchStatus === 'not_quoted') return null;
+              if (!line || line.matchStatus === 'not_quoted' || !line.mathValid || line.normalizedUnitLanded === null) {
+                return null;
+              }
               return {
                 rfqItemId: item.id,
                 quotationId: l1Quote.id,
                 quotationLineId: line.id,
                 supplierId: l1Quote.supplierId,
                 awardedQty: item.quantity,
-                awardedUnitLanded: line.normalizedUnitLanded ?? 0,
+                awardedUnitLanded: line.normalizedUnitLanded,
               };
             })
             .filter((x): x is AwardAllocation => x !== null),
@@ -271,6 +285,7 @@ export function RfqWorkspace({
                 suppliers,
                 settings,
                 auditLogs,
+                award: existingAward || undefined,
               })
             }
             disabled={quotes.length === 0}
@@ -572,9 +587,23 @@ export function RfqWorkspace({
                           Inspect Source
                         </button>
                         <button
-                          onClick={() => onDeleteQuote(q.id)}
+                          onClick={async () => {
+                            if (deletingQuoteId) return;
+                            setUploadError(null);
+                            try {
+                              setDeletingQuoteId(q.id);
+                              await onDeleteQuote(q.id);
+                            } catch (err) {
+                              setUploadError(
+                                err instanceof Error ? err.message : 'Unable to delete quotation.'
+                              );
+                            } finally {
+                              setDeletingQuoteId(null);
+                            }
+                          }}
+                          disabled={deletingQuoteId === q.id}
                           title="Delete quotation"
-                          className="p-1.5 text-[#475569] hover:text-[#DC2626] rounded"
+                          className="p-1.5 text-[#475569] hover:text-[#DC2626] rounded disabled:opacity-40"
                         >
                           <Trash2 className="w-4 h-4" />
                         </button>
@@ -637,6 +666,7 @@ export function RfqWorkspace({
               suppliers,
               settings,
               auditLogs,
+              award: existingAward || undefined,
             })
           }
         />

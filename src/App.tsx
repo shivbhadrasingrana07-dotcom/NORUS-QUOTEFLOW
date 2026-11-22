@@ -78,8 +78,8 @@ export default function App() {
   };
 
   const handleRoleSwitch = async (role: UserRole, activeUserName: string, activeUserTitle: string) => {
-    await apiJson('/api/settings', {
-      method: 'PATCH',
+    await apiJson('/api/demo/switch-persona', {
+      method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ activeUserRole: role, activeUserName, activeUserTitle }),
     });
