@@ -1,0 +1,6 @@
+{
+  "name": "NORUS QUOTEFLOW",
+  "description": "Pre-PO supplier quotation extraction, commercial & tax normalization, side-by-side comparison, and historical price intelligence.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
