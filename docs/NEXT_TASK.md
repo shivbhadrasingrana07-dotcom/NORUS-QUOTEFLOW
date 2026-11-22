@@ -7,6 +7,8 @@
 
 ## Remaining External Setup Actions Before Public Launch
 
+0. **Restore Full Authentication (Exit Temporary Task 006 Demo Mode):**
+   - Set `DEMO_MODE="false"` in `.env` / runtime Secrets and restart the server. This immediately disables `/api/demo-workspace*` (`410 Gone`) and restores `AuthView` (Google Sign-In + Email/Password login, registration, email verification, password reset) and `OrganizationView` (team & org switching).
 1. **Link Founder Account to `org-kalyani-hydraulics`:**
    - Run `npm run org:bootstrap-owner -- --org-id=org-kalyani-hydraulics --issue-token --email="<founder-email>"` (or `--claim-direct`) once the authorized founder email is ready to take ownership.
 2. **Provision Production Runtime Secrets & Managed Services:**

@@ -43,12 +43,22 @@ import {
 import { hasPermission, type Permission } from './server/rbac.ts';
 import {
   clearAuthCookies,
+  generateSecureToken,
   getSigningSecret,
   parseCookies,
   redactSensitiveText,
   SESSION_COOKIE_NAME,
   setAuthCookies,
+  signHmac,
+  verifyHmac,
 } from './server/security.ts';
+import {
+  DEMO_ORGANIZATION_SUMMARY,
+  DEMO_USER,
+  DemoStoreError,
+  DemoWorkspaceStore,
+  extractDemoQuotationOffline,
+} from './server/demoWorkspace.ts';
 
 declare global {
   namespace Express {
@@ -69,6 +79,7 @@ export interface AppOptions {
   generateContentOverride?: GenerateContentFn;
   authRateLimitMax?: number;
   errorTrackerHook?: ErrorTrackerHook;
+  demoMode?: boolean;
 }
 
 function safeTimingEqual(a: string, b: string): boolean {
@@ -127,7 +138,9 @@ export async function createApp(options: AppOptions = {}) {
     firebaseVerifier = verifyFirebaseIdToken,
     generateContentOverride,
     authRateLimitMax = 25,
+    demoMode,
   } = options;
+  const demoModeEnabled = demoMode ?? process.env.DEMO_MODE !== 'false';
 
   if (process.env.NODE_ENV === 'production') {
     // Fail closed if required production secrets/database configuration are missing
@@ -180,7 +193,7 @@ export async function createApp(options: AppOptions = {}) {
       res.setHeader('Access-Control-Allow-Credentials', 'true');
       res.setHeader(
         'Access-Control-Allow-Headers',
-        'Content-Type, Authorization, X-CSRF-Token'
+        'Content-Type, Authorization, X-CSRF-Token, X-Demo-Session'
       );
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
     }
@@ -290,6 +303,7 @@ export async function createApp(options: AppOptions = {}) {
       organizations: ctx.organizations,
       csrfToken: ctx.csrfToken,
       googleAuthEnabled: true,
+      demoMode: demoModeEnabled,
     };
   }
 
@@ -351,9 +365,329 @@ export async function createApp(options: AppOptions = {}) {
         organizations: [],
         csrfToken: null,
         googleAuthEnabled: true,
+        demoMode: demoModeEnabled,
       });
     }
     res.json(buildAuthResponse(req.auth));
+  });
+
+  // ==================== ISOLATED SYNTHETIC DEMO WORKSPACE ====================
+  const demoStore = new DemoWorkspaceStore();
+  const DEMO_COOKIE_NAME = 'nf_demo_sid';
+
+  function resolveDemoSessionId(req: Request, res: Response): string {
+    const headerVal = req.headers['x-demo-session'];
+    const cookies = parseCookies(req);
+    const cookieVal = cookies[DEMO_COOKIE_NAME];
+    const candidate =
+      (typeof headerVal === 'string' && /^[A-Za-z0-9_-]{8,64}$/.test(headerVal.trim())
+        ? headerVal.trim()
+        : null) ||
+      (typeof cookieVal === 'string' && /^[A-Za-z0-9_-]{8,64}$/.test(cookieVal.trim())
+        ? cookieVal.trim()
+        : null);
+
+    const sessionId = candidate || `demo-${generateSecureToken(16)}`;
+    if (!cookieVal || cookieVal !== sessionId) {
+      const proto = req.headers['x-forwarded-proto'];
+      const secure =
+        process.env.NODE_ENV === 'production' ||
+        req.secure ||
+        (typeof proto === 'string' && proto.split(',')[0].trim() === 'https');
+      const sameSite = secure ? 'None' : 'Lax';
+      res.setHeader(
+        'Set-Cookie',
+        [
+          `${DEMO_COOKIE_NAME}=${encodeURIComponent(sessionId)}`,
+          'Path=/',
+          'HttpOnly',
+          'Max-Age=86400',
+          `SameSite=${sameSite}`,
+          secure ? 'Secure' : '',
+        ]
+          .filter(Boolean)
+          .join('; ')
+      );
+    }
+    return sessionId;
+  }
+
+  function requireDemoMode(_req: Request, res: Response, next: NextFunction) {
+    if (!demoModeEnabled) {
+      return res.status(410).json({
+        error: 'Temporary demo mode is disabled. Sign in with an authenticated account.',
+      });
+    }
+    next();
+  }
+
+  app.get('/api/demo-workspace', requireDemoMode, (req, res) => {
+    const sessionId = resolveDemoSessionId(req, res);
+    const workspace = demoStore.getWorkspace(sessionId);
+    res.json({
+      ...workspace,
+      demoMode: true,
+      demoSessionId: sessionId,
+      user: DEMO_USER,
+      activeOrganization: DEMO_ORGANIZATION_SUMMARY,
+      organizations: [DEMO_ORGANIZATION_SUMMARY],
+    });
+  });
+
+  app.post('/api/demo-workspace/reset', requireDemoMode, mutationRateLimiter, (req, res) => {
+    const sessionId = resolveDemoSessionId(req, res);
+    const workspace = demoStore.resetSession(sessionId);
+    res.json({
+      ...workspace,
+      demoMode: true,
+      demoSessionId: sessionId,
+      user: DEMO_USER,
+      activeOrganization: DEMO_ORGANIZATION_SUMMARY,
+      organizations: [DEMO_ORGANIZATION_SUMMARY],
+    });
+  });
+
+  app.patch('/api/demo-workspace/settings', requireDemoMode, mutationRateLimiter, (req, res) => {
+    const sessionId = resolveDemoSessionId(req, res);
+    const updated = demoStore.updateSettings(sessionId, req.body || {});
+    res.json(updated);
+  });
+
+  app.post('/api/demo-workspace/rfqs/load-sample', requireDemoMode, mutationRateLimiter, (req, res) => {
+    const sessionId = resolveDemoSessionId(req, res);
+    const result = demoStore.loadSampleRfq(sessionId);
+    res.status(201).json(result);
+  });
+
+  app.post('/api/demo-workspace/rfqs', requireDemoMode, mutationRateLimiter, (req, res, next) => {
+    try {
+      const sessionId = resolveDemoSessionId(req, res);
+      const created = demoStore.createRfq(sessionId, req.body || {});
+      res.status(201).json(created);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/demo-workspace/suppliers', requireDemoMode, mutationRateLimiter, (req, res, next) => {
+    try {
+      const sessionId = resolveDemoSessionId(req, res);
+      const supplier = demoStore.createSupplier(sessionId, req.body || {});
+      res.status(201).json(supplier);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post(
+    '/api/demo-workspace/rfqs/:rfqId/quotes/extract',
+    requireDemoMode,
+    extractRateLimiter,
+    upload.single('file'),
+    async (req, res, next) => {
+      try {
+        const sessionId = resolveDemoSessionId(req, res);
+        const supplierId = req.body?.supplierId;
+        if (typeof supplierId !== 'string' || !supplierId.trim()) {
+          return res.status(400).json({ error: 'Valid supplierId is required.' });
+        }
+
+        const { rfq, settings, supplierName } = demoStore.getExtractionContext(
+          sessionId,
+          req.params.rfqId,
+          supplierId.trim()
+        );
+
+        const rawEmailText =
+          typeof req.body?.rawEmailText === 'string' ? req.body.rawEmailText.trim() : '';
+        const file = req.file;
+
+        if (!file && !rawEmailText) {
+          return res.status(400).json({
+            error: 'Upload a quotation file (PDF, Excel, CSV, Image) or paste email text.',
+          });
+        }
+
+        let safeName = `Demo_Email_Quote_${Date.now().toString().slice(-4)}.txt`;
+        let safeMime = 'text/plain';
+        if (file) {
+          const validation = validateUploadedFile(file.buffer, file.originalname, file.mimetype);
+          if (!validation.ok) {
+            return res.status(validation.status).json({ error: validation.error });
+          }
+          safeName = validation.safeFilename;
+          safeMime = validation.detectedMime;
+        }
+
+        const hasLiveGemini =
+          Boolean(generateContentOverride) ||
+          Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY');
+
+        const extracted = hasLiveGemini
+          ? await extractQuotationWithGemini({
+              rfq,
+              supplierId: supplierId.trim(),
+              settings,
+              documentName: safeName,
+              mimeType: safeMime,
+              fileBuffer: file?.buffer,
+              rawEmailText: rawEmailText || undefined,
+              skipInlineDataUrl: true,
+              generateContentOverride,
+            })
+          : extractDemoQuotationOffline({
+              rfq,
+              supplierId: supplierId.trim(),
+              settings,
+              documentName: safeName,
+              mimeType: safeMime,
+              fileBuffer: file?.buffer,
+              rawEmailText: rawEmailText || undefined,
+            });
+
+        const saved = demoStore.saveExtractedQuotation({
+          sessionId,
+          rfqId: rfq.id,
+          supplierName,
+          quotation: extracted,
+          file: file
+            ? {
+                buffer: file.buffer,
+                originalFilename: safeName,
+                mimeType: safeMime,
+              }
+            : undefined,
+        });
+
+        res.status(201).json(saved);
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
+  app.patch('/api/demo-workspace/quotations/:quoteId', requireDemoMode, mutationRateLimiter, (req, res, next) => {
+    try {
+      const sessionId = resolveDemoSessionId(req, res);
+      const updated = demoStore.updateQuotationHeader(sessionId, req.params.quoteId, req.body || {});
+      res.json(updated);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.patch(
+    '/api/demo-workspace/quotations/:quoteId/lines/:lineId',
+    requireDemoMode,
+    mutationRateLimiter,
+    (req, res, next) => {
+      try {
+        const sessionId = resolveDemoSessionId(req, res);
+        const updated = demoStore.updateQuotationLine(
+          sessionId,
+          req.params.quoteId,
+          req.params.lineId,
+          req.body || {}
+        );
+        res.json(updated);
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
+  app.post('/api/demo-workspace/quotations/:quoteId/verify', requireDemoMode, mutationRateLimiter, (req, res, next) => {
+    try {
+      const sessionId = resolveDemoSessionId(req, res);
+      const verified = demoStore.verifyQuotation(sessionId, req.params.quoteId);
+      res.json(verified);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.delete('/api/demo-workspace/quotations/:quoteId', requireDemoMode, mutationRateLimiter, (req, res, next) => {
+    try {
+      const sessionId = resolveDemoSessionId(req, res);
+      demoStore.deleteQuotation(sessionId, req.params.quoteId);
+      res.json({ ok: true });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/demo-workspace/rfqs/:rfqId/award', requireDemoMode, mutationRateLimiter, (req, res, next) => {
+    try {
+      const sessionId = resolveDemoSessionId(req, res);
+      const { isSplitAward, nonL1Justification, allocations } = req.body || {};
+      const award = demoStore.submitAward(sessionId, {
+        rfqId: req.params.rfqId,
+        isSplitAward: Boolean(isSplitAward),
+        nonL1Justification,
+        allocations,
+      });
+      res.status(201).json(award);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/demo-workspace/awards/:awardId/decide', requireDemoMode, mutationRateLimiter, (req, res, next) => {
+    try {
+      const sessionId = resolveDemoSessionId(req, res);
+      const { decision, approverNotes } = req.body || {};
+      const decided = demoStore.decideAward(sessionId, req.params.awardId, decision, approverNotes);
+      res.json(decided);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get('/api/demo-workspace/documents/:docId/signed-url', requireDemoMode, (req, res) => {
+    const sessionId = resolveDemoSessionId(req, res);
+    const doc = demoStore.getDocument(sessionId, req.params.docId);
+    if (!doc) {
+      return res.status(404).json({ error: 'Demo document not found in this session.' });
+    }
+    const exp = Math.floor(Date.now() / 1000) + 300;
+    const sig = signHmac(`demo:${doc.id}:${sessionId}:${exp}`);
+    res.json({
+      url: `/api/demo-workspace/documents/${encodeURIComponent(doc.id)}/content?demo=${encodeURIComponent(
+        sessionId
+      )}&exp=${exp}&sig=${encodeURIComponent(sig)}`,
+      expiresAt: new Date(exp * 1000).toISOString(),
+      mimeType: doc.mimeType,
+      originalFilename: doc.originalFilename,
+    });
+  });
+
+  app.get('/api/demo-workspace/documents/:docId/content', requireDemoMode, (req, res) => {
+    const demoParam = typeof req.query.demo === 'string' ? req.query.demo : '';
+    const expParam = typeof req.query.exp === 'string' ? Number(req.query.exp) : NaN;
+    const sigParam = typeof req.query.sig === 'string' ? req.query.sig : '';
+
+    if (
+      !demoParam ||
+      !Number.isFinite(expParam) ||
+      expParam < Math.floor(Date.now() / 1000) ||
+      !verifyHmac(`demo:${req.params.docId}:${demoParam}:${expParam}`, sigParam)
+    ) {
+      return res.status(403).json({ error: 'Signed demo document URL is invalid or expired.' });
+    }
+
+    const doc = demoStore.getDocument(demoParam, req.params.docId);
+    if (!doc) {
+      return res.status(404).json({ error: 'Demo document not found.' });
+    }
+
+    res.setHeader('Content-Type', doc.mimeType || 'application/octet-stream');
+    res.setHeader(
+      'Content-Disposition',
+      `inline; filename="${doc.originalFilename.replace(/["\r\n]/g, '_')}"`
+    );
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.send(doc.buffer);
   });
 
   app.post('/api/auth/register', authRateLimiter, async (req, res, next) => {
@@ -1238,6 +1572,8 @@ export async function createApp(options: AppOptions = {}) {
     }
     const status =
       err instanceof StoreError
+        ? err.statusCode
+        : err instanceof DemoStoreError
         ? err.statusCode
         : err instanceof ExtractionServiceError
         ? err.statusCode

@@ -1,5 +1,24 @@
 # Changelog
 
+## Task 006 — Temporary No-Login Demo Experience (Non-Production)
+
+### Added
+- **Isolated Synthetic Demo Store (`server/demoWorkspace.ts`):** Created `DemoWorkspaceStore` serving a 100% synthetic sample procurement workspace (`demo-org-synthetic`, `Meridian Industrial Demo Works (Sample)`, `DEMO-RFQ-2026-101`, 4 `(Demo)` suppliers, 4 sample catalog items, PDF/Excel/email quotes with math-audit & missing-freight teaching scenarios, plus a historical approved award) scoped per visitor session in memory (`maxSessions = 120`) with zero Cloud SQL or `storageProvider` access.
+- **Isolated Demo API Endpoints (`server.ts`):** Added `/api/demo-workspace*` routes (`GET`, `/reset`, `/settings`, `/rfqs`, `/rfqs/load-sample`, `/suppliers`, `/rfqs/:rfqId/quotes/extract`, `/quotations/*`, `/awards/*`, `/documents/:docId/signed-url`, `/documents/:docId/content`) gated by `DEMO_MODE !== "false"` (`410 Gone` when disabled). Added `demoMode` flag to `GET /api/auth/me` and `X-Demo-Session` to CORS allowed headers.
+- **Demo Workspace UI & Banners (`src/App.tsx`, `src/components/Sidebar.tsx`, `src/components/SecondaryViews.tsx`, `src/components/RfqWorkspace.tsx`, `src/components/ExtractionReviewPane.tsx`):** Bypassed login/register/verification/reset screens when `demoMode === true`, landing visitors directly on the Command Center Dashboard with a prominent `DEMO ENVIRONMENT` top bar, `Reset Demo Data` action, and `DEMO WORKSPACE` sidebar indicator while hiding team/org switcher and sign-out controls.
+- **Task 006 Automated Test Suite (`tests/demoWorkspace.test.ts`):** Verifies zero real-tenant leakage, `401` preservation on real endpoints, `410` on `/api/demo/switch-persona`, full isolated demo workflow, signed demo preview isolation, and `DEMO_MODE=false` restoration.
+
+---
+
+## Task 005 — Google Sign-In Failure Investigation & Resolution
+
+### Fixed
+- **Server-Side Firebase ID Token Verification (`server/firebase-admin.ts`):** Switched `adminAuth.verifyIdToken` from hardcoded `checkRevoked = true` to `process.env.FIREBASE_CHECK_REVOKED === 'true'` (default `false`). In AI Studio runtime containers, `checkRevoked = true` triggered an Identity Toolkit Admin API call using host-project ADC (`344782474303`) instead of the app's Firebase project (`favorable-emblem-zxq1s`), causing `identitytoolkit.googleapis.com is not enabled for Google Cloud project 344782474303`. Default certificate-based verification preserves full Google X.509 RS256 signature, `exp`, `aud`, and `iss` validation while exchanging tokens for revocable PostgreSQL `nf_session` records. Also updated `DecodedIdToken` to a type-only ESM import.
+- **Client Auth Error Messaging (`src/components/AuthView.tsx`):** Added explicit friendly handling for `auth/operation-not-allowed`.
+- **Regression Coverage (`tests/opsAndMonitoring.test.ts`):** Added test verifying default `checkRevoked=false`, optional `FIREBASE_CHECK_REVOKED=true`, `aud`/`iss` mismatch rejection, and `/api/auth/google` `401` behavior without Identity Toolkit host-project lookup errors.
+
+---
+
 ## Task 004 — Production Operations, Integration Completion & Operational Readiness
 
 ### Added

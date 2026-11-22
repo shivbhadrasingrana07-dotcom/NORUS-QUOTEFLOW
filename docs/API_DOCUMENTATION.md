@@ -23,7 +23,23 @@ Permanently disabled.
 ## Authentication & Sessions
 
 ### `GET /api/auth/me`
-Returns `{ authenticated, user, activeOrganization, organizations, csrfToken, googleAuthEnabled }`. Always returns `200` (`authenticated: false` when signed out).
+Returns `{ authenticated, user, activeOrganization, organizations, csrfToken, googleAuthEnabled, demoMode }`. Always returns `200` (`authenticated: false` when signed out).
+
+---
+
+## Temporary No-Login Demo Workspace Routes (`DEMO_MODE !== "false"`)
+
+All routes below operate exclusively on an isolated, in-memory synthetic dataset (`server/demoWorkspace.ts`, `demo-org-synthetic`), keyed per visitor by `X-Demo-Session` / `nf_demo_sid`. They never read or write Cloud SQL PostgreSQL or private tenant object storage, and return `410 Gone` as soon as `DEMO_MODE="false"`.
+
+- `GET /api/demo-workspace` — Initializes or fetches the caller's isolated synthetic workspace (`demoMode`, `demoSessionId`, `user`, `activeOrganization`, `settings`, `suppliers`, `items`, `rfqs`, `quotations`, `awards`, `auditLogs`).
+- `POST /api/demo-workspace/reset` — Restores the caller's demo session to its clean synthetic initial dataset.
+- `PATCH /api/demo-workspace/settings` — Updates demo organization defaults (`name`, `defaultCurrency`, `taxRegime`, `defaultTaxCreditable`).
+- `POST /api/demo-workspace/rfqs` & `POST /api/demo-workspace/rfqs/load-sample` — Creates a demo RFQ or loads another synthetic RFQ + 3 sample quotations.
+- `POST /api/demo-workspace/suppliers` — Creates a demo supplier (`409` on duplicate name/Tax ID within the demo session).
+- `POST /api/demo-workspace/rfqs/:rfqId/quotes/extract` *(Rate Limited)* — Validates magic bytes (`validateUploadedFile`), runs Gemini extraction (or deterministic `extractDemoQuotationOffline` when no API key is configured), and stores uploaded demo files strictly in session memory.
+- `PATCH /api/demo-workspace/quotations/:quoteId`, `PATCH /api/demo-workspace/quotations/:quoteId/lines/:lineId`, `POST /api/demo-workspace/quotations/:quoteId/verify` (`422` math gate), `DELETE /api/demo-workspace/quotations/:quoteId` (`409` approved-award guard).
+- `POST /api/demo-workspace/rfqs/:rfqId/award` & `POST /api/demo-workspace/awards/:awardId/decide` — Simulates split/single award recommendation (`nonL1Justification` enforced) and updates synthetic demo price memory.
+- `GET /api/demo-workspace/documents/:docId/signed-url` & `GET /api/demo-workspace/documents/:docId/content` — Returns HMAC-signed URLs scoped to `demo:${docId}:${demoSessionId}:${exp}` (`403` on tampered signature, `404` across demo sessions).
 
 ### `POST /api/auth/register` *(Rate Limited)*
 Creates a password user account, creates a personal organization (or accepts an `inviteToken`), queues a verification email, and sets `nf_session`.
@@ -35,7 +51,7 @@ Verifies email + `scrypt` password hash and sets `nf_session`.
 - **Responses:** `200 OK`, `400 Bad Request`, `401 Unauthorized`, `429 Too Many Requests`.
 
 ### `POST /api/auth/google` *(Rate Limited)*
-Verifies Firebase Google `idToken` via `firebase-admin` (`checkRevoked=true`, `aud`/`iss` checked), enforces `email_verified === true` before linking to an existing password account, optionally accepts `inviteToken` for both new and existing users, and sets `nf_session`.
+Verifies Firebase Google `idToken` via `firebase-admin` (`verifyIdToken` validating RS256 signature against Google X.509 certificates, `exp`, `aud`, and `iss`; revocation lookup opt-in via `FIREBASE_CHECK_REVOKED=true`), enforces `email_verified === true` before linking to an existing password account, optionally accepts `inviteToken` for both new and existing users, and sets `nf_session`.
 - **Body:** `{ idToken, inviteToken? }`
 - **Responses:** `200 OK`, `400 Bad Request`, `401 Unauthorized`, `403 Forbidden` (unverified email link attempt or invite email mismatch).
 

@@ -24,6 +24,8 @@ interface ExtractionReviewPaneProps {
   onUpdateLine: (quoteId: string, lineId: string, patch: Partial<QuotationLine>) => Promise<void>;
   onVerifyQuote: (quoteId: string) => Promise<void>;
   onGoToCompare: () => void;
+  demoMode?: boolean;
+  demoSessionId?: string | null;
 }
 
 function colIndexToLetter(index: number): string {
@@ -54,6 +56,8 @@ export function ExtractionReviewPane({
   onUpdateLine,
   onVerifyQuote,
   onGoToCompare,
+  demoMode = false,
+  demoSessionId = null,
 }: ExtractionReviewPaneProps) {
   const activeQuote = quotes.find((q) => q.id === selectedQuoteId) || quotes[0] || null;
   const [focusedLineId, setFocusedLineId] = useState<string | null>(null);
@@ -105,8 +109,14 @@ export function ExtractionReviewPane({
     setSignedDocUrl(null);
     if (!activeQuote?.documentId || activeQuote.fileDataUrl) return;
     let active = true;
-    fetch(`/api/documents/${encodeURIComponent(activeQuote.documentId)}/signed-url`, {
+    const base = demoMode ? '/api/demo-workspace/documents' : '/api/documents';
+    const headers: Record<string, string> = {};
+    if (demoMode && demoSessionId) {
+      headers['X-Demo-Session'] = demoSessionId;
+    }
+    fetch(`${base}/${encodeURIComponent(activeQuote.documentId)}/signed-url`, {
       credentials: 'include',
+      headers,
     })
       .then(async (res) => {
         if (!res.ok) return null;
@@ -121,7 +131,7 @@ export function ExtractionReviewPane({
     return () => {
       active = false;
     };
-  }, [activeQuote?.id, activeQuote?.documentId, activeQuote?.fileDataUrl]);
+  }, [activeQuote?.id, activeQuote?.documentId, activeQuote?.fileDataUrl, demoMode, demoSessionId]);
 
   if (!activeQuote) {
     return (

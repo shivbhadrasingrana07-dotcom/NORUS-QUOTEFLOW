@@ -163,6 +163,8 @@ export function AuthView({
         setError(
           'This domain is not yet added to Firebase Authorized Domains. Use email/password sign-in or authorize this domain in Firebase Console.'
         );
+      } else if (code === 'auth/operation-not-allowed') {
+        setError('Google Sign-In is not enabled in the configured Firebase Authentication project.');
       } else {
         setError(
           err instanceof Error

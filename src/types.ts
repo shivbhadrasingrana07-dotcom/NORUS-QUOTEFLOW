@@ -98,6 +98,7 @@ export interface AuthStatePayload {
   organizations: OrganizationSummary[];
   csrfToken: string | null;
   googleAuthEnabled: boolean;
+  demoMode?: boolean;
 }
 
 export interface Supplier {

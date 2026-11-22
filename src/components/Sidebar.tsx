@@ -38,7 +38,8 @@ interface SidebarProps {
   pendingReviewCount: number;
   pendingApprovalCount: number;
   onSwitchOrganization: (orgId: string) => Promise<void>;
-  onSignOut: () => Promise<void>;
+  onSignOut?: () => Promise<void>;
+  demoMode?: boolean;
 }
 
 export function Sidebar({
@@ -52,6 +53,7 @@ export function Sidebar({
   pendingApprovalCount,
   onSwitchOrganization,
   onSignOut,
+  demoMode = false,
 }: SidebarProps) {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [orgMenuOpen, setOrgMenuOpen] = useState(false);
@@ -73,7 +75,9 @@ export function Sidebar({
     { id: 'suppliers', label: 'Suppliers', icon: Building2 },
     { id: 'items', label: 'Item Price Memory', icon: Package },
     { id: 'reports', label: 'CS Archive & Audit', icon: FileSpreadsheet },
-    { id: 'organization', label: 'Team & Organizations', icon: Users },
+    ...(demoMode
+      ? []
+      : [{ id: 'organization' as NavSection, label: 'Team & Organizations', icon: Users }]),
     { id: 'settings', label: 'Settings', icon: Settings },
   ];
 
@@ -102,23 +106,37 @@ export function Sidebar({
         <div className="font-display text-base font-bold tracking-tight text-[#0F172A] whitespace-nowrap">
           NORUS QUOTEFLOW
         </div>
-        <button
-          type="button"
-          onClick={() => setOrgMenuOpen((v) => !v)}
-          className="mt-2 w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-md bg-[#F8FAFC] border border-[#E2E8F0] hover:bg-slate-100 text-left transition-colors"
-        >
-          <div className="min-w-0">
-            <div className="text-xs font-medium text-[#0F172A] truncate">
+        {demoMode ? (
+          <div className="mt-2 px-2.5 py-1.5 rounded-md bg-[#FFFBEB] border border-[#FDE68A] text-left">
+            <div className="text-[10px] font-mono font-bold uppercase tracking-wider text-[#B45309]">
+              DEMO WORKSPACE
+            </div>
+            <div className="text-xs font-medium text-[#0F172A] truncate mt-0.5">
               {activeOrganization.name}
             </div>
             <div className="text-[11px] font-mono text-[#475569]">
-              {activeOrganization.defaultCurrency} · {activeOrganization.role.toUpperCase()}
+              {activeOrganization.defaultCurrency} · SAMPLE DATA
             </div>
           </div>
-          <ChevronDown className="w-3.5 h-3.5 text-[#475569] shrink-0" />
-        </button>
+        ) : (
+          <button
+            type="button"
+            onClick={() => setOrgMenuOpen((v) => !v)}
+            className="mt-2 w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-md bg-[#F8FAFC] border border-[#E2E8F0] hover:bg-slate-100 text-left transition-colors"
+          >
+            <div className="min-w-0">
+              <div className="text-xs font-medium text-[#0F172A] truncate">
+                {activeOrganization.name}
+              </div>
+              <div className="text-[11px] font-mono text-[#475569]">
+                {activeOrganization.defaultCurrency} · {activeOrganization.role.toUpperCase()}
+              </div>
+            </div>
+            <ChevronDown className="w-3.5 h-3.5 text-[#475569] shrink-0" />
+          </button>
+        )}
 
-        {orgMenuOpen && (
+        {!demoMode && orgMenuOpen && (
           <div className="absolute left-3 right-3 top-[92px] bg-white border border-[#E2E8F0] rounded-lg shadow-lg p-1.5 z-40">
             <div className="px-2 py-1 text-[11px] font-medium text-[#475569]">
               Switch Organization
@@ -193,20 +211,26 @@ export function Sidebar({
           </div>
           <div className="min-w-0 flex-1">
             <div className="text-xs font-semibold text-[#0F172A] truncate">{user.fullName}</div>
-            <div className="text-[11px] text-[#475569] truncate">{user.email}</div>
+            <div className="text-[11px] text-[#475569] truncate">
+              {demoMode ? 'Isolated Sample Environment' : user.email}
+            </div>
             <div className="text-[10px] font-mono text-[#0F4C81] mt-0.5">
-              {settings.activeUserRole.toUpperCase()} · {settings.taxRegime.replace('_', ' ')}
+              {demoMode
+                ? `DEMO · ${settings.taxRegime.replace('_', ' ')}`
+                : `${settings.activeUserRole.toUpperCase()} · ${settings.taxRegime.replace('_', ' ')}`}
             </div>
           </div>
         </div>
-        <button
-          type="button"
-          onClick={onSignOut}
-          className="w-full flex items-center justify-center gap-2 px-3 py-1.5 text-xs font-medium text-[#475569] hover:text-[#DC2626] hover:bg-[#FEF2F2] rounded-md border border-[#E2E8F0] transition-colors"
-        >
-          <LogOut className="w-3.5 h-3.5" />
-          <span>Sign Out</span>
-        </button>
+        {!demoMode && onSignOut && (
+          <button
+            type="button"
+            onClick={onSignOut}
+            className="w-full flex items-center justify-center gap-2 px-3 py-1.5 text-xs font-medium text-[#475569] hover:text-[#DC2626] hover:bg-[#FEF2F2] rounded-md border border-[#E2E8F0] transition-colors"
+          >
+            <LogOut className="w-3.5 h-3.5" />
+            <span>Sign Out</span>
+          </button>
+        )}
       </div>
     </div>
   );

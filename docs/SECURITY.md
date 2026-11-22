@@ -6,7 +6,7 @@
    - Passwords hashed with Node `crypto.scrypt` (`N=16384`, `r=8`, `p=1`) and random 16-byte per-user salts, compared via `crypto.timingSafeEqual`.
    - Password complexity enforced server-side (8–128 chars, requires letter + number).
    - Email verification tokens and password-reset tokens use 256-bit random values stored exclusively as `SHA-256` hashes, enforced one-time with expiration checks; password reset revokes all active user sessions.
-   - Google Sign-In uses minimal scopes (`openid`, `email`, `profile`), popup/domain error translation (`src/components/AuthView.tsx`), and server-side verification via `firebase-admin` (`verifyIdToken(idToken, true)` checking revocation + `aud` + `iss`). Linking a Google UID onto an existing password account requires `email_verified === true` (`403` otherwise).
+   - Google Sign-In uses minimal scopes (`openid`, `email`, `profile`), popup/domain error translation (`src/components/AuthView.tsx`), and server-side verification via `firebase-admin` (`verifyIdToken(idToken, FIREBASE_CHECK_REVOKED === 'true')`, validating Google X.509 certificate signature, `exp`, `aud`, and `iss` before exchanging for a revocable PostgreSQL `nf_session`). Linking a Google UID onto an existing password account requires `email_verified === true` (`403` otherwise).
    - `POST /api/demo/switch-persona` is permanently disabled (`410 Gone`), and `PATCH /api/settings` ignores client-supplied role properties.
 
 2. **Session Management & CSRF Protection (`server.ts`, `server/security.ts`):**
@@ -41,3 +41,10 @@
 3. **Multi-Replica Object Storage:** Configure `STORAGE_PROVIDER=s3` (`S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`) rather than local container filesystem storage if running multiple backend instances.
 4. **Outbound Transactional Email:** Configure `RESEND_API_KEY` and a domain-verified `EMAIL_FROM` (`SPF`/`DKIM`) so verification, password reset, and organization invitation links deliver externally instead of queuing in `DevOutboxEmailProvider`.
 5. **Founder Ownership Claim for `org-kalyani-hydraulics`:** Run `npm run org:bootstrap-owner -- --org-id=org-kalyani-hydraulics --issue-token --email="<founder-email>"` (or `--claim-direct`) once the authorized founder email is designated.
+6. **Disable Temporary No-Login Demo Mode:** Set `DEMO_MODE="false"` in `.env` / Secret Manager before public or production deployment so the login UI (`AuthView`), organization management (`OrganizationView`), and real PostgreSQL multi-tenant workspaces are active (`GET /api/demo-workspace*` returns `410 Gone`).
+
+## Temporary Demo Workspace Isolation (Task 006)
+
+- When `DEMO_MODE !== "false"`, unauthenticated visitors land directly in an isolated synthetic sandbox backed exclusively by `server/demoWorkspace.ts` (`demo-org-synthetic`).
+- **Zero Database / Customer Leakage:** `DemoWorkspaceStore` holds no Cloud SQL connection and no reference to `server/pgStore.ts`, `server/seedData.ts` (`org-kalyani-hydraulics`), or `server/objectStorage.ts`. All real `/api/workspace`, `/api/rfqs`, `/api/suppliers`, `/api/documents/*`, and `/api/organizations/*` routes continue enforcing `401 Unauthorized`, CSRF, and RBAC.
+- **Per-Visitor Memory Isolation:** Each visitor receives a scoped `nf_demo_sid` / `X-Demo-Session` session capped at 120 LRU sessions in server memory; uploaded demo previews require session-bound HMAC signatures (`demo:${docId}:${demoSessionId}:${exp}`).

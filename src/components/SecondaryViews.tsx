@@ -587,9 +587,11 @@ export function ReportsView({
 export function SettingsView({
   settings,
   onSaveSettings,
+  demoMode = false,
 }: {
   settings: OrganizationSettings;
   onSaveSettings: (patch: Partial<OrganizationSettings>) => Promise<void>;
+  demoMode?: boolean;
 }) {
   const [name, setName] = useState(settings.name);
   const [currency, setCurrency] = useState(settings.defaultCurrency);
@@ -701,11 +703,19 @@ export function SettingsView({
         </label>
 
         <div className="p-3 bg-[#F8FAFC] border border-[#E2E8F0] rounded-md text-xs text-[#475569]">
-          <strong>Authenticated Membership Role:</strong>{' '}
-          <span className="font-mono font-semibold text-[#0F4C81]">
-            {settings.activeUserRole.toUpperCase()}
-          </span>
-          . Only Organization Owners and Admins can modify organization normalization defaults or manage team roles under Team & Organizations.
+          {demoMode ? (
+            <>
+              <strong>Demo Workspace Mode:</strong> Changes apply only to your isolated synthetic sample session and do not affect any real organization records.
+            </>
+          ) : (
+            <>
+              <strong>Authenticated Membership Role:</strong>{' '}
+              <span className="font-mono font-semibold text-[#0F4C81]">
+                {settings.activeUserRole.toUpperCase()}
+              </span>
+              . Only Organization Owners and Admins can modify organization normalization defaults or manage team roles under Team & Organizations.
+            </>
+          )}
         </div>
 
         {error && (

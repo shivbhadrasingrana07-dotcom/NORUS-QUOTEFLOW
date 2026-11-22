@@ -12,14 +12,27 @@ import {
   SuppliersView,
 } from './components/SecondaryViews.tsx';
 import { NavSection, Sidebar } from './components/Sidebar.tsx';
+import { RotateCcw } from 'lucide-react';
 import {
   AuthStatePayload,
   AwardAllocation,
+  AuthUser,
   OrganizationSettings,
+  OrganizationSummary,
   Quotation,
   QuotationLine,
   WorkspaceState,
 } from './types.ts';
+
+interface DemoWorkspaceResponse extends WorkspaceState {
+  demoMode: true;
+  demoSessionId: string;
+  user: AuthUser;
+  activeOrganization: OrganizationSummary;
+  organizations: OrganizationSummary[];
+}
+
+const DEMO_SESSION_STORAGE_KEY = 'norus_demo_session_id';
 
 function readCookie(name: string): string | null {
   const parts = document.cookie.split(';');
@@ -50,6 +63,15 @@ function getInitialUrlTokens() {
 export default function App() {
   const [urlTokens, setUrlTokens] = useState(getInitialUrlTokens);
   const [authState, setAuthState] = useState<AuthStatePayload | null>(null);
+  const [demoMode, setDemoMode] = useState(false);
+  const [demoSessionId, setDemoSessionId] = useState<string | null>(() => {
+    try {
+      return window.sessionStorage.getItem(DEMO_SESSION_STORAGE_KEY);
+    } catch {
+      return null;
+    }
+  });
+  const demoSessionIdRef = useRef<string | null>(demoSessionId);
   const csrfTokenRef = useRef<string | null>(null);
 
   const [workspace, setWorkspace] = useState<WorkspaceState | null>(null);
@@ -63,6 +85,7 @@ export default function App() {
 
   const [createModalOpen, setCreateModalOpen] = useState(false);
   const [loadingSample, setLoadingSample] = useState(false);
+  const [resettingDemo, setResettingDemo] = useState(false);
 
   const clearUrlParams = useCallback(() => {
     if (window.location.search) {
@@ -74,7 +97,15 @@ export default function App() {
   const apiJson = useCallback(async <T,>(url: string, options?: RequestInit): Promise<T> => {
     const method = (options?.method || 'GET').toUpperCase();
     const headers = new Headers(options?.headers || {});
-    if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
+    if (url.startsWith('/api/demo-workspace') && demoSessionIdRef.current && !headers.has('X-Demo-Session')) {
+      headers.set('X-Demo-Session', demoSessionIdRef.current);
+    }
+    if (
+      !url.startsWith('/api/demo-workspace') &&
+      method !== 'GET' &&
+      method !== 'HEAD' &&
+      method !== 'OPTIONS'
+    ) {
       const csrf = csrfTokenRef.current || readCookie('nf_csrf');
       if (csrf && !headers.has('X-CSRF-Token')) {
         headers.set('X-CSRF-Token', csrf);
@@ -86,7 +117,7 @@ export default function App() {
       credentials: 'include',
     });
     const data = await res.json();
-    if (res.status === 401) {
+    if (res.status === 401 && !url.startsWith('/api/demo-workspace')) {
       csrfTokenRef.current = null;
       setAuthState({
         authenticated: false,
@@ -95,6 +126,7 @@ export default function App() {
         organizations: [],
         csrfToken: null,
         googleAuthEnabled: true,
+        demoMode: false,
       });
       setWorkspace(null);
       throw new Error(data.error || 'Session expired. Please sign in again.');
@@ -105,9 +137,46 @@ export default function App() {
     return data as T;
   }, []);
 
+  const applyDemoResponse = useCallback((demo: DemoWorkspaceResponse) => {
+    demoSessionIdRef.current = demo.demoSessionId;
+    setDemoSessionId(demo.demoSessionId);
+    try {
+      window.sessionStorage.setItem(DEMO_SESSION_STORAGE_KEY, demo.demoSessionId);
+    } catch {
+      // Ignore storage errors
+    }
+    setDemoMode(true);
+    setAuthState({
+      authenticated: true,
+      user: demo.user,
+      activeOrganization: demo.activeOrganization,
+      organizations: demo.organizations,
+      csrfToken: null,
+      googleAuthEnabled: false,
+      demoMode: true,
+    });
+    setWorkspace({
+      settings: demo.settings,
+      suppliers: demo.suppliers,
+      items: demo.items,
+      rfqs: demo.rfqs,
+      quotations: demo.quotations,
+      awards: demo.awards,
+      auditLogs: demo.auditLogs,
+    });
+    setLoadError(null);
+  }, []);
+
   const refreshAll = useCallback(async () => {
     try {
       const me = await apiJson<AuthStatePayload>('/api/auth/me');
+      if (me.demoMode) {
+        const demo = await apiJson<DemoWorkspaceResponse>('/api/demo-workspace');
+        applyDemoResponse(demo);
+        return;
+      }
+
+      setDemoMode(false);
       csrfTokenRef.current = me.csrfToken;
       setAuthState(me);
 
@@ -150,7 +219,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [apiJson, clearUrlParams, urlTokens.invite]);
+  }, [apiJson, applyDemoResponse, clearUrlParams, urlTokens.invite]);
 
   useEffect(() => {
     refreshAll();
@@ -200,10 +269,28 @@ export default function App() {
     setActiveSection('rfqs');
   };
 
+  const apiPrefix = demoMode ? '/api/demo-workspace' : '/api';
+
+  const handleResetDemo = async () => {
+    if (!demoMode || resettingDemo) return;
+    try {
+      setResettingDemo(true);
+      const reset = await apiJson<DemoWorkspaceResponse>('/api/demo-workspace/reset', {
+        method: 'POST',
+      });
+      setActiveRfqId(null);
+      setSelectedQuoteId(null);
+      setActiveSection('dashboard');
+      applyDemoResponse(reset);
+    } finally {
+      setResettingDemo(false);
+    }
+  };
+
   const handleLoadSample = async () => {
     try {
       setLoadingSample(true);
-      const result = await apiJson<{ rfq: { id: string } }>('/api/rfqs/load-sample', {
+      const result = await apiJson<{ rfq: { id: string } }>(`${apiPrefix}/rfqs/load-sample`, {
         method: 'POST',
       });
       await refreshAll();
@@ -214,7 +301,7 @@ export default function App() {
   };
 
   const handleSaveSettings = async (patch: Partial<OrganizationSettings>) => {
-    await apiJson('/api/settings', {
+    await apiJson(`${apiPrefix}/settings`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(patch),
@@ -237,7 +324,7 @@ export default function App() {
       targetUnitPrice: number | null;
     }>;
   }) => {
-    const created = await apiJson<{ id: string }>('/api/rfqs', {
+    const created = await apiJson<{ id: string }>(`${apiPrefix}/rfqs`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -256,7 +343,7 @@ export default function App() {
     defaultPaymentTerms: string;
     categories: string[];
   }) => {
-    await apiJson('/api/suppliers', {
+    await apiJson(`${apiPrefix}/suppliers`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -275,7 +362,7 @@ export default function App() {
     if (params.file) formData.append('file', params.file);
     if (params.rawEmailText) formData.append('rawEmailText', params.rawEmailText);
 
-    const created = await apiJson<Quotation>(`/api/rfqs/${params.rfqId}/quotes/extract`, {
+    const created = await apiJson<Quotation>(`${apiPrefix}/rfqs/${params.rfqId}/quotes/extract`, {
       method: 'POST',
       body: formData,
     });
@@ -284,7 +371,7 @@ export default function App() {
   };
 
   const handleUpdateHeader = async (quoteId: string, patch: Partial<Quotation>) => {
-    await apiJson(`/api/quotations/${quoteId}`, {
+    await apiJson(`${apiPrefix}/quotations/${quoteId}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(patch),
@@ -297,7 +384,7 @@ export default function App() {
     lineId: string,
     patch: Partial<QuotationLine>
   ) => {
-    await apiJson(`/api/quotations/${quoteId}/lines/${lineId}`, {
+    await apiJson(`${apiPrefix}/quotations/${quoteId}/lines/${lineId}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(patch),
@@ -306,12 +393,12 @@ export default function App() {
   };
 
   const handleVerifyQuote = async (quoteId: string) => {
-    await apiJson(`/api/quotations/${quoteId}/verify`, { method: 'POST' });
+    await apiJson(`${apiPrefix}/quotations/${quoteId}/verify`, { method: 'POST' });
     await refreshAll();
   };
 
   const handleDeleteQuote = async (quoteId: string) => {
-    await apiJson(`/api/quotations/${quoteId}`, { method: 'DELETE' });
+    await apiJson(`${apiPrefix}/quotations/${quoteId}`, { method: 'DELETE' });
     await refreshAll();
   };
 
@@ -323,7 +410,7 @@ export default function App() {
     isNonL1: boolean;
     nonL1Justification: string;
   }) => {
-    await apiJson(`/api/rfqs/${params.rfqId}/award`, {
+    await apiJson(`${apiPrefix}/rfqs/${params.rfqId}/award`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(params),
@@ -336,7 +423,7 @@ export default function App() {
     decision: 'approved' | 'rejected',
     approverNotes: string
   ) => {
-    await apiJson(`/api/awards/${awardId}/decide`, {
+    await apiJson(`${apiPrefix}/awards/${awardId}/decide`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ decision, approverNotes }),
@@ -356,7 +443,7 @@ export default function App() {
     );
   }
 
-  if (!authState?.authenticated || !authState.user) {
+  if (!demoMode && (!authState?.authenticated || !authState.user)) {
     return (
       <AuthView
         initialInviteToken={urlTokens.invite}
@@ -368,7 +455,7 @@ export default function App() {
     );
   }
 
-  if (!authState.activeOrganization) {
+  if (!demoMode && authState?.user && !authState.activeOrganization) {
     return (
       <div className="min-h-screen bg-[#F8FAFC] p-6">
         <div className="max-w-4xl mx-auto space-y-4">
@@ -393,7 +480,7 @@ export default function App() {
     );
   }
 
-  if (loadError || !workspace) {
+  if (loadError || !workspace || !authState?.user || !authState?.activeOrganization) {
     return (
       <div className="min-h-screen bg-[#F8FAFC] flex items-center justify-center p-6">
         <div className="bg-white border border-[#E2E8F0] rounded-lg p-6 max-w-md space-y-3">
@@ -406,12 +493,14 @@ export default function App() {
             >
               Retry
             </button>
-            <button
-              onClick={handleSignOut}
-              className="px-4 py-2 text-xs font-medium text-[#475569] border border-[#E2E8F0] rounded-md"
-            >
-              Sign Out
-            </button>
+            {!demoMode && (
+              <button
+                onClick={handleSignOut}
+                className="px-4 py-2 text-xs font-medium text-[#475569] border border-[#E2E8F0] rounded-md"
+              >
+                Sign Out
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -446,10 +535,32 @@ export default function App() {
         pendingReviewCount={pendingReviewCount}
         pendingApprovalCount={pendingApprovalCount}
         onSwitchOrganization={handleSwitchOrganization}
-        onSignOut={handleSignOut}
+        onSignOut={demoMode ? undefined : handleSignOut}
+        demoMode={demoMode}
       />
 
       <main className="flex-1 min-w-0 pt-16 lg:pt-0">
+        {demoMode && (
+          <div className="bg-[#FFFBEB] border-b border-[#FDE68A] px-4 sm:px-6 lg:px-8 py-2.5">
+            <div className="max-w-[1360px] mx-auto flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+              <div className="text-[#92400E]">
+                <span className="font-mono font-bold uppercase mr-2">DEMO ENVIRONMENT</span>
+                <span>
+                  Synthetic sample procurement data only — changes stay isolated in this demo session and never access real customer records.
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={handleResetDemo}
+                disabled={resettingDemo}
+                className="px-2.5 py-1 bg-white border border-[#F59E0B] text-[#92400E] font-medium rounded hover:bg-amber-50 flex items-center gap-1.5 self-start sm:self-auto shrink-0 disabled:opacity-50"
+              >
+                <RotateCcw className="w-3 h-3" />
+                <span>{resettingDemo ? 'Resetting...' : 'Reset Demo Data'}</span>
+              </button>
+            </div>
+          </div>
+        )}
         <div className="max-w-[1360px] mx-auto px-4 sm:px-6 lg:px-8 py-6">
           {activeSection === 'dashboard' && (
             <DashboardView
@@ -486,6 +597,8 @@ export default function App() {
               onDeleteQuote={handleDeleteQuote}
               onSubmitAward={handleSubmitAward}
               onDecideAward={handleDecideAward}
+              demoMode={demoMode}
+              demoSessionId={demoSessionId}
             />
           )}
 
@@ -523,7 +636,7 @@ export default function App() {
             />
           )}
 
-          {activeSection === 'organization' && (
+          {!demoMode && activeSection === 'organization' && (
             <OrganizationView
               user={authState.user}
               activeOrganization={authState.activeOrganization}
@@ -537,6 +650,7 @@ export default function App() {
             <SettingsView
               settings={workspace.settings}
               onSaveSettings={handleSaveSettings}
+              demoMode={demoMode}
             />
           )}
         </div>

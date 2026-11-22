@@ -68,6 +68,8 @@ interface RfqWorkspaceProps {
     decision: 'approved' | 'rejected',
     approverNotes: string
   ) => Promise<void>;
+  demoMode?: boolean;
+  demoSessionId?: string | null;
 }
 
 export function RfqWorkspace({
@@ -90,6 +92,8 @@ export function RfqWorkspace({
   onDeleteQuote,
   onSubmitAward,
   onDecideAward,
+  demoMode = false,
+  demoSessionId = null,
 }: RfqWorkspaceProps) {
   const [basis, setBasis] = useState<CostBasis>('landed');
   const [copiedInvite, setCopiedInvite] = useState(false);
@@ -629,6 +633,8 @@ export function RfqWorkspace({
           onUpdateLine={onUpdateLine}
           onVerifyQuote={onVerifyQuote}
           onGoToCompare={() => onChangeTab('compare')}
+          demoMode={demoMode}
+          demoSessionId={demoSessionId}
         />
       )}
 

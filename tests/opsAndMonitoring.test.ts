@@ -16,6 +16,7 @@ import {
   issueFirstOwnerClaimToken,
 } from '../server/ownerBootstrap.ts';
 import { PgDataStore, StoreError } from '../server/pgStore.ts';
+import { adminAuth, verifyFirebaseIdToken } from '../server/firebase-admin.ts';
 import { generateSecureToken, sha256Hex } from '../server/security.ts';
 import { db, pool } from '../src/db/index.ts';
 import {
@@ -743,5 +744,99 @@ test('Operational monitoring: correlation IDs, COOP header, readiness ready/degr
     );
   } finally {
     await degradedSrv.close();
+  }
+});
+
+test('Task 005 regression: verifyFirebaseIdToken defaults checkRevoked=false, enforces aud/iss, and avoids host-project Identity Toolkit lookup errors', async () => {
+  const prevCheckRevoked = process.env.FIREBASE_CHECK_REVOKED;
+  delete process.env.FIREBASE_CHECK_REVOKED;
+
+  const originalVerify = adminAuth.verifyIdToken.bind(adminAuth);
+  const mutableAdminAuth = adminAuth as unknown as {
+    verifyIdToken: typeof adminAuth.verifyIdToken;
+  };
+
+  try {
+    // 1. Live default path with malformed JWT fails strictly on local JWT decoding (not Identity Toolkit 344782474303)
+    await assert.rejects(
+      () => verifyFirebaseIdToken('not.a.valid-jwt'),
+      (err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        assert.ok(!msg.includes('identitytoolkit.googleapis.com'));
+        assert.ok(!msg.includes('344782474303'));
+        return true;
+      }
+    );
+
+    const realSrv = await startIntegratedTestServer();
+    try {
+      const client = new TestCookieClient(realSrv.baseUrl);
+      const res = await client.request('/api/auth/google', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idToken: 'not.a.valid-jwt' }),
+      });
+      assert.equal(res.status, 401);
+      const errJson = (await res.json()) as { error: string };
+      assert.ok(errJson.error.length > 0);
+      assert.ok(!errJson.error.includes('identitytoolkit.googleapis.com'));
+      assert.ok(!errJson.error.includes('344782474303'));
+    } finally {
+      await realSrv.close();
+    }
+
+    // 2. Verify checkRevoked defaults to false, opts in when FIREBASE_CHECK_REVOKED=true, and validates aud/iss
+    const seenCheckRevoked: Array<boolean | undefined> = [];
+    mutableAdminAuth.verifyIdToken = (async (_token: string, checkRevoked?: boolean) => {
+      seenCheckRevoked.push(checkRevoked);
+      return {
+        uid: 'uid-task005',
+        email: 'founder@example.com',
+        email_verified: true,
+        aud: 'favorable-emblem-zxq1s',
+        iss: 'https://securetoken.google.com/favorable-emblem-zxq1s',
+      } as Awaited<ReturnType<typeof originalVerify>>;
+    }) as typeof adminAuth.verifyIdToken;
+
+    const okDecoded = await verifyFirebaseIdToken('fake.header.sig');
+    assert.equal(okDecoded.uid, 'uid-task005');
+    assert.equal(seenCheckRevoked[0], false);
+
+    process.env.FIREBASE_CHECK_REVOKED = 'true';
+    await verifyFirebaseIdToken('fake.header.sig');
+    assert.equal(seenCheckRevoked[1], true);
+
+    delete process.env.FIREBASE_CHECK_REVOKED;
+
+    mutableAdminAuth.verifyIdToken = (async () =>
+      ({
+        uid: 'uid-bad-aud',
+        aud: 'wrong-project',
+        iss: 'https://securetoken.google.com/favorable-emblem-zxq1s',
+      }) as Awaited<ReturnType<typeof originalVerify>>) as typeof adminAuth.verifyIdToken;
+
+    await assert.rejects(
+      () => verifyFirebaseIdToken('fake.header.sig'),
+      /audience mismatch/i
+    );
+
+    mutableAdminAuth.verifyIdToken = (async () =>
+      ({
+        uid: 'uid-bad-iss',
+        aud: 'favorable-emblem-zxq1s',
+        iss: 'https://securetoken.google.com/wrong-project',
+      }) as Awaited<ReturnType<typeof originalVerify>>) as typeof adminAuth.verifyIdToken;
+
+    await assert.rejects(
+      () => verifyFirebaseIdToken('fake.header.sig'),
+      /issuer mismatch/i
+    );
+  } finally {
+    mutableAdminAuth.verifyIdToken = originalVerify;
+    if (prevCheckRevoked === undefined) {
+      delete process.env.FIREBASE_CHECK_REVOKED;
+    } else {
+      process.env.FIREBASE_CHECK_REVOKED = prevCheckRevoked;
+    }
   }
 });
