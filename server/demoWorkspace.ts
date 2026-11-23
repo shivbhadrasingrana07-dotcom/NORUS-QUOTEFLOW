@@ -1,4 +1,7 @@
 import crypto from 'node:crypto';
+import { jsPDF } from 'jspdf';
+import autoTable from 'jspdf-autotable';
+import * as XLSX from 'xlsx';
 import type {
   AuditLogEntry,
   AwardAllocation,
@@ -61,6 +64,15 @@ export interface DemoStoredDocument {
   mimeType: string;
   buffer: Buffer;
   createdAt: string;
+  isSeedSample?: boolean;
+}
+
+interface DemoSeedDocTemplate {
+  id: string;
+  originalFilename: string;
+  mimeType: string;
+  buffer: Buffer;
+  createdAt: string;
 }
 
 interface DemoSessionState {
@@ -71,9 +83,137 @@ interface DemoSessionState {
   lastAccessedAt: number;
 }
 
+const DEMO_SAMPLE_SUPPLIER_INFO: Record<
+  string,
+  { name: string; taxId: string; city: string; email: string }
+> = {
+  'sup-demo-1': {
+    name: 'Northstar Precision CNC (Demo)',
+    taxId: '27DEMO0001A1Z1',
+    city: 'Pune, MH',
+    email: 'demo-quotes@northstar-sample.example',
+  },
+  'sup-demo-4': {
+    name: 'Clearwater Seals & Gauges (Demo)',
+    taxId: '33DEMO0004D4Z4',
+    city: 'Coimbatore, TN',
+    email: 'demo-rfq@clearwater-sample.example',
+  },
+};
+
+const samplePdfCache = new Map<string, Buffer>();
+const sampleXlsxCache = new Map<string, Buffer>();
+
+function buildSampleSupplierPdfBuffer(params: {
+  cacheKey: string;
+  supplierId: string;
+  rfq: Rfq;
+  quote: Quotation;
+}): Buffer {
+  const cached = samplePdfCache.get(params.cacheKey);
+  if (cached) return cached;
+
+  const sup = DEMO_SAMPLE_SUPPLIER_INFO[params.supplierId] || {
+    name: 'Synthetic Demo Vendor',
+    taxId: '27DEMO0000Z1Z1',
+    city: 'Pune, MH',
+    email: 'demo@sample-vendor.invalid',
+  };
+
+  const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+  doc.setFontSize(14);
+  doc.setTextColor(15, 23, 42);
+  doc.text(sup.name, 14, 18);
+
+  doc.setFontSize(9);
+  doc.setTextColor(71, 85, 105);
+  doc.text(`GSTIN: ${sup.taxId}  |  ${sup.city}  |  ${sup.email}`, 14, 24);
+  doc.text('SYNTHETIC DEMO DOCUMENT — NOT A CUSTOMER RECORD', 14, 29);
+
+  doc.setFontSize(11);
+  doc.setTextColor(15, 76, 129);
+  doc.text(`QUOTATION REF: ${params.quote.quoteReference}`, 14, 38);
+  doc.setFontSize(9);
+  doc.setTextColor(71, 85, 105);
+  doc.text(
+    `Date: ${params.quote.quoteDate}  |  Valid Until: ${params.quote.validUntil || 'N/A'}  |  Currency: ${params.quote.currency}`,
+    14,
+    44
+  );
+  doc.text(
+    `To: Meridian Industrial Demo Works (Sample)  |  RFQ: ${params.rfq.rfqNumber} (${params.rfq.deliveryLocation})`,
+    14,
+    49
+  );
+
+  autoTable(doc, {
+    startY: 55,
+    head: [['#', 'Description', 'Quoted Qty', 'UOM', 'Unit Rate', 'GST %', 'Line Total']],
+    body: params.quote.lines.map((l) => [
+      String(l.vendorLineNo),
+      l.rawDescription,
+      l.quotedQty !== null ? String(l.quotedQty) : '—',
+      l.quotedUom || '—',
+      l.quotedUnitRate !== null ? l.quotedUnitRate.toFixed(2) : '—',
+      `${l.taxRatePct}%`,
+      l.lineTotalQuoted !== null ? l.lineTotalQuoted.toFixed(2) : '—',
+    ]),
+    styles: { fontSize: 8.5, cellPadding: 2.5 },
+    headStyles: { fillColor: [15, 76, 129], textColor: 255 },
+  });
+
+  const finalY =
+    (doc as unknown as { lastAutoTable?: { finalY: number } }).lastAutoTable?.finalY ?? 120;
+
+  doc.setFontSize(9.5);
+  doc.setTextColor(15, 23, 42);
+  doc.text(
+    `Freight & Transit Insurance: ${params.quote.currency} ${params.quote.freightCharges.toFixed(2)}`,
+    14,
+    finalY + 10
+  );
+  doc.text(
+    `Packing & Crating: ${params.quote.currency} ${params.quote.packingForwarding.toFixed(2)}`,
+    14,
+    finalY + 16
+  );
+  doc.text(
+    `Lead Time: ${params.quote.leadTimeDays ?? '—'} days  |  Payment Terms: ${params.quote.paymentTerms || '—'}`,
+    14,
+    finalY + 22
+  );
+  doc.text(
+    `Tax Treatment: ${params.quote.taxIncludedInRates ? 'Included in quoted unit rates' : 'GST Extra as Applicable'}`,
+    14,
+    finalY + 28
+  );
+
+  const buffer = Buffer.from(doc.output('arraybuffer'));
+  samplePdfCache.set(params.cacheKey, buffer);
+  return buffer;
+}
+
+function buildSampleExcelBuffer(
+  cacheKey: string,
+  sheets: Array<{ sheetName: string; rows: string[][] }>
+): Buffer {
+  const cached = sampleXlsxCache.get(cacheKey);
+  if (cached) return cached;
+
+  const wb = XLSX.utils.book_new();
+  for (const sheet of sheets) {
+    const ws = XLSX.utils.aoa_to_sheet(sheet.rows);
+    XLSX.utils.book_append_sheet(wb, ws, sheet.sheetName);
+  }
+  const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
+  sampleXlsxCache.set(cacheKey, buffer);
+  return buffer;
+}
+
 function createSyntheticDemoRfqAndQuotes(suffix = ''): {
   rfq: Rfq;
   quotes: Quotation[];
+  documents: DemoSeedDocTemplate[];
 } {
   const rfqId = suffix ? `demo-rfq-sample-${suffix}` : 'demo-rfq-2026-101';
   const rfqNumber = suffix ? `DEMO-RFQ-2026-${suffix.slice(-3)}` : 'DEMO-RFQ-2026-101';
@@ -139,10 +279,12 @@ function createSyntheticDemoRfqAndQuotes(suffix = ''): {
     ],
   };
 
+  const q1DocId = `${rfqId}-doc-1`;
   const q1Raw: Quotation = {
     id: `${rfqId}-q1`,
     rfqId,
     supplierId: 'sup-demo-1',
+    documentId: q1DocId,
     documentName: 'Northstar_Demo_Quote_NSQ-401.pdf',
     documentKind: 'pdf',
     mimeType: 'application/pdf',
@@ -321,10 +463,12 @@ function createSyntheticDemoRfqAndQuotes(suffix = ''): {
     ],
   };
 
+  const q2DocId = `${rfqId}-doc-2`;
   const q2Raw: Quotation = {
     id: `${rfqId}-q2`,
     rfqId,
     supplierId: 'sup-demo-2',
+    documentId: q2DocId,
     documentName: 'Vanguard_Demo_Commercial_Offer.xlsx',
     documentKind: 'excel',
     mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -700,17 +844,47 @@ function createSyntheticDemoRfqAndQuotes(suffix = ''): {
     ],
   };
 
+  const q1Norm = recomputeQuotation(q1Raw, rfq);
+  const q2Norm = recomputeQuotation(q2Raw, rfq);
+  const q3Norm = recomputeQuotation(q3Raw, rfq);
+
+  const q1PdfBuf = buildSampleSupplierPdfBuffer({
+    cacheKey: 'northstar-nsq-401',
+    supplierId: q1Norm.supplierId,
+    rfq,
+    quote: q1Norm,
+  });
+  const q2XlsxBuf = buildSampleExcelBuffer(
+    'vanguard-offer-26-88',
+    q2Norm.sheetPreview || []
+  );
+
   return {
     rfq,
-    quotes: [
-      recomputeQuotation(q1Raw, rfq),
-      recomputeQuotation(q2Raw, rfq),
-      recomputeQuotation(q3Raw, rfq),
+    quotes: [q1Norm, q2Norm, q3Norm],
+    documents: [
+      {
+        id: q1DocId,
+        originalFilename: q1Norm.documentName,
+        mimeType: q1Norm.mimeType,
+        buffer: q1PdfBuf,
+        createdAt: q1Norm.createdAt,
+      },
+      {
+        id: q2DocId,
+        originalFilename: q2Norm.documentName,
+        mimeType: q2Norm.mimeType,
+        buffer: q2XlsxBuf,
+        createdAt: q2Norm.createdAt,
+      },
     ],
   };
 }
 
-export function createInitialDemoWorkspaceState(): WorkspaceState {
+function createInitialDemoWorkspaceAndDocs(): {
+  workspace: WorkspaceState;
+  documents: DemoSeedDocTemplate[];
+} {
   const sample = createSyntheticDemoRfqAndQuotes();
 
   const awardedRfq: Rfq = {
@@ -757,6 +931,7 @@ export function createInitialDemoWorkspaceState(): WorkspaceState {
       id: 'demo-rfq-100-q1',
       rfqId: 'demo-rfq-2026-100',
       supplierId: 'sup-demo-1',
+      documentId: 'demo-rfq-100-doc-1',
       documentName: 'Northstar_Demo_Q3_380.pdf',
       documentKind: 'pdf',
       mimeType: 'application/pdf',
@@ -859,6 +1034,7 @@ export function createInitialDemoWorkspaceState(): WorkspaceState {
       id: 'demo-rfq-100-q2',
       rfqId: 'demo-rfq-2026-100',
       supplierId: 'sup-demo-4',
+      documentId: 'demo-rfq-100-doc-2',
       documentName: 'Clearwater_Demo_Q3_109.pdf',
       documentKind: 'pdf',
       mimeType: 'application/pdf',
@@ -956,7 +1132,20 @@ export function createInitialDemoWorkspaceState(): WorkspaceState {
     awardedRfq
   );
 
-  return {
+  const awardedQ1Buf = buildSampleSupplierPdfBuffer({
+    cacheKey: 'northstar-q3-380',
+    supplierId: awardedQ1.supplierId,
+    rfq: awardedRfq,
+    quote: awardedQ1,
+  });
+  const awardedQ2Buf = buildSampleSupplierPdfBuffer({
+    cacheKey: 'clearwater-q3-109',
+    supplierId: awardedQ2.supplierId,
+    rfq: awardedRfq,
+    quote: awardedQ2,
+  });
+
+  const workspace: WorkspaceState = {
     settings: {
       id: DEMO_ORGANIZATION_ID,
       slug: DEMO_ORGANIZATION_SUMMARY.slug,
@@ -1181,6 +1370,31 @@ export function createInitialDemoWorkspaceState(): WorkspaceState {
       },
     ],
   };
+
+  return {
+    workspace,
+    documents: [
+      ...sample.documents,
+      {
+        id: 'demo-rfq-100-doc-1',
+        originalFilename: awardedQ1.documentName,
+        mimeType: awardedQ1.mimeType,
+        buffer: awardedQ1Buf,
+        createdAt: awardedQ1.createdAt,
+      },
+      {
+        id: 'demo-rfq-100-doc-2',
+        originalFilename: awardedQ2.documentName,
+        mimeType: awardedQ2.mimeType,
+        buffer: awardedQ2Buf,
+        createdAt: awardedQ2.createdAt,
+      },
+    ],
+  };
+}
+
+export function createInitialDemoWorkspaceState(): WorkspaceState {
+  return createInitialDemoWorkspaceAndDocs().workspace;
 }
 
 function normalizeNameKey(v: string): string {
@@ -1275,6 +1489,10 @@ export function extractDemoQuotationOffline(params: {
   });
 }
 
+const MAX_UPLOADED_DOCS_PER_SESSION = 25;
+const MAX_UPLOADED_BYTES_PER_SESSION = 30 * 1024 * 1024;
+const MAX_RFQS_PER_SESSION = 30;
+
 export class DemoWorkspaceStore {
   private readonly sessions = new Map<string, DemoSessionState>();
   private readonly maxSessions: number;
@@ -1297,10 +1515,23 @@ export class DemoWorkspaceStore {
         this.sessions.delete(oldestKey);
       }
     }
+    const { workspace, documents } = createInitialDemoWorkspaceAndDocs();
+    const docMap = new Map<string, DemoStoredDocument>();
+    for (const d of documents) {
+      docMap.set(d.id, {
+        id: d.id,
+        demoSessionId: id,
+        originalFilename: d.originalFilename,
+        mimeType: d.mimeType,
+        buffer: d.buffer,
+        createdAt: d.createdAt,
+        isSeedSample: true,
+      });
+    }
     const created: DemoSessionState = {
       id,
-      workspace: createInitialDemoWorkspaceState(),
-      documents: new Map(),
+      workspace,
+      documents: docMap,
       rfqSeq: 102,
       lastAccessedAt: Date.now(),
     };
@@ -1308,10 +1539,20 @@ export class DemoWorkspaceStore {
     return created;
   }
 
-  getOrCreateSession(sessionId: string): DemoSessionState {
+  getExistingSession(sessionId: string): DemoSessionState | null {
     const existing = this.sessions.get(sessionId);
+    if (!existing) return null;
+    existing.lastAccessedAt = Date.now();
+    return existing;
+  }
+
+  hasSession(sessionId: string): boolean {
+    return this.sessions.has(sessionId);
+  }
+
+  getOrCreateSession(sessionId: string): DemoSessionState {
+    const existing = this.getExistingSession(sessionId);
     if (existing) {
-      existing.lastAccessedAt = Date.now();
       return existing;
     }
     return this.createFreshSession(sessionId);
@@ -1419,19 +1660,31 @@ export class DemoWorkspaceStore {
       ? input.invitedSupplierIds.filter((id): id is string => typeof id === 'string' && supplierIds.has(id))
       : [];
 
+    if (session.workspace.rfqs.length >= MAX_RFQS_PER_SESSION) {
+      throw new DemoStoreError(
+        `Demo session RFQ limit reached (${MAX_RFQS_PER_SESSION}). Reset demo data to continue.`,
+        400
+      );
+    }
+
     const now = new Date().toISOString();
     const items: RfqItem[] = validItems.map((raw, idx) => {
       const sku = typeof raw.skuCode === 'string' ? raw.skuCode.trim() : '';
       const desc = String(raw.description).trim();
       const qtyRaw = Number(raw.quantity);
-      const quantity = Number.isFinite(qtyRaw) && qtyRaw > 0 ? qtyRaw : 1;
+      if (!Number.isFinite(qtyRaw) || qtyRaw <= 0) {
+        throw new DemoStoreError(`Item "${desc}" must have quantity > 0.`, 400);
+      }
+      const quantity = qtyRaw;
       const uom = typeof raw.uom === 'string' && raw.uom.trim() ? raw.uom.trim() : 'pcs';
       const targetRaw =
         raw.targetUnitPrice === null || raw.targetUnitPrice === undefined || raw.targetUnitPrice === ''
           ? null
           : Number(raw.targetUnitPrice);
-      const targetUnitPrice =
-        targetRaw !== null && Number.isFinite(targetRaw) && targetRaw >= 0 ? targetRaw : null;
+      if (targetRaw !== null && (!Number.isFinite(targetRaw) || targetRaw < 0)) {
+        throw new DemoStoreError('Target unit price cannot be negative.', 400);
+      }
+      const targetUnitPrice = targetRaw;
 
       const matchedCatalog = session.workspace.items.find(
         (c) =>
@@ -1492,8 +1745,25 @@ export class DemoWorkspaceStore {
 
   loadSampleRfq(sessionId: string): { rfq: Rfq; quotes: Quotation[] } {
     const session = this.getOrCreateSession(sessionId);
+    if (session.workspace.rfqs.length >= MAX_RFQS_PER_SESSION) {
+      throw new DemoStoreError(
+        `Demo session RFQ limit reached (${MAX_RFQS_PER_SESSION}). Reset demo data to continue.`,
+        400
+      );
+    }
     const suffix = String(session.rfqSeq++);
     const sample = createSyntheticDemoRfqAndQuotes(suffix);
+    for (const d of sample.documents) {
+      session.documents.set(d.id, {
+        id: d.id,
+        demoSessionId: session.id,
+        originalFilename: d.originalFilename,
+        mimeType: d.mimeType,
+        buffer: d.buffer,
+        createdAt: d.createdAt,
+        isSeedSample: true,
+      });
+    }
     session.workspace.rfqs.unshift(sample.rfq);
     session.workspace.quotations.unshift(...sample.quotes);
     this.addAudit(session, {
@@ -1605,6 +1875,24 @@ export class DemoWorkspaceStore {
 
     let documentId: string | null = null;
     if (params.file) {
+      let uploadedCount = 0;
+      let uploadedBytes = 0;
+      for (const doc of session.documents.values()) {
+        if (!doc.isSeedSample) {
+          uploadedCount += 1;
+          uploadedBytes += doc.buffer.byteLength;
+        }
+      }
+      if (
+        uploadedCount >= MAX_UPLOADED_DOCS_PER_SESSION ||
+        uploadedBytes + params.file.buffer.byteLength > MAX_UPLOADED_BYTES_PER_SESSION
+      ) {
+        throw new DemoStoreError(
+          'Demo session upload quota reached (max 25 uploaded files or 30 MB). Delete old quotes or reset demo data.',
+          413
+        );
+      }
+
       documentId = `demo-doc-${Date.now().toString(36)}-${crypto.randomBytes(3).toString('hex')}`;
       session.documents.set(documentId, {
         id: documentId,
@@ -1613,6 +1901,7 @@ export class DemoWorkspaceStore {
         mimeType: params.file.mimeType,
         buffer: params.file.buffer,
         createdAt: new Date().toISOString(),
+        isSeedSample: false,
       });
     }
 
@@ -1641,7 +1930,8 @@ export class DemoWorkspaceStore {
   }
 
   getDocument(sessionId: string, docId: string): DemoStoredDocument | null {
-    const session = this.getOrCreateSession(sessionId);
+    const session = this.getExistingSession(sessionId);
+    if (!session) return null;
     return session.documents.get(docId) ?? null;
   }
 
@@ -1739,11 +2029,26 @@ export class DemoWorkspaceStore {
       if (idx !== lineIdx) return l;
       const next: QuotationLine = { ...l, humanEdited: true };
       if (body.quotedQty !== undefined) {
-        next.quotedQty = body.quotedQty === null || body.quotedQty === '' ? null : Number(body.quotedQty);
+        if (body.quotedQty === null || body.quotedQty === '') {
+          next.quotedQty = null;
+        } else {
+          const n = Number(body.quotedQty);
+          if (!Number.isFinite(n) || n <= 0) {
+            throw new DemoStoreError('Quoted quantity must be greater than 0.', 400);
+          }
+          next.quotedQty = n;
+        }
       }
       if (body.quotedUnitRate !== undefined) {
-        next.quotedUnitRate =
-          body.quotedUnitRate === null || body.quotedUnitRate === '' ? null : Number(body.quotedUnitRate);
+        if (body.quotedUnitRate === null || body.quotedUnitRate === '') {
+          next.quotedUnitRate = null;
+        } else {
+          const n = Number(body.quotedUnitRate);
+          if (!Number.isFinite(n) || n < 0) {
+            throw new DemoStoreError('Unit rate cannot be negative.', 400);
+          }
+          next.quotedUnitRate = n;
+        }
       }
       if (body.uomConversionFactor !== undefined) {
         const n = Number(body.uomConversionFactor);
@@ -1756,8 +2061,15 @@ export class DemoWorkspaceStore {
         next.taxRatePct = n;
       }
       if (body.lineTotalQuoted !== undefined) {
-        next.lineTotalQuoted =
-          body.lineTotalQuoted === null || body.lineTotalQuoted === '' ? null : Number(body.lineTotalQuoted);
+        if (body.lineTotalQuoted === null || body.lineTotalQuoted === '') {
+          next.lineTotalQuoted = null;
+        } else {
+          const n = Number(body.lineTotalQuoted);
+          if (!Number.isFinite(n) || n < 0) {
+            throw new DemoStoreError('Line total cannot be negative.', 400);
+          }
+          next.lineTotalQuoted = n;
+        }
       }
       if (typeof body.taxCreditable === 'boolean') {
         next.taxCreditable = body.taxCreditable;

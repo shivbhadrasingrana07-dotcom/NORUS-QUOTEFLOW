@@ -15,11 +15,39 @@ export interface RateLimitStore {
 
 export class MemoryRateLimitStore implements RateLimitStore {
   private readonly buckets = new Map<string, { hits: number; resetAtMs: number }>();
+  private readonly maxBuckets: number;
+
+  constructor(maxBuckets = 2000) {
+    this.maxBuckets = Math.max(1, maxBuckets);
+  }
+
+  private pruneAndBound(now: number) {
+    for (const [key, entry] of this.buckets.entries()) {
+      if (entry.resetAtMs <= now) {
+        this.buckets.delete(key);
+      }
+    }
+    while (this.buckets.size >= this.maxBuckets) {
+      const oldestKey = this.buckets.keys().next().value;
+      if (oldestKey === undefined) break;
+      this.buckets.delete(oldestKey);
+    }
+  }
+
+  getBucketCount(): number {
+    return this.buckets.size;
+  }
 
   async consume(bucketKey: string, limit: number, windowMs: number): Promise<RateLimitCheckResult> {
     const now = Date.now();
     const existing = this.buckets.get(bucketKey);
     if (!existing || existing.resetAtMs <= now) {
+      if (existing) {
+        this.buckets.delete(bucketKey);
+      }
+      if (this.buckets.size >= this.maxBuckets) {
+        this.pruneAndBound(now);
+      }
       const resetAtMs = now + windowMs;
       this.buckets.set(bucketKey, { hits: 1, resetAtMs });
       return {
@@ -31,6 +59,9 @@ export class MemoryRateLimitStore implements RateLimitStore {
     }
 
     existing.hits += 1;
+    // Refresh LRU order on active bucket
+    this.buckets.delete(bucketKey);
+    this.buckets.set(bucketKey, existing);
     const allowed = existing.hits <= limit;
     return {
       allowed,

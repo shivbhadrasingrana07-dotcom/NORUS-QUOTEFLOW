@@ -121,6 +121,10 @@ export function RfqWorkspace({
   const [awardError, setAwardError] = useState<string | null>(null);
   const [deletingQuoteId, setDeletingQuoteId] = useState<string | null>(null);
 
+  const quotesSignature = quotes
+    .map((q) => `${q.id}:${q.totalLandedCost}:${q.isVerified}`)
+    .join('|');
+
   // Reset per-RFQ transient state when switching RFQs
   useEffect(() => {
     setDraftAward(null);
@@ -130,6 +134,11 @@ export function RfqWorkspace({
     setUploadError(null);
     setUploadSupplierId(rfq.invitedSupplierIds[0] || suppliers[0]?.id || '');
   }, [rfq.id]);
+
+  // Clear stale draft award simulation if underlying quote numbers/verification change
+  useEffect(() => {
+    setDraftAward(null);
+  }, [rfq.id, quotesSignature]);
 
   const existingAward = awards.find((a) => a.rfqId === rfq.id) || null;
   const getSupplierName = (id: string) =>
@@ -896,6 +905,7 @@ export function RfqWorkspace({
                     suppliers,
                     settings,
                     auditLogs,
+                    award: existingAward || undefined,
                   })
                 }
                 disabled={quotes.length === 0}

@@ -74,12 +74,58 @@ export interface AppOptions {
   db?: DrizzleDb;
   storageProvider?: ObjectStorageProvider;
   rateLimitStore?: RateLimitStore;
+  demoRateLimitStore?: RateLimitStore;
   emailProvider?: EmailProvider;
   firebaseVerifier?: FirebaseTokenVerifier;
   generateContentOverride?: GenerateContentFn;
   authRateLimitMax?: number;
+  demoMutationLimitMax?: number;
+  demoExtractLimitMax?: number;
   errorTrackerHook?: ErrorTrackerHook;
   demoMode?: boolean;
+}
+
+export function resolveDemoMode(params: {
+  nodeEnv?: string;
+  demoModeOverride?: boolean;
+  envDemoMode?: string;
+} = {}): boolean {
+  const nodeEnv = (params.nodeEnv ?? process.env.NODE_ENV ?? 'development').trim().toLowerCase();
+  const rawEnv = (params.envDemoMode ?? process.env.DEMO_MODE ?? '').trim().toLowerCase();
+
+  if (nodeEnv === 'production') {
+    if (params.demoModeOverride === true) {
+      throw new Error(
+        'Configuration error: Demo mode cannot be enabled when NODE_ENV=production.'
+      );
+    }
+    if (rawEnv === 'true' || rawEnv === '1' || rawEnv === 'yes') {
+      throw new Error(
+        'Configuration error: DEMO_MODE=true is forbidden when NODE_ENV=production. Unset DEMO_MODE or set DEMO_MODE=false.'
+      );
+    }
+    if (rawEnv === '' || rawEnv === 'false' || rawEnv === '0' || rawEnv === 'no') {
+      return false;
+    }
+    throw new Error(
+      'Configuration error: Invalid DEMO_MODE value in production. Unset DEMO_MODE or set DEMO_MODE=false.'
+    );
+  }
+
+  if (params.demoModeOverride !== undefined) {
+    return params.demoModeOverride;
+  }
+
+  if (rawEnv === 'false' || rawEnv === '0' || rawEnv === 'no') {
+    return false;
+  }
+  if (rawEnv === '' || rawEnv === 'true' || rawEnv === '1' || rawEnv === 'yes') {
+    return true;
+  }
+
+  throw new Error(
+    'Configuration error: Invalid DEMO_MODE value. Set "true", "false", or leave unset.'
+  );
 }
 
 function safeTimingEqual(a: string, b: string): boolean {
@@ -138,9 +184,11 @@ export async function createApp(options: AppOptions = {}) {
     firebaseVerifier = verifyFirebaseIdToken,
     generateContentOverride,
     authRateLimitMax = 25,
+    demoMutationLimitMax = 200,
+    demoExtractLimitMax = 40,
     demoMode,
   } = options;
-  const demoModeEnabled = demoMode ?? process.env.DEMO_MODE !== 'false';
+  const demoModeEnabled = resolveDemoMode({ demoModeOverride: demoMode });
 
   if (process.env.NODE_ENV === 'production') {
     // Fail closed if required production secrets/database configuration are missing
@@ -158,6 +206,8 @@ export async function createApp(options: AppOptions = {}) {
     (options.db || isSqlEnvConfigured()
       ? new PostgresRateLimitStore(db)
       : new MemoryRateLimitStore());
+  const demoRateLimitStore: RateLimitStore =
+    options.demoRateLimitStore || new MemoryRateLimitStore(2000);
 
   const app = express();
   app.disable('x-powered-by');
@@ -232,6 +282,31 @@ export async function createApp(options: AppOptions = {}) {
     limit: 250,
     windowMs: 15 * 60 * 1000,
     keyFn: (req) => req.auth?.user.id || getClientIp(req),
+  });
+
+  // Dedicated bounded in-memory rate limiters for /api/demo-workspace/* (never touch PostgreSQL)
+  const demoMutationRateLimiter = createRateLimitMiddleware({
+    store: demoRateLimitStore,
+    namespace: 'demo-mutate',
+    limit: demoMutationLimitMax,
+    windowMs: 15 * 60 * 1000,
+    keyFn: (req) => getClientIp(req),
+  });
+
+  const demoExtractRateLimiter = createRateLimitMiddleware({
+    store: demoRateLimitStore,
+    namespace: 'demo-extract',
+    limit: demoExtractLimitMax,
+    windowMs: 15 * 60 * 1000,
+    keyFn: (req) => getClientIp(req),
+  });
+
+  const demoDocRateLimiter = createRateLimitMiddleware({
+    store: demoRateLimitStore,
+    namespace: 'demo-doc',
+    limit: 200,
+    windowMs: 15 * 60 * 1000,
+    keyFn: (req) => getClientIp(req),
   });
 
   // Attach authenticated session context if nf_session cookie is present
@@ -375,17 +450,24 @@ export async function createApp(options: AppOptions = {}) {
   const demoStore = new DemoWorkspaceStore();
   const DEMO_COOKIE_NAME = 'nf_demo_sid';
 
-  function resolveDemoSessionId(req: Request, res: Response): string {
+  function extractProvidedDemoSessionId(req: Request): string | null {
     const headerVal = req.headers['x-demo-session'];
     const cookies = parseCookies(req);
     const cookieVal = cookies[DEMO_COOKIE_NAME];
-    const candidate =
+    return (
       (typeof headerVal === 'string' && /^[A-Za-z0-9_-]{8,64}$/.test(headerVal.trim())
         ? headerVal.trim()
         : null) ||
       (typeof cookieVal === 'string' && /^[A-Za-z0-9_-]{8,64}$/.test(cookieVal.trim())
         ? cookieVal.trim()
-        : null);
+        : null)
+    );
+  }
+
+  function resolveDemoSessionId(req: Request, res: Response): string {
+    const cookies = parseCookies(req);
+    const cookieVal = cookies[DEMO_COOKIE_NAME];
+    const candidate = extractProvidedDemoSessionId(req);
 
     const sessionId = candidate || `demo-${generateSecureToken(16)}`;
     if (!cookieVal || cookieVal !== sessionId) {
@@ -434,32 +516,44 @@ export async function createApp(options: AppOptions = {}) {
     });
   });
 
-  app.post('/api/demo-workspace/reset', requireDemoMode, mutationRateLimiter, (req, res) => {
-    const sessionId = resolveDemoSessionId(req, res);
-    const workspace = demoStore.resetSession(sessionId);
-    res.json({
-      ...workspace,
-      demoMode: true,
-      demoSessionId: sessionId,
-      user: DEMO_USER,
-      activeOrganization: DEMO_ORGANIZATION_SUMMARY,
-      organizations: [DEMO_ORGANIZATION_SUMMARY],
-    });
+  app.post('/api/demo-workspace/reset', requireDemoMode, demoMutationRateLimiter, (req, res, next) => {
+    try {
+      const sessionId = resolveDemoSessionId(req, res);
+      const workspace = demoStore.resetSession(sessionId);
+      res.json({
+        ...workspace,
+        demoMode: true,
+        demoSessionId: sessionId,
+        user: DEMO_USER,
+        activeOrganization: DEMO_ORGANIZATION_SUMMARY,
+        organizations: [DEMO_ORGANIZATION_SUMMARY],
+      });
+    } catch (err) {
+      next(err);
+    }
   });
 
-  app.patch('/api/demo-workspace/settings', requireDemoMode, mutationRateLimiter, (req, res) => {
-    const sessionId = resolveDemoSessionId(req, res);
-    const updated = demoStore.updateSettings(sessionId, req.body || {});
-    res.json(updated);
+  app.patch('/api/demo-workspace/settings', requireDemoMode, demoMutationRateLimiter, (req, res, next) => {
+    try {
+      const sessionId = resolveDemoSessionId(req, res);
+      const updated = demoStore.updateSettings(sessionId, req.body || {});
+      res.json(updated);
+    } catch (err) {
+      next(err);
+    }
   });
 
-  app.post('/api/demo-workspace/rfqs/load-sample', requireDemoMode, mutationRateLimiter, (req, res) => {
-    const sessionId = resolveDemoSessionId(req, res);
-    const result = demoStore.loadSampleRfq(sessionId);
-    res.status(201).json(result);
+  app.post('/api/demo-workspace/rfqs/load-sample', requireDemoMode, demoMutationRateLimiter, (req, res, next) => {
+    try {
+      const sessionId = resolveDemoSessionId(req, res);
+      const result = demoStore.loadSampleRfq(sessionId);
+      res.status(201).json(result);
+    } catch (err) {
+      next(err);
+    }
   });
 
-  app.post('/api/demo-workspace/rfqs', requireDemoMode, mutationRateLimiter, (req, res, next) => {
+  app.post('/api/demo-workspace/rfqs', requireDemoMode, demoMutationRateLimiter, (req, res, next) => {
     try {
       const sessionId = resolveDemoSessionId(req, res);
       const created = demoStore.createRfq(sessionId, req.body || {});
@@ -469,7 +563,7 @@ export async function createApp(options: AppOptions = {}) {
     }
   });
 
-  app.post('/api/demo-workspace/suppliers', requireDemoMode, mutationRateLimiter, (req, res, next) => {
+  app.post('/api/demo-workspace/suppliers', requireDemoMode, demoMutationRateLimiter, (req, res, next) => {
     try {
       const sessionId = resolveDemoSessionId(req, res);
       const supplier = demoStore.createSupplier(sessionId, req.body || {});
@@ -482,7 +576,7 @@ export async function createApp(options: AppOptions = {}) {
   app.post(
     '/api/demo-workspace/rfqs/:rfqId/quotes/extract',
     requireDemoMode,
-    extractRateLimiter,
+    demoExtractRateLimiter,
     upload.single('file'),
     async (req, res, next) => {
       try {
@@ -566,7 +660,7 @@ export async function createApp(options: AppOptions = {}) {
     }
   );
 
-  app.patch('/api/demo-workspace/quotations/:quoteId', requireDemoMode, mutationRateLimiter, (req, res, next) => {
+  app.patch('/api/demo-workspace/quotations/:quoteId', requireDemoMode, demoMutationRateLimiter, (req, res, next) => {
     try {
       const sessionId = resolveDemoSessionId(req, res);
       const updated = demoStore.updateQuotationHeader(sessionId, req.params.quoteId, req.body || {});
@@ -579,7 +673,7 @@ export async function createApp(options: AppOptions = {}) {
   app.patch(
     '/api/demo-workspace/quotations/:quoteId/lines/:lineId',
     requireDemoMode,
-    mutationRateLimiter,
+    demoMutationRateLimiter,
     (req, res, next) => {
       try {
         const sessionId = resolveDemoSessionId(req, res);
@@ -596,7 +690,7 @@ export async function createApp(options: AppOptions = {}) {
     }
   );
 
-  app.post('/api/demo-workspace/quotations/:quoteId/verify', requireDemoMode, mutationRateLimiter, (req, res, next) => {
+  app.post('/api/demo-workspace/quotations/:quoteId/verify', requireDemoMode, demoMutationRateLimiter, (req, res, next) => {
     try {
       const sessionId = resolveDemoSessionId(req, res);
       const verified = demoStore.verifyQuotation(sessionId, req.params.quoteId);
@@ -606,7 +700,7 @@ export async function createApp(options: AppOptions = {}) {
     }
   });
 
-  app.delete('/api/demo-workspace/quotations/:quoteId', requireDemoMode, mutationRateLimiter, (req, res, next) => {
+  app.delete('/api/demo-workspace/quotations/:quoteId', requireDemoMode, demoMutationRateLimiter, (req, res, next) => {
     try {
       const sessionId = resolveDemoSessionId(req, res);
       demoStore.deleteQuotation(sessionId, req.params.quoteId);
@@ -616,7 +710,7 @@ export async function createApp(options: AppOptions = {}) {
     }
   });
 
-  app.post('/api/demo-workspace/rfqs/:rfqId/award', requireDemoMode, mutationRateLimiter, (req, res, next) => {
+  app.post('/api/demo-workspace/rfqs/:rfqId/award', requireDemoMode, demoMutationRateLimiter, (req, res, next) => {
     try {
       const sessionId = resolveDemoSessionId(req, res);
       const { isSplitAward, nonL1Justification, allocations } = req.body || {};
@@ -632,7 +726,7 @@ export async function createApp(options: AppOptions = {}) {
     }
   });
 
-  app.post('/api/demo-workspace/awards/:awardId/decide', requireDemoMode, mutationRateLimiter, (req, res, next) => {
+  app.post('/api/demo-workspace/awards/:awardId/decide', requireDemoMode, demoMutationRateLimiter, (req, res, next) => {
     try {
       const sessionId = resolveDemoSessionId(req, res);
       const { decision, approverNotes } = req.body || {};
@@ -643,17 +737,20 @@ export async function createApp(options: AppOptions = {}) {
     }
   });
 
-  app.get('/api/demo-workspace/documents/:docId/signed-url', requireDemoMode, (req, res) => {
-    const sessionId = resolveDemoSessionId(req, res);
-    const doc = demoStore.getDocument(sessionId, req.params.docId);
+  app.get('/api/demo-workspace/documents/:docId/signed-url', requireDemoMode, demoDocRateLimiter, (req, res) => {
+    const candidateSession = extractProvidedDemoSessionId(req);
+    if (!candidateSession || !demoStore.hasSession(candidateSession)) {
+      return res.status(404).json({ error: 'Demo document not found in this session.' });
+    }
+    const doc = demoStore.getDocument(candidateSession, req.params.docId);
     if (!doc) {
       return res.status(404).json({ error: 'Demo document not found in this session.' });
     }
     const exp = Math.floor(Date.now() / 1000) + 300;
-    const sig = signHmac(`demo:${doc.id}:${sessionId}:${exp}`);
+    const sig = signHmac(`demo:${doc.id}:${candidateSession}:${exp}`);
     res.json({
       url: `/api/demo-workspace/documents/${encodeURIComponent(doc.id)}/content?demo=${encodeURIComponent(
-        sessionId
+        candidateSession
       )}&exp=${exp}&sig=${encodeURIComponent(sig)}`,
       expiresAt: new Date(exp * 1000).toISOString(),
       mimeType: doc.mimeType,
@@ -661,7 +758,7 @@ export async function createApp(options: AppOptions = {}) {
     });
   });
 
-  app.get('/api/demo-workspace/documents/:docId/content', requireDemoMode, (req, res) => {
+  app.get('/api/demo-workspace/documents/:docId/content', requireDemoMode, demoDocRateLimiter, (req, res) => {
     const demoParam = typeof req.query.demo === 'string' ? req.query.demo : '';
     const expParam = typeof req.query.exp === 'string' ? Number(req.query.exp) : NaN;
     const sigParam = typeof req.query.sig === 'string' ? req.query.sig : '';

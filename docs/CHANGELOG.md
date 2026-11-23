@@ -1,5 +1,16 @@
 # Changelog
 
+## Task 007 — Final MVP Audit, Security Hardening & Workflow Completion
+
+### Fixed & Hardened
+- **Safe `DEMO_MODE` Production Guard (`server.ts`, `.env.example`):** Added `resolveDemoMode()` enforcing `DEMO_MODE` default **OFF (`false`)** in `NODE_ENV=production` and failing closed on startup if `DEMO_MODE=true` is configured in production, while keeping dev/test default-on (`DEMO_MODE="false"` restores full authentication).
+- **Zero-Database Demo Rate Limiting & Bounded Memory (`server.ts`, `server/rateLimiter.ts`, `server/demoWorkspace.ts`):** Moved all `/api/demo-workspace*` routes onto dedicated bounded `MemoryRateLimitStore` instances (`maxBuckets = 2000` with expired pruning + LRU eviction) so demo traffic never queries or writes Cloud SQL `rate_limit_buckets`. Added non-allocating `hasSession`/`getExistingSession` document checks (returning `404` on unknown/missing session signed-url lookups without session creation/eviction), per-session upload/RFQ caps (`25` uploads / `30 MB`, `30` RFQs), and strict finite numeric validation matching `pgStore.ts`.
+- **Genuine Synthetic PDF & Excel Document Previews (`server/demoWorkspace.ts`, `src/components/ExtractionReviewPane.tsx`):** Generated cached real `%PDF-` (`jsPDF` + `jspdf-autotable`) and `.xlsx` (`xlsx`) buffers matching sample quotation data verbatim, registered them with deterministic `documentId`s on initialization, reset, and `load-sample`, and added direct Download actions in `ExtractionReviewPane` toolbar & PDF preview footer.
+- **UI Consistency & Error Surfacing (`src/components/RfqWorkspace.tsx`, `src/components/SecondaryViews.tsx`, `src/App.tsx`):** Fixed Approval-tab Excel exports omitting `award`, cleared stale `draftAward` state on quote updates, synced `SettingsView` local form state when workspace settings reset/change, and surfaced `handleResetDemo` / `handleLoadSample` errors cleanly instead of silent rejections.
+- **Expanded Tests (`tests/demoWorkspace.test.ts`, `tests/objectStorageAndRateLimit.test.ts`):** Verified `resolveDemoMode` matrix, fail-closed prod guard, PG limiter isolation, LRU eviction, genuine sample PDF/XLSX binary streaming, UOM conversion, numeric validation, and exports with award allocations.
+
+---
+
 ## Task 006 — Temporary No-Login Demo Experience (Non-Production)
 
 ### Added

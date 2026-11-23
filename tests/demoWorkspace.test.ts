@@ -1,12 +1,32 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { after, describe, it } from 'node:test';
+import * as XLSX from 'xlsx';
+import { createApp, resolveDemoMode } from '../server.ts';
+import { DevOutboxEmailProvider } from '../server/emailService.ts';
+import { LocalPrivateStorageProvider } from '../server/objectStorage.ts';
+import { type RateLimitStore } from '../server/rateLimiter.ts';
+import {
+  buildComparativeStatementPdfDoc,
+  buildComparativeStatementWorkbook,
+} from '../src/lib/exporters.ts';
+import {
+  type AuditLogEntry,
+  type AwardDecision,
+  type OrganizationSettings,
+  type Quotation,
+  type Rfq,
+  type Supplier,
+} from '../src/types.ts';
 import {
   createMinimalValidPng,
   startIntegratedTestServer,
   uniqueRunTag,
 } from './_helpers.ts';
 
-describe('Task 006: Temporary No-Login Demo Workspace & Security Isolation', () => {
+describe('Task 006/007: Temporary No-Login Demo Workspace & Security Isolation', () => {
   const cleanups: Array<() => Promise<void>> = [];
 
   after(async () => {
@@ -394,5 +414,254 @@ describe('Task 006: Temporary No-Login Demo Workspace & Security Isolation', () 
 
     const demoReset = await fetch(`${srv.baseUrl}/api/demo-workspace/reset`, { method: 'POST' });
     assert.equal(demoReset.status, 410);
+  });
+
+  it('Task 007: enforces safe DEMO_MODE defaults in dev/prod and fails closed if DEMO_MODE=true in production', async () => {
+    // 1. Direct resolver matrix
+    assert.equal(resolveDemoMode({ nodeEnv: 'development', envDemoMode: '' }), true);
+    assert.equal(resolveDemoMode({ nodeEnv: 'development', envDemoMode: 'false' }), false);
+    assert.equal(resolveDemoMode({ nodeEnv: 'test', envDemoMode: '' }), true);
+    assert.equal(resolveDemoMode({ nodeEnv: 'production', envDemoMode: '' }), false);
+    assert.equal(resolveDemoMode({ nodeEnv: 'production', envDemoMode: 'false' }), false);
+
+    assert.throws(
+      () => resolveDemoMode({ nodeEnv: 'production', envDemoMode: 'true' }),
+      /DEMO_MODE=true is forbidden when NODE_ENV=production/
+    );
+    assert.throws(
+      () => resolveDemoMode({ nodeEnv: 'production', demoModeOverride: true }),
+      /Demo mode cannot be enabled when NODE_ENV=production/
+    );
+    assert.throws(
+      () => resolveDemoMode({ nodeEnv: 'development', envDemoMode: 'maybe' }),
+      /Invalid DEMO_MODE value/
+    );
+
+    // 2. Startup check under simulated NODE_ENV=production
+    const prevNodeEnv = process.env.NODE_ENV;
+    const prevDemoMode = process.env.DEMO_MODE;
+    const prevSessionSecret = process.env.SESSION_SECRET;
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'norus-prod-check-'));
+    try {
+      process.env.NODE_ENV = 'production';
+      process.env.SESSION_SECRET = '0123456789abcdef0123456789abcdef-prod-test';
+      process.env.DEMO_MODE = 'true';
+
+      await assert.rejects(
+        () =>
+          createApp({
+            enableVite: false,
+            storageProvider: new LocalPrivateStorageProvider(tmpDir),
+            emailProvider: new DevOutboxEmailProvider(),
+          }),
+        /DEMO_MODE=true is forbidden when NODE_ENV=production/
+      );
+
+      // Unset DEMO_MODE in production -> defaults cleanly to OFF (false) and disables demo routes
+      delete process.env.DEMO_MODE;
+      const prodApp = await createApp({
+        enableVite: false,
+        storageProvider: new LocalPrivateStorageProvider(tmpDir),
+        emailProvider: new DevOutboxEmailProvider(),
+      });
+      assert.equal(typeof prodApp, 'function');
+    } finally {
+      if (prevNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = prevNodeEnv;
+      if (prevDemoMode === undefined) delete process.env.DEMO_MODE;
+      else process.env.DEMO_MODE = prevDemoMode;
+      if (prevSessionSecret === undefined) delete process.env.SESSION_SECRET;
+      else process.env.SESSION_SECRET = prevSessionSecret;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('Task 007: isolates demo rate limiters completely from PostgreSQL/primary RateLimitStore and rejects unknown session signed-url lookups', async () => {
+    let primaryStoreHits = 0;
+    const throwingPgStore: RateLimitStore = {
+      async consume() {
+        primaryStoreHits += 1;
+        throw new Error('Primary PostgresRateLimitStore must NEVER be invoked for /api/demo-workspace* routes');
+      },
+    };
+
+    const srv = await startIntegratedTestServer({
+      demoMode: true,
+      rateLimitStore: throwingPgStore,
+      demoMutationLimitMax: 3,
+      demoExtractLimitMax: 2,
+    });
+    cleanups.push(() => srv.close());
+
+    const sessId = `test-iso-${uniqueRunTag()}`;
+    const headers = { 'X-Demo-Session': sessId, 'Content-Type': 'application/json' };
+
+    // Unknown/missing session signed-url lookup must fail cleanly (404) without touching PG or allocating a session
+    const missingSessRes = await fetch(
+      `${srv.baseUrl}/api/demo-workspace/documents/demo-rfq-2026-101-doc-1/signed-url`
+    );
+    assert.equal(missingSessRes.status, 404);
+
+    const unknownSessRes = await fetch(
+      `${srv.baseUrl}/api/demo-workspace/documents/demo-rfq-2026-101-doc-1/signed-url`,
+      { headers: { 'X-Demo-Session': 'does-not-exist-anywhere' } }
+    );
+    assert.equal(unknownSessRes.status, 404);
+
+    // 3 mutations succeed cleanly using MemoryRateLimitStore, 4th trips demo 429; zero hits to primary PG store
+    for (let i = 0; i < 3; i += 1) {
+      const r = await fetch(`${srv.baseUrl}/api/demo-workspace/settings`, {
+        method: 'PATCH',
+        headers,
+        body: JSON.stringify({ name: `Isolated Demo ${i}` }),
+      });
+      assert.equal(r.status, 200);
+    }
+    const overLimitRes = await fetch(`${srv.baseUrl}/api/demo-workspace/settings`, {
+      method: 'PATCH',
+      headers,
+      body: JSON.stringify({ name: 'Should Trigger Demo Limit' }),
+    });
+    assert.equal(overLimitRes.status, 429);
+    assert.equal(primaryStoreHits, 0);
+  });
+
+  it('Task 007: serves genuine synthetic PDF and Excel binary previews for preloaded & load-sample quotes, enforces validation, and builds complete exports', async () => {
+    const srv = await startIntegratedTestServer({ demoMode: true });
+    cleanups.push(() => srv.close());
+
+    const sessId = `test-bins-${uniqueRunTag()}`;
+    const headers = { 'X-Demo-Session': sessId };
+
+    // Initial workspace must have non-null documentIds on PDF and XLSX sample quotes
+    const wsRes = await fetch(`${srv.baseUrl}/api/demo-workspace`, { headers });
+    assert.equal(wsRes.status, 200);
+    const ws = (await wsRes.json()) as {
+      settings: OrganizationSettings;
+      suppliers: Supplier[];
+      rfqs: Rfq[];
+      quotations: Quotation[];
+      awards: AwardDecision[];
+      auditLogs: AuditLogEntry[];
+    };
+
+    const q1 = ws.quotations.find((q) => q.id === 'demo-rfq-2026-101-q1')!;
+    const q2 = ws.quotations.find((q) => q.id === 'demo-rfq-2026-101-q2')!;
+    const aq1 = ws.quotations.find((q) => q.id === 'demo-rfq-100-q1')!;
+    const aq2 = ws.quotations.find((q) => q.id === 'demo-rfq-100-q2')!;
+
+    assert.ok(q1.documentId, 'Preloaded q1 PDF must have documentId');
+    assert.ok(q2.documentId, 'Preloaded q2 XLSX must have documentId');
+    assert.ok(aq1.documentId, 'Historical awarded q1 PDF must have documentId');
+    assert.ok(aq2.documentId, 'Historical awarded q2 PDF must have documentId');
+
+    // Verify q1 signed URL serves valid %PDF- binary
+    const q1SignedRes = await fetch(
+      `${srv.baseUrl}/api/demo-workspace/documents/${q1.documentId}/signed-url`,
+      { headers }
+    );
+    assert.equal(q1SignedRes.status, 200);
+    const q1Signed = (await q1SignedRes.json()) as { url: string; mimeType: string };
+    assert.equal(q1Signed.mimeType, 'application/pdf');
+    const q1Bytes = Buffer.from(await (await fetch(`${srv.baseUrl}${q1Signed.url}`)).arrayBuffer());
+    assert.equal(q1Bytes.subarray(0, 5).toString('ascii'), '%PDF-');
+
+    // Verify q2 signed URL serves genuine parseable XLSX workbook matching Demo_Offer sheet
+    const q2SignedRes = await fetch(
+      `${srv.baseUrl}/api/demo-workspace/documents/${q2.documentId}/signed-url`,
+      { headers }
+    );
+    assert.equal(q2SignedRes.status, 200);
+    const q2Signed = (await q2SignedRes.json()) as { url: string; mimeType: string };
+    assert.equal(
+      q2Signed.mimeType,
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    );
+    const q2Bytes = Buffer.from(await (await fetch(`${srv.baseUrl}${q2Signed.url}`)).arrayBuffer());
+    assert.equal(q2Bytes.subarray(0, 2).toString('ascii'), 'PK');
+    const parsedBook = XLSX.read(q2Bytes, { type: 'buffer' });
+    assert.ok(parsedBook.SheetNames.includes('Demo_Offer'));
+    const sheetRows = XLSX.utils.sheet_to_json<string[]>(parsedBook.Sheets['Demo_Offer'], {
+      header: 1,
+    });
+    assert.equal(sheetRows[1][1], 'Ball Valve DN50 SS316L Flanged');
+    assert.equal(String(sheetRows[3][5]), '10400.00');
+
+    // Verify UOM pack-of-20 normalization on q1 line 2 (20 packs * 20 pcs = 400 pcs, 980/pack = 49/pc base + pro-rata overhead)
+    assert.equal(q1.lines[1].uomConversionFactor, 20);
+    assert.equal((q1.lines[1].quotedQty || 0) * q1.lines[1].uomConversionFactor, 400);
+    assert.equal(q1.lines[1].normalizedUnitBase, 49);
+    assert.ok(
+      q1.lines[1].normalizedUnitLanded !== null &&
+        q1.lines[1].normalizedUnitLanded >= 48 &&
+        q1.lines[1].normalizedUnitLanded <= 55
+    );
+
+    // Load-sample also attaches genuine PDF & XLSX signed previews
+    const sampleRes = await fetch(`${srv.baseUrl}/api/demo-workspace/rfqs/load-sample`, {
+      method: 'POST',
+      headers,
+    });
+    assert.equal(sampleRes.status, 201);
+    const samplePayload = (await sampleRes.json()) as {
+      rfq: Rfq;
+      quotes: Quotation[];
+    };
+    assert.equal(samplePayload.quotes.length, 3);
+    assert.ok(samplePayload.quotes[0].documentId);
+    assert.ok(samplePayload.quotes[1].documentId);
+
+    const samplePdfSigned = (await (
+      await fetch(
+        `${srv.baseUrl}/api/demo-workspace/documents/${samplePayload.quotes[0].documentId}/signed-url`,
+        { headers }
+      )
+    ).json()) as { url: string };
+    const samplePdfBytes = Buffer.from(
+      await (await fetch(`${srv.baseUrl}${samplePdfSigned.url}`)).arrayBuffer()
+    );
+    assert.equal(samplePdfBytes.subarray(0, 5).toString('ascii'), '%PDF-');
+
+    // Strict numeric validation rejects negative/NaN amounts with 400
+    const badLineRes = await fetch(
+      `${srv.baseUrl}/api/demo-workspace/quotations/demo-rfq-2026-101-q2/lines/demo-rfq-2026-101-q2-l1`,
+      {
+        method: 'PATCH',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ quotedUnitRate: -150 }),
+      }
+    );
+    assert.equal(badLineRes.status, 400);
+
+    // Export Comparative Statement Excel & PDF with awarded historical RFQ (ensures Approval tab award param parity)
+    const awardedRfq = ws.rfqs.find((r) => r.id === 'demo-rfq-2026-100')!;
+    const awardedQuotes = ws.quotations.filter((q) => q.rfqId === awardedRfq.id);
+    const existingAward = ws.awards.find((a) => a.rfqId === awardedRfq.id);
+    assert.ok(existingAward);
+
+    const wb = buildComparativeStatementWorkbook({
+      rfq: awardedRfq,
+      quotes: awardedQuotes,
+      suppliers: ws.suppliers,
+      settings: ws.settings,
+      auditLogs: ws.auditLogs,
+      award: existingAward,
+    });
+    assert.deepEqual(wb.SheetNames, ['Summary', 'Line_Matrix', 'Exceptions', 'Audit_Log']);
+    const matrixRows = XLSX.utils.sheet_to_json<string[]>(wb.Sheets['Line_Matrix'], {
+      header: 1,
+    });
+    assert.ok(matrixRows.some((r) => r.includes('AWARD ALLOCATION')));
+
+    const pdfDoc = buildComparativeStatementPdfDoc({
+      rfq: awardedRfq,
+      quotes: awardedQuotes,
+      suppliers: ws.suppliers,
+      settings: ws.settings,
+      basis: 'landed',
+      award: existingAward,
+    });
+    const pdfBytes = Buffer.from(pdfDoc.output('arraybuffer'));
+    assert.equal(pdfBytes.subarray(0, 5).toString('ascii'), '%PDF-');
   });
 });

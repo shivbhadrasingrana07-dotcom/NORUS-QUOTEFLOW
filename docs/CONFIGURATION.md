@@ -29,7 +29,7 @@
 | `NODE_ENV` | No | `development` | Enforces fail-closed `SESSION_SECRET`/`SQL_*` checks, `Secure` cookies, HSTS, and static `dist/` serving |
 | `QUOTEFLOW_DB_PATH` | No | `data/quoteflow-db.json` | Legacy JSON source file path read by `scripts/migrate-json-to-postgres.ts` |
 | `FIREBASE_CHECK_REVOKED` | No | `false` | Set `'true'` only when running with an IAM-authorized Firebase service account to query Identity Toolkit revocation status during `verifyIdToken` |
-| `DEMO_MODE` | No | `true` (temp Task 006) | When not `'false'`, opens UI into an isolated synthetic demo workspace (`/api/demo-workspace*`). **Set `DEMO_MODE="false"` before production launch** to restore Firebase Google Sign-In, Email/Password login, `AuthView`, and `OrganizationView` |
+| `DEMO_MODE` | No (`false` in prod) | `true` in dev/test; **`false` in prod** | Controls the isolated synthetic no-login sandbox (`/api/demo-workspace*`). In `development`/`test`, unset/`true` enables demo mode and `false` restores full login (`AuthView`/`OrganizationView`). In `NODE_ENV=production`, demo mode is strictly **OFF by default**, and setting `DEMO_MODE="true"` **fails closed on boot** |
 
 ## Key NPM Scripts (`package.json`)
 

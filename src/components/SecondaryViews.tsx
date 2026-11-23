@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   Building2,
   FilePlus2,
@@ -600,6 +600,13 @@ export function SettingsView({
   const [saved, setSaved] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setName(settings.name);
+    setCurrency(settings.defaultCurrency);
+    setTaxRegime(settings.taxRegime);
+    setItc(settings.defaultTaxCreditable);
+  }, [settings]);
 
   const canEditSettings =
     settings.activeUserRole === 'owner' || settings.activeUserRole === 'admin';

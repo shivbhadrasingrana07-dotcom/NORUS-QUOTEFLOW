@@ -160,6 +160,31 @@ test('MemoryRateLimitStore enforces window limit and resets after window expires
   assert.equal(r4.allowed, true);
 });
 
+test('MemoryRateLimitStore bounds active buckets with LRU eviction and prunes expired buckets', async () => {
+  const store = new MemoryRateLimitStore(3);
+  await store.consume('b1', 5, 5000);
+  await store.consume('b2', 5, 5000);
+  await store.consume('b3', 5, 5000);
+  assert.equal(store.getBucketCount(), 3);
+
+  // Access b1 again so b2 becomes the least-recently-used key
+  await store.consume('b1', 5, 5000);
+  await store.consume('b4', 5, 5000);
+  assert.equal(store.getBucketCount(), 3);
+
+  // b1 must still remember count=2 (only 3 left out of 5) while b2 was evicted and starts fresh
+  const b1Check = await store.consume('b1', 5, 5000);
+  assert.equal(b1Check.remaining, 2);
+
+  // Expired buckets are cleaned out before counting capacity
+  const timedStore = new MemoryRateLimitStore(2);
+  await timedStore.consume('e1', 5, 25);
+  await timedStore.consume('e2', 5, 25);
+  await new Promise((r) => setTimeout(r, 40));
+  await timedStore.consume('e3', 5, 5000);
+  assert.equal(timedStore.getBucketCount(), 1);
+});
+
 test('PostgresRateLimitStore persists atomic counters in Cloud SQL rate_limit_buckets', async (t) => {
   if (!isSqlEnvConfigured()) {
     t.skip('SQL_* env vars not configured');

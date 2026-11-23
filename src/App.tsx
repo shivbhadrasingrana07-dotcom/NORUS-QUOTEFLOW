@@ -86,6 +86,7 @@ export default function App() {
   const [createModalOpen, setCreateModalOpen] = useState(false);
   const [loadingSample, setLoadingSample] = useState(false);
   const [resettingDemo, setResettingDemo] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const clearUrlParams = useCallback(() => {
     if (window.location.search) {
@@ -274,6 +275,7 @@ export default function App() {
   const handleResetDemo = async () => {
     if (!demoMode || resettingDemo) return;
     try {
+      setActionError(null);
       setResettingDemo(true);
       const reset = await apiJson<DemoWorkspaceResponse>('/api/demo-workspace/reset', {
         method: 'POST',
@@ -282,6 +284,8 @@ export default function App() {
       setSelectedQuoteId(null);
       setActiveSection('dashboard');
       applyDemoResponse(reset);
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to reset demo workspace.');
     } finally {
       setResettingDemo(false);
     }
@@ -289,12 +293,15 @@ export default function App() {
 
   const handleLoadSample = async () => {
     try {
+      setActionError(null);
       setLoadingSample(true);
       const result = await apiJson<{ rfq: { id: string } }>(`${apiPrefix}/rfqs/load-sample`, {
         method: 'POST',
       });
       await refreshAll();
       handleOpenRfq(result.rfq.id, 'compare');
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to load sample RFQ.');
     } finally {
       setLoadingSample(false);
     }
@@ -562,6 +569,18 @@ export default function App() {
           </div>
         )}
         <div className="max-w-[1360px] mx-auto px-4 sm:px-6 lg:px-8 py-6">
+          {actionError && (
+            <div className="mb-4 px-4 py-2.5 bg-[#FEF2F2] border border-[#FECACA] text-[#DC2626] text-xs rounded-lg flex items-center justify-between gap-3">
+              <span>{actionError}</span>
+              <button
+                type="button"
+                onClick={() => setActionError(null)}
+                className="font-medium underline shrink-0 hover:text-[#991B1B]"
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
           {activeSection === 'dashboard' && (
             <DashboardView
               rfqs={workspace.rfqs}
