@@ -18,7 +18,6 @@ import {
 import { PgDataStore, StoreError } from '../server/pgStore.ts';
 import { adminAuth, verifyFirebaseIdToken } from '../server/firebase-admin.ts';
 import { generateSecureToken, sha256Hex } from '../server/security.ts';
-import { db, pool } from '../src/db/index.ts';
 import {
   invitations,
   organizationMemberships,
@@ -30,8 +29,12 @@ import {
 } from '../src/db/schema.ts';
 import {
   cleanupTestOrganizationsAndUsers,
+  closeTestDbPool,
   createMinimalValidPng,
+  getTestDbAndPool,
+  isSafeTestDbConfigured,
   startIntegratedTestServer,
+  TEST_DB_SKIP_REASON,
   TestCookieClient,
   uniqueRunTag,
 } from './_helpers.ts';
@@ -50,7 +53,7 @@ after(async () => {
   for (const dir of tempDirs) {
     fs.rmSync(dir, { recursive: true, force: true });
   }
-  await pool.end();
+  await closeTestDbPool();
 });
 
 test('ResendEmailProvider validates senders, retries transient 503/429 failures, aborts timeouts, and redacts API keys', async () => {
@@ -152,8 +155,12 @@ test('ResendEmailProvider validates senders, retries transient 503/429 failures,
   }
 });
 
-test('Token security: expired verification/reset tokens fail, one-time reuse is blocked, and Google existing-user invite + unverified link checks work', async () => {
-  const store = new PgDataStore(db);
+test(
+  'Token security: expired verification/reset tokens fail, one-time reuse is blocked, and Google existing-user invite + unverified link checks work',
+  { skip: isSafeTestDbConfigured() ? false : TEST_DB_SKIP_REASON },
+  async () => {
+    const { db } = getTestDbAndPool();
+    const store = new PgDataStore(db);
   const tag = uniqueRunTag();
   const email = `tok-${tag}@example.com`;
 
@@ -235,8 +242,12 @@ test('Token security: expired verification/reset tokens fail, one-time reuse is 
   assert.equal(googleJoined.organizations.length, 2);
 });
 
-test('First-owner bootstrap safely links an owner-less organization via claim token & direct bootstrap, blocking duplicates and enforcing last-owner protection', async () => {
-  const store = new PgDataStore(db);
+test(
+  'First-owner bootstrap safely links an owner-less organization via claim token & direct bootstrap, blocking duplicates and enforcing last-owner protection',
+  { skip: isSafeTestDbConfigured() ? false : TEST_DB_SKIP_REASON },
+  async () => {
+    const { db } = getTestDbAndPool();
+    const store = new PgDataStore(db);
   const tag = uniqueRunTag();
   const orgTokenId = `org-boot-tok-${tag}`;
   const orgDirectId = `org-boot-dir-${tag}`;
@@ -375,8 +386,12 @@ test('First-owner bootstrap safely links an owner-less organization via claim to
   assert.equal(directStatus.requiresFirstOwnerBootstrap, false);
 });
 
-test('Scheduled maintenance cleans expired tokens, sessions, invitations, rate buckets, orphaned docs & temp files idempotently while preserving valid records', async () => {
-  const tag = uniqueRunTag();
+test(
+  'Scheduled maintenance cleans expired tokens, sessions, invitations, rate buckets, orphaned docs & temp files idempotently while preserving valid records',
+  { skip: isSafeTestDbConfigured() ? false : TEST_DB_SKIP_REASON },
+  async () => {
+    const { db } = getTestDbAndPool();
+    const tag = uniqueRunTag();
   const orgId = `org-maint-${tag}`;
   const userId = `usr-maint-${tag}`;
   createdOrgIds.push(orgId);
@@ -595,8 +610,11 @@ test('Scheduled maintenance cleans expired tokens, sessions, invitations, rate b
   assert.equal(summary2.cleanedTempStorageFiles, 0);
 });
 
-test('Operational monitoring: correlation IDs, COOP header, readiness ready/degraded checks, and ErrorTrackerHook redaction', async () => {
-  const trackedErrors: Array<{ requestId?: string; statusCode: number; message: string }> = [];
+test(
+  'Operational monitoring: correlation IDs, COOP header, readiness ready/degraded checks, and ErrorTrackerHook redaction',
+  { skip: isSafeTestDbConfigured() ? false : TEST_DB_SKIP_REASON },
+  async () => {
+    const trackedErrors: Array<{ requestId?: string; statusCode: number; message: string }> = [];
   const srv = await startIntegratedTestServer({
     errorTrackerHook: (payload) => {
       trackedErrors.push({
@@ -768,21 +786,23 @@ test('Task 005 regression: verifyFirebaseIdToken defaults checkRevoked=false, en
       }
     );
 
-    const realSrv = await startIntegratedTestServer();
-    try {
-      const client = new TestCookieClient(realSrv.baseUrl);
-      const res = await client.request('/api/auth/google', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ idToken: 'not.a.valid-jwt' }),
-      });
-      assert.equal(res.status, 401);
-      const errJson = (await res.json()) as { error: string };
-      assert.ok(errJson.error.length > 0);
-      assert.ok(!errJson.error.includes('identitytoolkit.googleapis.com'));
-      assert.ok(!errJson.error.includes('344782474303'));
-    } finally {
-      await realSrv.close();
+    if (isSafeTestDbConfigured()) {
+      const realSrv = await startIntegratedTestServer();
+      try {
+        const client = new TestCookieClient(realSrv.baseUrl);
+        const res = await client.request('/api/auth/google', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ idToken: 'not.a.valid-jwt' }),
+        });
+        assert.equal(res.status, 401);
+        const errJson = (await res.json()) as { error: string };
+        assert.ok(errJson.error.length > 0);
+        assert.ok(!errJson.error.includes('identitytoolkit.googleapis.com'));
+        assert.ok(!errJson.error.includes('344782474303'));
+      } finally {
+        await realSrv.close();
+      }
     }
 
     // 2. Verify checkRevoked defaults to false, opts in when FIREBASE_CHECK_REVOKED=true, and validates aud/iss

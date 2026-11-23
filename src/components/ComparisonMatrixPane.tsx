@@ -128,12 +128,22 @@ export function ComparisonMatrixPane({
   const splitAllocations: AwardAllocation[] = [];
   let splitTotalLanded = 0;
   let splitHasInvalidSelection = false;
+  let splitHasUnverifiedSelection = false;
 
   for (const item of rfq.items) {
     const qId = getEffectiveSplitQuoteForItem(item.id);
     const quote = sortedQuotes.find((q) => q.id === qId) || sortedQuotes[0];
     const line = quote.lines.find((l) => l.rfqItemId === item.id);
-    if (!line || line.matchStatus === 'not_quoted' || !line.mathValid || line.normalizedUnitLanded === null) {
+    if (!quote.isVerified) {
+      splitHasUnverifiedSelection = true;
+    }
+    if (
+      !line ||
+      line.matchStatus === 'not_quoted' ||
+      line.matchStatus === 'unmapped' ||
+      !line.mathValid ||
+      line.normalizedUnitLanded === null
+    ) {
       splitHasInvalidSelection = true;
     } else {
       splitTotalLanded += line.normalizedUnitLanded * item.quantity;
@@ -148,30 +158,54 @@ export function ComparisonMatrixPane({
     }
   }
 
-  const handleRecommendClick = () => {
-    if (awardMode === 'package') {
-      const chosen = sortedQuotes.find((q) => q.id === activePackageId) || sortedQuotes[0];
-      const allocs: AwardAllocation[] = rfq.items
-        .map((item) => {
-          const line = chosen.lines.find((l) => l.rfqItemId === item.id);
-          if (!line || line.matchStatus === 'not_quoted' || !line.mathValid || line.normalizedUnitLanded === null) {
-            return null;
-          }
-          return {
-            rfqItemId: item.id,
-            quotationId: chosen.id,
-            quotationLineId: line.id,
-            supplierId: chosen.supplierId,
-            awardedQty: item.quantity,
-            awardedUnitLanded: line.normalizedUnitLanded,
-          };
-        })
-        .filter((x): x is AwardAllocation => x !== null);
+  const activePackageQuote =
+    sortedQuotes.find((q) => q.id === activePackageId) || sortedQuotes[0];
+  const activePackageAllocations: AwardAllocation[] = rfq.items
+    .map((item) => {
+      const line = activePackageQuote.lines.find((l) => l.rfqItemId === item.id);
+      if (
+        !line ||
+        line.matchStatus === 'not_quoted' ||
+        line.matchStatus === 'unmapped' ||
+        !line.mathValid ||
+        line.normalizedUnitLanded === null
+      ) {
+        return null;
+      }
+      return {
+        rfqItemId: item.id,
+        quotationId: activePackageQuote.id,
+        quotationLineId: line.id,
+        supplierId: activePackageQuote.supplierId,
+        awardedQty: item.quantity,
+        awardedUnitLanded: line.normalizedUnitLanded,
+      };
+    })
+    .filter((x): x is AwardAllocation => x !== null);
 
+  const packageBlockReason = !activePackageQuote.isVerified
+    ? `Verify quotation ${activePackageQuote.quoteReference} before recommending award`
+    : activePackageQuote.completenessRatio < 1 || activePackageAllocations.length !== rfq.items.length
+    ? `Quotation ${activePackageQuote.quoteReference} must cover 100% of RFQ lines for a package award`
+    : null;
+
+  const splitBlockReason = splitHasInvalidSelection
+    ? 'Select valid, quoted lines for all items before recommending a split award'
+    : splitHasUnverifiedSelection
+    ? 'Verify all selected quotations before recommending a split award'
+    : null;
+
+  const activeBlockReason =
+    awardMode === 'package' ? packageBlockReason : splitBlockReason;
+
+  const handleRecommendClick = () => {
+    if (activeBlockReason) return;
+    if (awardMode === 'package') {
+      const chosen = activePackageQuote;
       const l1Landed = l1Eligible ? l1Eligible.quotation.totalLandedCost : chosen.totalLandedCost;
       onProceedToAward({
         isSplitAward: false,
-        allocations: allocs,
+        allocations: activePackageAllocations,
         totalAwardedLanded: chosen.totalLandedCost,
         isNonL1: l1Eligible ? chosen.totalLandedCost > l1Landed + 1 : false,
       });
@@ -264,13 +298,9 @@ export function ComparisonMatrixPane({
           </button>
           <button
             onClick={handleRecommendClick}
-            disabled={awardMode === 'split' && splitHasInvalidSelection}
+            disabled={Boolean(activeBlockReason)}
             className="px-3.5 py-1.5 text-xs font-medium text-white bg-[#0F4C81] rounded-md hover:bg-[#0A365C] disabled:opacity-50 whitespace-nowrap"
-            title={
-              awardMode === 'split' && splitHasInvalidSelection
-                ? 'Select valid, quoted lines for all items before recommending a split award'
-                : 'Proceed to award approval'
-            }
+            title={activeBlockReason || 'Proceed to award approval'}
           >
             {awardMode === 'split'
               ? `Proceed with Split Award (${formatMoney(splitTotalLanded, rfq.currency)})`
@@ -279,11 +309,18 @@ export function ComparisonMatrixPane({
         </div>
       </div>
 
+      {activeBlockReason && (
+        <div className="p-3 bg-[#FFFBEB] border border-[#FDE68A] text-[#92400E] text-xs rounded-md flex items-center gap-2">
+          <AlertTriangle className="w-4 h-4 text-[#D97706] shrink-0" />
+          <span>{activeBlockReason}.</span>
+        </div>
+      )}
+
       {!l1Eligible && (
         <div className="p-3 bg-[#FFFBEB] border border-[#FDE68A] text-[#92400E] text-xs rounded-md flex items-center gap-2">
           <AlertTriangle className="w-4 h-4 text-[#D97706] shrink-0" />
           <span>
-            No quotation is currently both 100% complete and verified. Incomplete or unverified quotes are excluded from L1 ranking until audited.
+            No quotation is currently complete, commercially confirmed, and verified. Incomplete, unconfirmed-freight, or unverified quotes are excluded from L1 ranking until audited.
           </span>
         </div>
       )}

@@ -10,8 +10,11 @@ import { computeEvaluatedSavings, rankQuotations } from '../src/lib/ranking.ts';
 import type { WorkspaceState } from '../src/types.ts';
 import {
   cleanupTestOrganizationsAndUsers,
+  closeTestDbPool,
   createMinimalValidPng,
+  isSafeTestDbConfigured,
   startIntegratedTestServer,
+  TEST_DB_SKIP_REASON,
   TestCookieClient,
   uniqueRunTag,
 } from './_helpers.ts';
@@ -24,10 +27,13 @@ after(async () => {
     orgIds: createdOrgIds,
     userIds: createdUserIds,
   });
-  await pool.end();
+  await closeTestDbPool();
 });
 
-test('Complete 20-step multi-tenant B2B procurement workflow + cross-tenant isolation', async () => {
+test(
+  'Complete 20-step multi-tenant B2B procurement workflow + cross-tenant isolation',
+  { skip: isSafeTestDbConfigured() ? false : TEST_DB_SKIP_REASON },
+  async () => {
   const tag = uniqueRunTag();
   let extractScenario: 'l1_good' | 'l2_badmath' | 'l3_partial' = 'l1_good';
 

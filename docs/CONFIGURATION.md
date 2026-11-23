@@ -30,8 +30,12 @@
 | `QUOTEFLOW_DB_PATH` | No | `data/quoteflow-db.json` | Legacy JSON source file path read by `scripts/migrate-json-to-postgres.ts` |
 | `FIREBASE_CHECK_REVOKED` | No | `false` | Set `'true'` only when running with an IAM-authorized Firebase service account to query Identity Toolkit revocation status during `verifyIdToken` |
 | `DEMO_MODE` | No (`false` in prod) | `true` in dev/test; **`false` in prod** | Controls the isolated synthetic no-login sandbox (`/api/demo-workspace*`). In `development`/`test`, unset/`true` enables demo mode and `false` restores full login (`AuthView`/`OrganizationView`). In `NODE_ENV=production`, demo mode is strictly **OFF by default**, and setting `DEMO_MODE="true"` **fails closed on boot** |
+| `TEST_DATABASE_URL` / `TEST_SQL_*` | For PG integration tests | *(unset)* | Disposable PostgreSQL target (`TEST_SQL_HOST`, `TEST_SQL_PORT`, `TEST_SQL_DB_NAME`, `TEST_SQL_USER`, `TEST_SQL_PASSWORD`, `TEST_SQL_SSL`) used by `tests/_helpers.ts`. Explicitly rejects `cloud_sql_development_database`, `prod`, `production`, `staging`, and `postgres`; when unset, live PG tests skip safely |
+| `RUN_LIVE_GEMINI_TESTS` | No | `'false'` | Set `'true'` alongside a valid `GEMINI_API_KEY` to execute live Gemini API smoke tests in `tests/extractionValidation.test.ts` |
 
 ## Key NPM Scripts (`package.json`)
+
+> Note: Because `package.json` pins `"esbuild": "^0.25.0"` while `vite@8.3.x` declares an optional peer range `esbuild@^0.27.0 || ^0.28.0`, clean lockfile installs in CI use `npm ci --legacy-peer-deps`.
 
 | Script | Command | Purpose |
 | :--- | :--- | :--- |
@@ -39,10 +43,10 @@
 | `npm run start` | `NODE_ENV=production tsx server.ts` | Starts Express serving built `dist/` assets |
 | `npm run build` | `vite build` | Compiles production frontend bundle into `dist/` |
 | `npm run lint` | `tsc --noEmit` | Runs strict TypeScript typechecking across client, server, and tests |
-| `npm test` | `tsx --test tests/*.test.ts` | Runs the automated Node test suite |
-| `npm run db:migrate` | `tsx scripts/migrate-json-to-postgres.ts` | Legacy JSON -> PostgreSQL migration CLI (`--dry-run`, `--apply`) |
+| `npm test` | `tsx --test tests/*.test.ts` | Runs the unit, demo, and disposable-PG test suite |
+| `npm run db:migrate` | `tsx scripts/migrate-json-to-postgres.ts` | Legacy JSON -> PostgreSQL migration CLI (`--dry-run`, `--apply --confirm`) |
 | `npm run org:bootstrap-owner` | `tsx scripts/bootstrap-org-owner.ts` | Inspect (`--inspect`) or safely bootstrap the first owner (`--issue-token` / `--claim-direct`) for an owner-less org |
-| `npm run ops:maintenance` | `tsx scripts/run-maintenance.ts` | Executes bounded-batch cleanup of expired sessions, tokens, invitations, rate buckets, orphan docs, and `.tmp` files |
+| `npm run ops:maintenance` | `tsx scripts/run-maintenance.ts` | Executes advisory-locked bounded-batch cleanup of expired sessions, tokens, invitations, rate buckets, orphan docs, and `.tmp` files |
 
 ## First-Owner Bootstrap Runbook (`org-kalyani-hydraulics`)
 

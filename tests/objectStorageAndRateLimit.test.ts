@@ -11,18 +11,26 @@ import {
   verifySignedDocumentToken,
 } from '../server/objectStorage.ts';
 import { MemoryRateLimitStore, PostgresRateLimitStore } from '../server/rateLimiter.ts';
-import { db, isSqlEnvConfigured, pool } from '../src/db/index.ts';
 import { rateLimitBuckets } from '../src/db/schema.ts';
+import {
+  closeTestDbPool,
+  getTestDbAndPool,
+  isSafeTestDbConfigured,
+  TEST_DB_SKIP_REASON,
+} from './_helpers.ts';
 
 const tempStorageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'norus-storage-test-'));
 const createdRateBuckets: string[] = [];
 
 after(async () => {
   fs.rmSync(tempStorageDir, { recursive: true, force: true });
-  for (const key of createdRateBuckets) {
-    await db.delete(rateLimitBuckets).where(eq(rateLimitBuckets.bucketKey, key)).catch(() => undefined);
+  if (isSafeTestDbConfigured() && createdRateBuckets.length > 0) {
+    const { db } = getTestDbAndPool();
+    for (const key of createdRateBuckets) {
+      await db.delete(rateLimitBuckets).where(eq(rateLimitBuckets.bucketKey, key)).catch(() => undefined);
+    }
   }
-  await pool.end();
+  await closeTestDbPool();
 });
 
 test('LocalPrivateStorageProvider stores, reads, deletes, prevents path traversal, and verifies HMAC signed URLs', async () => {
@@ -185,12 +193,12 @@ test('MemoryRateLimitStore bounds active buckets with LRU eviction and prunes ex
   assert.equal(timedStore.getBucketCount(), 1);
 });
 
-test('PostgresRateLimitStore persists atomic counters in Cloud SQL rate_limit_buckets', async (t) => {
-  if (!isSqlEnvConfigured()) {
-    t.skip('SQL_* env vars not configured');
-    return;
-  }
-  const pgLimiter = new PostgresRateLimitStore(db);
+test(
+  'PostgresRateLimitStore persists atomic counters in disposable PostgreSQL rate_limit_buckets',
+  { skip: isSafeTestDbConfigured() ? false : TEST_DB_SKIP_REASON },
+  async () => {
+    const { db } = getTestDbAndPool();
+    const pgLimiter = new PostgresRateLimitStore(db);
   const key = `test-rl-${Date.now().toString(36)}`;
   createdRateBuckets.push(key);
 

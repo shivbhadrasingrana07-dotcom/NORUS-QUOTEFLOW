@@ -150,7 +150,12 @@ export interface S3Config {
   bucket: string;
   accessKeyId: string;
   secretAccessKey: string;
+  requestTimeoutMs?: number;
+  readinessTimeoutMs?: number;
 }
+
+const DEFAULT_S3_TIMEOUT_MS = 15_000;
+const DEFAULT_S3_READINESS_TIMEOUT_MS = 5_000;
 
 function hmacSha256(key: Buffer | string, data: string): Buffer {
   return crypto.createHmac('sha256', key).update(data, 'utf8').digest();
@@ -170,12 +175,44 @@ function encodeRfc3986(str: string): string {
 export class S3CompatibleStorageProvider implements ObjectStorageProvider {
   readonly mode = 's3' as const;
   private readonly cfg: S3Config;
+  private readonly requestTimeoutMs: number;
+  private readonly readinessTimeoutMs: number;
 
   constructor(cfg: S3Config) {
     this.cfg = {
       ...cfg,
       endpoint: cfg.endpoint.replace(/\/+$/, ''),
     };
+    this.requestTimeoutMs =
+      cfg.requestTimeoutMs && cfg.requestTimeoutMs > 0
+        ? cfg.requestTimeoutMs
+        : DEFAULT_S3_TIMEOUT_MS;
+    this.readinessTimeoutMs =
+      cfg.readinessTimeoutMs && cfg.readinessTimeoutMs > 0
+        ? cfg.readinessTimeoutMs
+        : DEFAULT_S3_READINESS_TIMEOUT_MS;
+  }
+
+  private async fetchWithTimeout(
+    url: string,
+    init: RequestInit,
+    timeoutMs = this.requestTimeoutMs
+  ): Promise<globalThis.Response> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(url, {
+        ...init,
+        signal: controller.signal,
+      });
+    } catch (err) {
+      if ((err as { name?: string })?.name === 'AbortError') {
+        throw new Error(`Object storage request timed out after ${timeoutMs}ms`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private getSigningKey(dateStamp: string): Buffer {
@@ -257,7 +294,7 @@ export class S3CompatibleStorageProvider implements ObjectStorageProvider {
       contentType: params.contentType,
     });
 
-    const res = await fetch(signed.url, {
+    const res = await this.fetchWithTimeout(signed.url, {
       method: 'PUT',
       headers: signed.headers,
       body: new Uint8Array(params.buffer),
@@ -275,7 +312,7 @@ export class S3CompatibleStorageProvider implements ObjectStorageProvider {
       payloadHash: sha256HexBuf(''),
     });
 
-    const res = await fetch(signed.url, {
+    const res = await this.fetchWithTimeout(signed.url, {
       method: 'GET',
       headers: signed.headers,
     });
@@ -297,7 +334,7 @@ export class S3CompatibleStorageProvider implements ObjectStorageProvider {
       payloadHash: sha256HexBuf(''),
     });
 
-    const res = await fetch(signed.url, {
+    const res = await this.fetchWithTimeout(signed.url, {
       method: 'DELETE',
       headers: signed.headers,
     });
@@ -372,7 +409,11 @@ export class S3CompatibleStorageProvider implements ObjectStorageProvider {
         storageKey: '.healthcheck',
         payloadHash: sha256HexBuf(''),
       });
-      const res = await fetch(signed.url, { method: 'GET', headers: signed.headers });
+      const res = await this.fetchWithTimeout(
+        signed.url,
+        { method: 'GET', headers: signed.headers },
+        this.readinessTimeoutMs
+      );
       if (res.ok || res.status === 404) {
         return { ok: true };
       }

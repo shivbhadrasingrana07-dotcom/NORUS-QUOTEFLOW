@@ -1,10 +1,31 @@
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
 import { sql } from 'drizzle-orm';
 import type { NextFunction, Request, Response } from 'express';
 import type { DrizzleDb } from '../src/db/index.ts';
 import type { EmailProvider } from './emailService.ts';
 import type { ObjectStorageProvider } from './objectStorage.ts';
 import { redactSensitiveText } from './security.ts';
+
+export function isGoogleAuthConfigured(configPath?: string): boolean {
+  try {
+    const resolved = configPath || path.resolve(process.cwd(), 'firebase-applet-config.json');
+    if (!fs.existsSync(resolved)) return false;
+    const raw = fs.readFileSync(resolved, 'utf8');
+    const cfg = JSON.parse(raw) as Record<string, unknown>;
+    return Boolean(
+      typeof cfg.projectId === 'string' &&
+        cfg.projectId.trim() &&
+        typeof cfg.apiKey === 'string' &&
+        cfg.apiKey.trim() &&
+        typeof cfg.authDomain === 'string' &&
+        cfg.authDomain.trim()
+    );
+  } catch {
+    return false;
+  }
+}
 
 export type LogLevel = 'info' | 'warn' | 'error';
 
@@ -182,7 +203,7 @@ export async function checkDependencyReadiness(params: {
         configured: Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'),
       },
       googleAuth: {
-        configured: true,
+        configured: isGoogleAuthConfigured(),
       },
     },
   };

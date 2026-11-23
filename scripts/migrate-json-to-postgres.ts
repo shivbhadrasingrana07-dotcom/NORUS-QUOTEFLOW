@@ -6,9 +6,17 @@ import { createObjectStorageProvider } from '../server/objectStorage.ts';
 async function main() {
   const args = process.argv.slice(2);
   const apply = args.includes('--apply');
+  const confirmed = args.includes('--confirm');
   const dryRun = !apply;
   const ownerArg = args.find((a) => a.startsWith('--owner-email='));
   const ownerEmail = ownerArg ? ownerArg.split('=')[1] : undefined;
+
+  if (apply && !confirmed) {
+    console.error(
+      'Refusing to apply legacy migration without explicit --confirm flag. Run without --apply first for a dry-run preview.'
+    );
+    process.exit(1);
+  }
 
   if (!isSqlEnvConfigured()) {
     console.error(
@@ -22,6 +30,7 @@ async function main() {
     db,
     storageProvider,
     dryRun,
+    confirmed: apply && confirmed,
     ownerEmail,
   });
 

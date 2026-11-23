@@ -42,15 +42,16 @@ NORUS QUOTEFLOW is a multi-tenant TypeScript full-stack SaaS web application ser
 ## Core Architecture Modules
 
 1. **Dual Server-Verified Authentication (`server/security.ts`, `server/firebase-admin.ts`, `src/lib/firebase.ts`):**
-   - Passwords hashed with Node `crypto.scrypt` + 16-byte salt; tokens stored exclusively as `SHA-256` hashes; password reset revokes all active user sessions.
-   - Google Sign-In uses minimal OAuth scopes (`openid`, `email`, `profile`) with `prompt: 'select_account'`. `verifyFirebaseIdToken` calls `adminAuth.verifyIdToken(idToken, true)` (`checkRevoked=true`) and validates `aud` and `iss` against `firebase-applet-config.json`. Linking an existing password account requires `email_verified === true`.
+   - Passwords hashed with Node `crypto.scrypt` + 16-byte salt; tokens stored exclusively as `SHA-256` hashes; password reset revokes all active user sessions; `createSessionTx` caps active sessions at `10` per user by revoking oldest sessions beyond the cap.
+   - Google Sign-In uses minimal OAuth scopes (`openid`, `email`, `profile`) with `prompt: 'select_account'`. `verifyFirebaseIdToken` defaults `checkRevoked` to `false` (opt-in via `FIREBASE_CHECK_REVOKED=true`), validates Google X.509 RS256 signature, `exp`, `aud`, and `iss` against `firebase-applet-config.json`, and checks readiness dynamically via `isGoogleAuthConfigured()`. Linking an existing password account requires `email_verified === true`.
 2. **Multi-Tenancy, 5-Role RBAC & First-Owner Bootstrap (`server/pgStore.ts`, `server/rbac.ts`, `server/ownerBootstrap.ts`):**
-   - Every procurement domain row is scoped by `organization_id`.
-   - Migrated owner-less organizations (such as `org-kalyani-hydraulics`) require explicit operator/founder bootstrap via `scripts/bootstrap-org-owner.ts`, which transactionally verifies `activeOwnerCount === 0` before either issuing an email-locked one-time claim token or promoting a verified registered user.
-3. **Operational Monitoring & Scheduled Maintenance (`server/monitoring.ts`, `server/maintenance.ts`):**
-   - Requests receive a validated or generated `X-Request-Id` header propagated in structured JSON logs and error responses.
+   - Every procurement domain row is scoped by `organization_id`, reinforced by composite same-organization foreign keys and functional uniqueness indexes in `drizzle/0001_tenant_integrity.sql` (see `docs/DATABASE_SCHEMA.md` for the documented `price_history` exception). `audit_logs` immutability is **application-enforced** (insert-only store helpers).
+   - Migrated owner-less organizations (such as `org-kalyani-hydraulics`) require explicit operator/founder bootstrap via `scripts/bootstrap-org-owner.ts`, which acquires a `FOR UPDATE` lock on the `organizations` row inside a transaction before verifying `activeOwnerCount === 0`.
+3. **Operational Monitoring, Storage Timeouts & Scheduled Maintenance (`server/monitoring.ts`, `server/objectStorage.ts`, `server/maintenance.ts`):**
+   - Requests receive a validated or generated `X-Request-Id` header propagated in structured JSON logs and error responses. Rate limiters derive client IP safely via Express `req.ip` (`trust proxy = 1`) rather than raw `X-Forwarded-For`.
+   - `S3CompatibleStorageProvider` enforces `AbortController` timeouts (`15s` object ops / `5s` readiness probe).
    - Unhandled `500` errors emit redacted `unhandled_server_error` events and trigger `ErrorTrackerHook` / `ERROR_WEBHOOK_URL` while returning `{ error: 'Internal server error.', requestId }` to clients.
-   - `runScheduledMaintenance` runs bounded batches (`500` rows/run) to clean expired/old-revoked sessions, expired/old-terminal invitations, expired verification/reset token hashes (preserving user rows), expired `rate_limit_buckets`, orphaned unreferenced `stored_documents` (>1h grace window), and stale `.tmp` local storage artifacts.
+   - `runScheduledMaintenance` uses a dedicated-connection PostgreSQL advisory lock (`pg_try_advisory_lock`) to prevent concurrent overlap, runs bounded batches (`500` rows/run), and deletes unreferenced `stored_documents` DB rows **only after** `storageProvider.deleteObject` succeeds (retaining DB rows on storage error for retry).
 
 ## Private Object Storage Strategy & Cost Comparison
 
@@ -81,7 +82,7 @@ NORUS QUOTEFLOW is a multi-tenant TypeScript full-stack SaaS web application ser
    ```
    - Never restore into the live database without taking a fresh pre-restore snapshot and verifying row counts (`organizations`, `rfqs`, `quotations`, `awards`) against `org-kalyani-hydraulics` and active tenant records.
 3. **Migration Rollback Strategy:**
-   - Schema changes are additive via Drizzle migrations (`drizzle/`). Before applying breaking schema changes, take a Cloud SQL on-demand backup; rollback by restoring a clone instance from backup or PITR timestamp rather than running destructive `DROP` scripts in place.
+   - Schema changes use explicit SQL migrations under `drizzle/` (`0000_illegal_major_mapleleaf.sql`, `0001_tenant_integrity_preflight.sql`, `0001_tenant_integrity.sql`, and `0001_tenant_integrity_rollback.sql`). Before applying schema changes to Cloud SQL, run the preflight diagnostic query, take a Cloud SQL on-demand backup, and keep the corresponding rollback script ready alongside backup/PITR recovery.
 
 ### Estimated Monthly Cloud SQL Cost (`asia-southeast1` Planning Estimates)
 *Note: Indicative GCP Cloud SQL PostgreSQL planning ranges for `asia-southeast1` (not live billing invoices); verify exact SKU pricing in GCP Pricing Calculator before provisioning.*

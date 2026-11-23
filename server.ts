@@ -5,7 +5,7 @@ import multer from 'multer';
 import path from 'path';
 import { pathToFileURL } from 'url';
 import { createServer as createViteServer } from 'vite';
-import { db as defaultDb, type DrizzleDb, isSqlEnvConfigured } from './src/db/index.ts';
+import { db as defaultDb, type DrizzleDb, isSqlEnvConfigured, pool as defaultPool } from './src/db/index.ts';
 import { createEmailProvider, type EmailProvider } from './server/emailService.ts';
 import { validateUploadedFile } from './server/fileSecurity.ts';
 import {
@@ -24,6 +24,7 @@ import {
   createCorrelationMiddleware,
   dispatchErrorTrackerHook,
   type ErrorTrackerHook,
+  isGoogleAuthConfigured,
   logEvent,
 } from './server/monitoring.ts';
 import {
@@ -370,6 +371,8 @@ export async function createApp(options: AppOptions = {}) {
     };
   }
 
+  const googleAuthEnabled = isGoogleAuthConfigured();
+
   function buildAuthResponse(ctx: SessionAuthContext) {
     return {
       authenticated: true,
@@ -377,7 +380,7 @@ export async function createApp(options: AppOptions = {}) {
       activeOrganization: ctx.activeOrganization,
       organizations: ctx.organizations,
       csrfToken: ctx.csrfToken,
-      googleAuthEnabled: true,
+      googleAuthEnabled,
       demoMode: demoModeEnabled,
     };
   }
@@ -405,7 +408,7 @@ export async function createApp(options: AppOptions = {}) {
       geminiConfigured: Boolean(
         process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'
       ),
-      googleAuthConfigured: true,
+      googleAuthConfigured: googleAuthEnabled,
       timestamp: new Date().toISOString(),
       uptimeSec: Math.floor(process.uptime()),
     });
@@ -439,7 +442,7 @@ export async function createApp(options: AppOptions = {}) {
         activeOrganization: null,
         organizations: [],
         csrfToken: null,
-        googleAuthEnabled: true,
+        googleAuthEnabled,
         demoMode: demoModeEnabled,
       });
     }
@@ -613,11 +616,9 @@ export async function createApp(options: AppOptions = {}) {
           safeMime = validation.detectedMime;
         }
 
-        const hasLiveGemini =
-          Boolean(generateContentOverride) ||
-          Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY');
-
-        const extracted = hasLiveGemini
+        // Never allow anonymous demo sessions to invoke live production GEMINI_API_KEY quota.
+        // Only run extractQuotationWithGemini if a test explicitly injects generateContentOverride.
+        const extracted = generateContentOverride
           ? await extractQuotationWithGemini({
               rfq,
               supplierId: supplierId.trim(),
@@ -713,11 +714,19 @@ export async function createApp(options: AppOptions = {}) {
   app.post('/api/demo-workspace/rfqs/:rfqId/award', requireDemoMode, demoMutationRateLimiter, (req, res, next) => {
     try {
       const sessionId = resolveDemoSessionId(req, res);
-      const { isSplitAward, nonL1Justification, allocations } = req.body || {};
+      const {
+        isSplitAward,
+        nonL1Justification,
+        acceptedAlternateLineIds,
+        commercialExceptionAccepted,
+        allocations,
+      } = req.body || {};
       const award = demoStore.submitAward(sessionId, {
         rfqId: req.params.rfqId,
         isSplitAward: Boolean(isSplitAward),
         nonL1Justification,
+        acceptedAlternateLineIds,
+        commercialExceptionAccepted,
         allocations,
       });
       res.status(201).json(award);
@@ -1395,7 +1404,13 @@ export async function createApp(options: AppOptions = {}) {
         res.status(201).json(saved);
       } catch (err) {
         if (uploadedKeyForRollback) {
-          await storageProvider.deleteObject(uploadedKeyForRollback).catch(() => undefined);
+          await storageProvider.deleteObject(uploadedKeyForRollback).catch((delErr) => {
+            logEvent('warn', 'storage_rollback_delete_failed', {
+              requestId: req.requestId,
+              storageKey: uploadedKeyForRollback,
+              error: delErr instanceof Error ? delErr.message : String(delErr),
+            });
+          });
         }
         next(err);
       }
@@ -1493,7 +1508,13 @@ export async function createApp(options: AppOptions = {}) {
         if (result.deletedDocument) {
           await storageProvider
             .deleteObject(result.deletedDocument.storageKey)
-            .catch(() => undefined);
+            .catch((delErr) => {
+              logEvent('warn', 'storage_post_delete_failed', {
+                requestId: req.requestId,
+                storageKey: result.deletedDocument!.storageKey,
+                error: delErr instanceof Error ? delErr.message : String(delErr),
+              });
+            });
         }
         res.json({ ok: true });
       } catch (err) {
@@ -1511,12 +1532,20 @@ export async function createApp(options: AppOptions = {}) {
     async (req, res, next) => {
       try {
         const org = req.auth!.activeOrganization!;
-        const { isSplitAward, nonL1Justification, allocations } = req.body || {};
+        const {
+          isSplitAward,
+          nonL1Justification,
+          acceptedAlternateLineIds,
+          commercialExceptionAccepted,
+          allocations,
+        } = req.body || {};
         const award = await store.submitAward({
           organizationId: org.id,
           rfqId: req.params.rfqId,
           isSplitAward: Boolean(isSplitAward),
           nonL1Justification,
+          acceptedAlternateLineIds,
+          commercialExceptionAccepted,
           allocations,
           actorUserId: req.auth!.user.id,
           actorName: req.auth!.user.fullName,
@@ -1663,7 +1692,7 @@ export async function createApp(options: AppOptions = {}) {
         });
       }
       return res.status(400).json({
-        error: `File upload error: ${err.message}`,
+        error: `File upload error: ${redactSensitiveText(err.message)}`,
         requestId: req.requestId,
       });
     }
@@ -1723,9 +1752,9 @@ if (isDirectExecution) {
     const intervalMinutes = Number(process.env.MAINTENANCE_INTERVAL_MINUTES ?? '360');
     if (Number.isFinite(intervalMinutes) && intervalMinutes > 0 && isSqlEnvConfigured()) {
       const timer = setInterval(() => {
-        runScheduledMaintenance({ db: defaultDb, storageProvider }).catch((err) => {
+        runScheduledMaintenance({ db: defaultDb, storageProvider, lockPool: defaultPool }).catch((err) => {
           logEvent('error', 'scheduled_maintenance_failed', {
-            error: err instanceof Error ? err.message : String(err),
+            error: redactSensitiveText(err instanceof Error ? err.message : String(err)),
           });
         });
       }, intervalMinutes * 60 * 1000);

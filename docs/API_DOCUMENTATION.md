@@ -8,7 +8,7 @@ Every response echoes or generates an `X-Request-Id` correlation header, and unh
 
 ### `GET /api/health`
 Fast process liveness probe (does not block on external database startup checks or expose credentials).
-- **200 OK:** `{ "status": "ok", "database": "postgresql", "storageProvider": "local" | "s3", "emailProvider": "dev_outbox" | "resend", "geminiConfigured": boolean, "googleAuthConfigured": true, "timestamp": string, "uptimeSec": number }`
+- **200 OK:** `{ "status": "ok", "database": "postgresql", "storageProvider": "local" | "s3", "emailProvider": "dev_outbox" | "resend", "geminiConfigured": boolean, "googleAuthConfigured": boolean, "timestamp": string, "uptimeSec": number }` *(where `googleAuthConfigured` checks `firebase-applet-config.json` via `isGoogleAuthConfigured()`)*
 
 ### `GET /api/health/ready`
 Dependency readiness probe executing PostgreSQL `SELECT 1`, private object storage readiness (`checkReadiness()`), email sender configuration status, and AI/OAuth readiness flags (never exposes secrets, stack traces, or connection strings).
@@ -36,9 +36,9 @@ All routes below operate exclusively on an isolated, in-memory synthetic dataset
 - `PATCH /api/demo-workspace/settings` — Updates demo organization defaults (`name`, `defaultCurrency`, `taxRegime`, `defaultTaxCreditable`).
 - `POST /api/demo-workspace/rfqs` & `POST /api/demo-workspace/rfqs/load-sample` — Creates a demo RFQ (capped at 30 per session) or loads another synthetic RFQ + 3 sample quotations with genuine synthetic PDF/Excel preview documents.
 - `POST /api/demo-workspace/suppliers` — Creates a demo supplier (`409` on duplicate name/Tax ID within the demo session).
-- `POST /api/demo-workspace/rfqs/:rfqId/quotes/extract` *(Rate Limited)* — Validates magic bytes (`validateUploadedFile`), enforces per-session quotas (`25` uploads / `30 MB`, `413`), runs Gemini extraction (or deterministic `extractDemoQuotationOffline` when no API key is configured), and stores uploaded demo files strictly in session memory.
-- `PATCH /api/demo-workspace/quotations/:quoteId`, `PATCH /api/demo-workspace/quotations/:quoteId/lines/:lineId`, `POST /api/demo-workspace/quotations/:quoteId/verify` (`422` math gate), `DELETE /api/demo-workspace/quotations/:quoteId` (`409` approved-award guard).
-- `POST /api/demo-workspace/rfqs/:rfqId/award` & `POST /api/demo-workspace/awards/:awardId/decide` — Simulates split/single award recommendation (`nonL1Justification` enforced) and updates synthetic demo price memory.
+- `POST /api/demo-workspace/rfqs/:rfqId/quotes/extract` *(Rate Limited)* — Validates magic bytes (`validateUploadedFile`), enforces per-session quotas (`25` uploads / `30 MB`, `413`), **always runs deterministic offline extraction (`extractDemoQuotationOffline`)** without calling external Gemini APIs even if `GEMINI_API_KEY` is set (only accepting `generateContentOverride` in unit tests), and stores uploaded demo files strictly in session memory.
+- `PATCH /api/demo-workspace/quotations/:quoteId`, `PATCH /api/demo-workspace/quotations/:quoteId/lines/:lineId`, `POST /api/demo-workspace/quotations/:quoteId/verify` (`422` math gate), `DELETE /api/demo-workspace/quotations/:quoteId` (`409` approved-award guard). Header and line edits clear `isVerified` / `verifiedBy` / `verifiedAt`, requiring explicit re-verification before award.
+- `POST /api/demo-workspace/rfqs/:rfqId/award` & `POST /api/demo-workspace/awards/:awardId/decide` — Validates awards via shared `validateAwardSubmission` (`src/lib/awardValidation.ts`: 100% BOM coverage, verified quotes, valid math, full package completeness, `nonL1Justification`, `commercialExceptionAccepted` when `missingFreightWarning` is true, and `acceptedAlternateLineIds` when `alternate_spec` lines are selected), and updates synthetic demo price memory upon approval.
 - `GET /api/demo-workspace/documents/:docId/signed-url` & `GET /api/demo-workspace/documents/:docId/content` — Requires an existing active session (`hasSession`, returning `404` on unknown/missing session IDs without allocating) and serves genuine synthetic sample PDF/XLSX or uploaded demo files using HMAC-signed URLs scoped to `demo:${docId}:${demoSessionId}:${exp}` (`403` on tampered signature, `404` across demo sessions).
 
 ### `POST /api/auth/register` *(Rate Limited)*
@@ -120,10 +120,10 @@ Accepts `multipart/form-data` (`supplierId`, optional `file`, optional `rawEmail
 - Edit requires `quotation:edit`; verify requires `quotation:verify` (blocked with `422` if any line has `mathValid === false`); delete requires `quotation:delete` (blocked with `409` if referenced by an `approved` award, and deletes the private object storage file if unapproved).
 
 ### `POST /api/rfqs/:rfqId/award` *(`award:recommend` — `owner`, `admin`, `buyer`)*
-Submits single or split-award recommendation after validating all allocations belong to the organization & RFQ and checking `nonL1Justification` against verified `L1`.
+Runs inside a transaction holding an RFQ row lock (`FOR UPDATE`) and validates allocations via `validateAwardSubmission` (`src/lib/awardValidation.ts`): rejects existing approved awards (`409`), enforces unique 100% BOM line coverage (`400`), requires `isVerified === true`, valid math, and package completeness (`422`), requires explicit `commercialExceptionAccepted` + written justification for `missingFreightWarning` (`422`), requires explicit `acceptedAlternateLineIds` + written justification for `alternate_spec` lines (`422`), and enforces `nonL1Justification` against verified `L1` (`400`).
 
 ### `POST /api/awards/:awardId/decide` *(`award:decide` — `owner`, `admin`, `approver`)*
-Approves or rejects a `pending` award (`403` for `buyer` or `viewer`). Approval updates RFQ status to `'awarded'` and records `price_history` + `catalog_items.last_awarded_unit_price`.
+Locks award/RFQ rows (`FOR UPDATE`) and executes an atomic conditional `UPDATE ... WHERE approval_status = 'pending'` (`409` if already finalized). Approval updates RFQ status to `'awarded'` and records `price_history` + `catalog_items.last_awarded_unit_price`.
 
 ---
 

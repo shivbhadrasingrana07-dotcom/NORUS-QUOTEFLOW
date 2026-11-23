@@ -107,6 +107,7 @@ export async function bootstrapFirstOwnerDirect(params: {
       .select()
       .from(organizations)
       .where(eq(organizations.id, params.organizationId))
+      .for('update')
       .limit(1);
 
     if (!org) {
@@ -227,6 +228,7 @@ export async function issueFirstOwnerClaimToken(params: {
       .select()
       .from(organizations)
       .where(eq(organizations.id, params.organizationId))
+      .for('update')
       .limit(1);
 
     if (!org) {

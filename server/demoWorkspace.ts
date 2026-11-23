@@ -23,7 +23,7 @@ import {
   parseSpreadsheetBuffer,
 } from './geminiExtractor.ts';
 import { recomputeQuotation } from './normalization.ts';
-import { rankQuotations } from '../src/lib/ranking.ts';
+import { AwardValidationError, validateAwardSubmission } from '../src/lib/awardValidation.ts';
 
 export const DEMO_ORGANIZATION_ID = 'demo-org-synthetic';
 
@@ -1951,7 +1951,12 @@ export class DemoWorkspaceStore {
       throw new DemoStoreError('Parent demo RFQ not found.', 404);
     }
 
-    const updatedRaw: Quotation = { ...q };
+    const updatedRaw: Quotation = {
+      ...q,
+      isVerified: false,
+      verifiedBy: null,
+      verifiedAt: null,
+    };
     if (body.freightCharges !== undefined) {
       const n = Number(body.freightCharges);
       if (!Number.isFinite(n) || n < 0) throw new DemoStoreError('Invalid freightCharges.', 400);
@@ -2181,6 +2186,8 @@ export class DemoWorkspaceStore {
       rfqId: string;
       isSplitAward: boolean;
       nonL1Justification?: unknown;
+      acceptedAlternateLineIds?: unknown;
+      commercialExceptionAccepted?: unknown;
       allocations?: unknown;
     }
   ): AwardDecision {
@@ -2188,60 +2195,28 @@ export class DemoWorkspaceStore {
     const rfq = session.workspace.rfqs.find((r) => r.id === params.rfqId);
     if (!rfq) throw new DemoStoreError('Demo RFQ not found.', 404);
 
-    const existingApproved = session.workspace.awards.find(
+    const existingApproved = session.workspace.awards.some(
       (a) => a.rfqId === rfq.id && a.approvalStatus === 'approved'
     );
-    if (existingApproved) {
-      throw new DemoStoreError('This demo RFQ already has an approved award.', 409);
-    }
-
-    const rawAllocs = Array.isArray(params.allocations) ? params.allocations : [];
-    if (rawAllocs.length === 0) {
-      throw new DemoStoreError('At least one award line allocation is required.', 400);
-    }
-
     const rfqQuotes = session.workspace.quotations.filter((q) => q.rfqId === rfq.id);
-    const validatedAllocs: AwardAllocation[] = [];
-    let totalAwardedLanded = 0;
 
-    for (const raw of rawAllocs) {
-      if (!raw || typeof raw !== 'object') throw new DemoStoreError('Invalid allocation.', 400);
-      const r = raw as Record<string, unknown>;
-      const rfqItemId = String(r.rfqItemId || '');
-      const quotationId = String(r.quotationId || '');
-      const quotationLineId = String(r.quotationLineId || '');
-      const rfqItem = rfq.items.find((it) => it.id === rfqItemId);
-      const quote = rfqQuotes.find((q) => q.id === quotationId);
-      const line = quote?.lines.find((l) => l.id === quotationLineId);
-      if (!rfqItem || !quote || !line || line.normalizedUnitLanded === null) {
-        throw new DemoStoreError('Allocation references invalid demo RFQ item or unpriced quote line.', 400);
-      }
-      const qty = Number(r.awardedQty ?? rfqItem.quantity);
-      if (!Number.isFinite(qty) || qty <= 0) {
-        throw new DemoStoreError('Awarded quantity must be > 0.', 400);
-      }
-      validatedAllocs.push({
-        rfqItemId,
-        quotationId,
-        quotationLineId,
-        supplierId: quote.supplierId,
-        awardedQty: qty,
-        awardedUnitLanded: line.normalizedUnitLanded,
+    let validated;
+    try {
+      validated = validateAwardSubmission({
+        rfq,
+        rfqQuotes,
+        isSplitAward: Boolean(params.isSplitAward),
+        allocations: params.allocations,
+        nonL1Justification: params.nonL1Justification,
+        acceptedAlternateLineIds: params.acceptedAlternateLineIds,
+        commercialExceptionAccepted: params.commercialExceptionAccepted,
+        hasApprovedAward: existingApproved,
       });
-      totalAwardedLanded += qty * line.normalizedUnitLanded;
-    }
-
-    totalAwardedLanded = Math.round(totalAwardedLanded * 100) / 100;
-    const ranked = rankQuotations(rfqQuotes, 'landed');
-    const l1 = ranked.find((r) => r.rankIndex === 1);
-    const isNonL1 = Boolean(l1 && totalAwardedLanded > l1.totalForBasis + 0.01);
-    const justification =
-      typeof params.nonL1Justification === 'string' ? params.nonL1Justification.trim() : '';
-    if (isNonL1 && !justification) {
-      throw new DemoStoreError(
-        'Non-L1 justification is mandatory because recommended total exceeds verified L1.',
-        400
-      );
+    } catch (err) {
+      if (err instanceof AwardValidationError) {
+        throw new DemoStoreError(err.message, err.statusCode);
+      }
+      throw err;
     }
 
     // Replace any prior pending/rejected award on this demo RFQ
@@ -2256,10 +2231,10 @@ export class DemoWorkspaceStore {
       recommendedBy: DEMO_USER.fullName,
       approvedBy: null,
       approvalStatus: 'pending',
-      nonL1Justification: justification || null,
+      nonL1Justification: validated.nonL1Justification,
       approverNotes: null,
-      totalAwardedLanded,
-      allocations: validatedAllocs,
+      totalAwardedLanded: validated.totalAwardedLanded,
+      allocations: validated.allocations,
       decidedAt: null,
       createdAt: new Date().toISOString(),
     };

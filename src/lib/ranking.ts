@@ -27,15 +27,24 @@ export function getIneligibilityReasons(q: Quotation): string[] {
   if (!q.isVerified) {
     reasons.push('Unverified');
   }
+  if (q.missingFreightWarning) {
+    reasons.push('Unconfirmed freight/commercial terms');
+  }
+  const unreviewedAlternate = q.lines.filter(
+    (l) => l.matchStatus === 'alternate_spec' && !l.verifiedField
+  ).length;
+  if (unreviewedAlternate > 0) {
+    reasons.push(`${unreviewedAlternate} unreviewed alternate spec`);
+  }
   return reasons;
 }
 
 /**
  * Deterministic ranking convention:
- * 1. Only complete (100% of RFQ items quoted), math-valid, human-verified quotations
- *    are eligible for L1 / L2 / L3 package ranking.
- * 2. Incomplete or invalid/unverified quotations sort after eligible quotes and are
- *    explicitly labeled so they can never masquerade as L1 due to missing items.
+ * 1. Only complete (100% of RFQ items quoted), math-valid, commercially confirmed,
+ *    human-verified quotations are eligible for L1 / L2 / L3 package ranking.
+ * 2. Incomplete, invalid, or unverified quotations sort after eligible quotes and are
+ *    explicitly labeled so they can never masquerade as L1 due to missing items or omitted freight.
  */
 export function rankQuotations(quotes: Quotation[], basis: CostBasis): RankedQuotation[] {
   const enriched = quotes.map((q) => {

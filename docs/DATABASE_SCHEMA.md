@@ -1,6 +1,8 @@
 # Database Schema (Cloud SQL PostgreSQL + Drizzle ORM)
 
-NORUS QUOTEFLOW persists all identity, multi-tenant access control, procurement records, private document metadata, audit trails, and rate-limit buckets in PostgreSQL (`src/db/schema.ts`, initial migration `drizzle/0000_illegal_major_mapleleaf.sql`).
+NORUS QUOTEFLOW persists all identity, multi-tenant access control, procurement records, private document metadata, audit trails, and rate-limit buckets in PostgreSQL (`src/db/schema.ts`, initial migration `drizzle/0000_illegal_major_mapleleaf.sql`, and tenant-integrity hardening migration `drizzle/0001_tenant_integrity.sql` with preflight `drizzle/0001_tenant_integrity_preflight.sql` and rollback `drizzle/0001_tenant_integrity_rollback.sql`).
+
+> **Deployment Note:** `drizzle/0001_tenant_integrity.sql` is checked into the repository and applied in CI against PostgreSQL 16; apply it to Cloud SQL only after running `0001_tenant_integrity_preflight.sql` and taking an instance backup.
 
 ## Relational Tables (17 Tables)
 
@@ -31,15 +33,23 @@ Every table below enforces a non-null `organization_id` FK (`ON DELETE CASCADE`)
 | `audit_logs` | `id`, `organization_id`, `actor_user_id`, `actor_name`, `actor_role`, `entity_type`, `entity_id`, `action`, `detail`, `created_at` | Immutable organization-scoped procurement & access audit log |
 | `rate_limit_buckets` | `bucket_key` (PK), `hits`, `reset_at` | Atomic PostgreSQL-backed sliding/fixed window rate-limit counters |
 
-## Referential Integrity & Business Rules
+## Referential Integrity, Tenant Boundaries & Exceptions
 
-1. **Approved Quote Deletion Guard:** Deleting a quotation referenced by an `approved` award is blocked with `409 Conflict` (`award_allocations.quotation_id` uses `ON DELETE RESTRICT` + explicit server check). Deleting an unapproved quote deletes stale `pending` awards, deletes the `stored_documents` row, and removes the object from private object storage.
-2. **Duplicate Supplier Protection:** Case-insensitive duplicate `name` or `tax_id` within the same organization returns `409 Conflict`.
-3. **Cross-Tenant Enforcement:** Every query filters by `organization_id = req.auth.activeOrganization.id`.
+1. **Composite Same-Organization Constraints (`drizzle/0001_tenant_integrity.sql`):**
+   - Adds `(organization_id, id)` unique keys on parent tables and composite same-organization foreign keys across procurement child tables (`catalog_items`, `price_history`, `rfq_items`, `quotations`, `quotation_lines`, `awards`, `award_allocations`) so a child row cannot reference a parent record from a different organization even by raw ID. Uses PostgreSQL 15+ column-list `ON DELETE SET NULL (<column>)` where optional parent links nullable-cascade without clearing `organization_id`.
+   - Functional partial unique indexes enforce case-insensitive per-organization supplier uniqueness on `lower(trim(name))` and non-empty `lower(trim(tax_id))`.
+2. **Documented `price_history` Exception:**
+   - `price_history.rfq_id` and `price_history.supplier_id` are intentionally stored as historical snapshot references without foreign keys to `rfqs` or `suppliers`, preserving historical awarded landed-price memory (`price_history.catalog_item_id` remains scoped via `(organization_id, catalog_item_id)`).
+3. **Audit Logs (`audit_logs`):**
+   - Immutability (append-only behavior) is **application-enforced**: `PgDataStore`, `ownerBootstrap.ts`, and `legacyMigration.ts` perform `INSERT`-only writes with no update/delete endpoints or queries (no PostgreSQL trigger/rule is installed at the DB layer).
+4. **Approved Quote Deletion & Row Locking:**
+   - Deleting a quotation referenced by an `approved` award is blocked with `409 Conflict` (`award_allocations.quotation_id` uses `ON DELETE RESTRICT` + explicit server check). `submitAward` and `decideAward` use row locks (`FOR UPDATE`) plus atomic conditional `UPDATE ... WHERE approval_status = 'pending'`.
+5. **Cross-Tenant & Supplier Protection:** Every query filters by `organization_id = req.auth.activeOrganization.id`; duplicate supplier name/Tax ID returns `409 Conflict`.
 
 ## Legacy JSON Migration (`server/legacyMigration.ts`)
 
-Legacy JSON data (`data/quoteflow-db.json`) is migrated via `npm run db:migrate -- --dry-run` / `--apply`:
+Legacy JSON data (`data/quoteflow-db.json`) is migrated via `npm run db:migrate -- --dry-run` or `npm run db:migrate -- --apply --confirm`:
+- Requires explicit `--confirm` CLI flag / `confirmed: true` when `dryRun: false` to prevent accidental writes.
 - Creates a timestamped pre-migration backup in `data/backups/` while leaving `data/quoteflow-db.json` untouched.
-- Extracts any inline Base64 `fileDataUrl` attachments into private object storage (`stored_documents` + `document_id`).
-- Runs inside a single idempotent PostgreSQL transaction (`onConflictDoNothing`) and verifies post-migration row counts match `sourceCounts`.
+- Extracts inline Base64 `fileDataUrl` attachments into private object storage (`stored_documents` + `document_id`), and automatically rolls back newly uploaded storage keys (`rolledBackStorageKeys`) if the PostgreSQL transaction aborts.
+- Runs pre-insert cross-organization ID collision detection (`MigrationConflictError`) and per-ID + attribute post-write reconciliation (`reconciliation`, `integrityVerified`).

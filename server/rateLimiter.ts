@@ -110,11 +110,7 @@ export class PostgresRateLimitStore implements RateLimitStore {
 }
 
 export function getClientIp(req: Request): string {
-  const fwd = req.headers['x-forwarded-for'];
-  if (typeof fwd === 'string' && fwd.trim()) {
-    return fwd.split(',')[0].trim();
-  }
-  return req.ip || req.socket.remoteAddress || 'unknown';
+  return req.ip || req.socket?.remoteAddress || 'unknown';
 }
 
 export function createRateLimitMiddleware(params: {

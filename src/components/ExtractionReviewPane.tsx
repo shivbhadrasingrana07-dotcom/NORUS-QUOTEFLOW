@@ -781,16 +781,30 @@ export function ExtractionReviewPane({
               </div>
             </div>
 
-            <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-[#E2E8F0] text-xs">
-              <label className="flex items-center gap-2 cursor-pointer text-[#0F172A]">
-                <input
-                  type="checkbox"
-                  checked={activeQuote.taxIncludedInRates}
-                  onChange={(e) => handleSaveHeaderPatch({ taxIncludedInRates: e.target.checked })}
-                  className="rounded border-[#CBD5E1]"
-                />
-                <span>Unit rates are GST/VAT inclusive</span>
-              </label>
+            <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-[#E2E8F0] text-xs">
+              <div className="flex flex-wrap items-center gap-4">
+                <label className="flex items-center gap-2 cursor-pointer text-[#0F172A]">
+                  <input
+                    type="checkbox"
+                    checked={activeQuote.taxIncludedInRates}
+                    onChange={(e) => handleSaveHeaderPatch({ taxIncludedInRates: e.target.checked })}
+                    className="rounded border-[#CBD5E1]"
+                  />
+                  <span>Unit rates are GST/VAT inclusive</span>
+                </label>
+
+                <label className="flex items-center gap-2 cursor-pointer text-[#0F172A]">
+                  <input
+                    type="checkbox"
+                    checked={!activeQuote.missingFreightWarning}
+                    onChange={(e) =>
+                      handleSaveHeaderPatch({ missingFreightWarning: !e.target.checked })
+                    }
+                    className="rounded border-[#CBD5E1]"
+                  />
+                  <span>Freight &amp; commercial terms confirmed</span>
+                </label>
+              </div>
 
               {activeQuote.missingFreightWarning && (
                 <span className="text-[#D97706] font-medium flex items-center gap-1">

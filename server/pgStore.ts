@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, isNull } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, inArray, isNull } from 'drizzle-orm';
 import type { DrizzleDb } from '../src/db/index.ts';
 import {
   auditLogs,
@@ -18,6 +18,7 @@ import {
   suppliers,
   users,
 } from '../src/db/schema.ts';
+import { AwardValidationError, validateAwardSubmission } from '../src/lib/awardValidation.ts';
 import { rankQuotations } from '../src/lib/ranking.ts';
 import type {
   AuditLogEntry,
@@ -95,6 +96,9 @@ function isPositiveFinite(val: unknown): val is number {
 
 function handleDbError(err: unknown, context: string): never {
   if (err instanceof StoreError) throw err;
+  if (err instanceof AwardValidationError) {
+    throw new StoreError(err.statusCode, err.message);
+  }
   const rawMsg = err instanceof Error ? err.message : String(err);
   const safeMsg = redactSensitiveText(rawMsg);
   if (process.env.NODE_ENV !== 'test') {
@@ -229,11 +233,37 @@ export class PgDataStore {
       userAgent?: string | null;
     }
   ): Promise<{ rawSessionToken: string; csrfToken: string; sessionId: string }> {
+    const MAX_ACTIVE_SESSIONS_PER_USER = 10;
     const rawSessionToken = generateSecureToken(32);
     const csrfToken = generateSecureToken(24);
     const sessionId = makeId('sess');
     const now = new Date();
     const expiresAt = new Date(now.getTime() + SESSION_TTL_MS);
+
+    const activeSessions = await tx
+      .select({ id: sessions.id })
+      .from(sessions)
+      .where(
+        and(
+          eq(sessions.userId, params.userId),
+          isNull(sessions.revokedAt),
+          gt(sessions.expiresAt, now)
+        )
+      )
+      .orderBy(desc(sessions.lastSeenAt), desc(sessions.createdAt));
+
+    const excess = activeSessions.slice(Math.max(0, MAX_ACTIVE_SESSIONS_PER_USER - 1));
+    if (excess.length > 0) {
+      await tx
+        .update(sessions)
+        .set({ revokedAt: now })
+        .where(
+          inArray(
+            sessions.id,
+            excess.map((s) => s.id)
+          )
+        );
+    }
 
     await tx.insert(sessions).values({
       id: sessionId,
@@ -3305,7 +3335,14 @@ export class PgDataStore {
     rfqId: string;
     isSplitAward: boolean;
     nonL1Justification?: string | null;
-    allocations: Array<{ rfqItemId: string; quotationId: string; quotationLineId: string }>;
+    acceptedAlternateLineIds?: string[];
+    commercialExceptionAccepted?: boolean;
+    allocations: Array<{
+      rfqItemId: string;
+      quotationId: string;
+      quotationLineId: string;
+      awardedQty?: number;
+    }>;
     actorUserId: string;
     actorName: string;
     actorRole: UserRole;
@@ -3323,13 +3360,27 @@ export class PgDataStore {
           .select()
           .from(rfqs)
           .where(and(eq(rfqs.id, params.rfqId), eq(rfqs.organizationId, params.organizationId)))
+          .for('update')
           .limit(1);
         if (!rfqRow) throw new StoreError(404, 'RFQ not found.');
+
+        const [existingApproved] = await tx
+          .select({ id: awards.id })
+          .from(awards)
+          .where(
+            and(
+              eq(awards.rfqId, rfqRow.id),
+              eq(awards.organizationId, params.organizationId),
+              eq(awards.approvalStatus, 'approved')
+            )
+          )
+          .limit(1);
 
         const rItems = await tx
           .select()
           .from(rfqItems)
-          .where(and(eq(rfqItems.rfqId, rfqRow.id), eq(rfqItems.organizationId, params.organizationId)));
+          .where(and(eq(rfqItems.rfqId, rfqRow.id), eq(rfqItems.organizationId, params.organizationId)))
+          .orderBy(asc(rfqItems.lineNo));
 
         const qRows = await tx
           .select()
@@ -3338,10 +3389,21 @@ export class PgDataStore {
             and(eq(quotations.rfqId, rfqRow.id), eq(quotations.organizationId, params.organizationId))
           );
 
-        const qLineRows = await tx
-          .select()
-          .from(quotationLines)
-          .where(eq(quotationLines.organizationId, params.organizationId));
+        const qLineRows =
+          qRows.length > 0
+            ? await tx
+                .select()
+                .from(quotationLines)
+                .where(
+                  and(
+                    eq(quotationLines.organizationId, params.organizationId),
+                    inArray(
+                      quotationLines.quotationId,
+                      qRows.map((q) => q.id)
+                    )
+                  )
+                )
+            : [];
 
         const linesByQuote = new Map<string, QuotationLine[]>();
         for (const l of qLineRows) {
@@ -3411,62 +3473,46 @@ export class PgDataStore {
           createdAt: q.createdAt,
         }));
 
-        const verifiedAllocations: AwardAllocation[] = [];
-        let computedTotalLanded = 0;
+        const domainRfq: Rfq = {
+          id: rfqRow.id,
+          rfqNumber: rfqRow.rfqNumber,
+          title: rfqRow.title,
+          status: rfqRow.status as Rfq['status'],
+          currency: rfqRow.currency as Rfq['currency'],
+          incoterms: rfqRow.incoterms,
+          deliveryLocation: rfqRow.deliveryLocation,
+          deadlineDate: rfqRow.deadlineDate,
+          createdBy: rfqRow.createdBy,
+          createdAt: rfqRow.createdAt,
+          updatedAt: rfqRow.updatedAt,
+          invitedSupplierIds: rfqRow.invitedSupplierIds || [],
+          items: rItems.map((it) => ({
+            id: it.id,
+            rfqId: it.rfqId,
+            itemId: it.itemId,
+            lineNo: it.lineNo,
+            skuCode: it.skuCode,
+            description: it.description,
+            quantity: it.quantity,
+            uom: it.uom,
+            targetUnitPrice: it.targetUnitPrice,
+          })),
+        };
 
-        for (const al of params.allocations) {
-          const rfqItem = rItems.find((it) => it.id === al.rfqItemId);
-          const quote = rfqQuotes.find((q) => q.id === al.quotationId);
-          const line = quote?.lines.find((l) => l.id === al.quotationLineId);
+        const validated = validateAwardSubmission({
+          rfq: domainRfq,
+          rfqQuotes,
+          isSplitAward: Boolean(params.isSplitAward),
+          allocations: params.allocations,
+          nonL1Justification: params.nonL1Justification,
+          acceptedAlternateLineIds: params.acceptedAlternateLineIds,
+          commercialExceptionAccepted: params.commercialExceptionAccepted,
+          hasApprovedAward: Boolean(existingApproved),
+        });
 
-          if (!rfqItem || !quote || !line || line.matchStatus === 'not_quoted') {
-            throw new StoreError(400, 'Invalid allocation reference to RFQ item or quotation line.');
-          }
-          if (!line.mathValid || line.normalizedUnitLanded === null) {
-            throw new StoreError(
-              422,
-              `Cannot include line "${line.rawDescription}" in an award while arithmetic mismatch or missing price remains.`
-            );
-          }
-
-          const qty = rfqItem.quantity;
-          const unitLanded = line.normalizedUnitLanded;
-          computedTotalLanded += unitLanded * qty;
-          verifiedAllocations.push({
-            rfqItemId: rfqItem.id,
-            quotationId: quote.id,
-            quotationLineId: line.id,
-            supplierId: quote.supplierId,
-            awardedQty: qty,
-            awardedUnitLanded: unitLanded,
-          });
-        }
-
-        const distinctQuoteIds = new Set(verifiedAllocations.map((a) => a.quotationId));
-        if (!params.isSplitAward && distinctQuoteIds.size === 1) {
-          const soleQuote = rfqQuotes.find((q) => q.id === [...distinctQuoteIds][0]);
-          if (soleQuote && verifiedAllocations.length === rItems.length) {
-            computedTotalLanded = soleQuote.totalLandedCost;
-          }
-        }
-        computedTotalLanded = Math.round(computedTotalLanded * 100) / 100;
-
-        const ranked = rankQuotations(rfqQuotes, 'landed');
-        const l1Eligible = ranked.find((r) => r.rankIndex === 1);
-        const isNonL1Server = l1Eligible
-          ? computedTotalLanded > l1Eligible.totalForBasis + 1
-          : false;
-
-        const trimmedJust =
-          typeof params.nonL1Justification === 'string' && params.nonL1Justification.trim()
-            ? params.nonL1Justification.trim()
-            : null;
-        if (isNonL1Server && !trimmedJust) {
-          throw new StoreError(
-            400,
-            'Justification is mandatory when awarding above the L1 lowest landed cost.'
-          );
-        }
+        const verifiedAllocations = validated.allocations;
+        const computedTotalLanded = validated.totalAwardedLanded;
+        const trimmedJust = validated.nonL1Justification;
 
         await tx
           .delete(awards)
@@ -3570,6 +3616,7 @@ export class PgDataStore {
           .where(
             and(eq(awards.id, params.awardId), eq(awards.organizationId, params.organizationId))
           )
+          .for('update')
           .limit(1);
 
         if (!awardRow) throw new StoreError(404, 'Award decision not found.');
@@ -3583,6 +3630,7 @@ export class PgDataStore {
           .where(
             and(eq(rfqs.id, awardRow.rfqId), eq(rfqs.organizationId, params.organizationId))
           )
+          .for('update')
           .limit(1);
         if (!rfqRow) throw new StoreError(404, 'Parent RFQ not found.');
 
@@ -3617,7 +3665,7 @@ export class PgDataStore {
             ? params.approverNotes.trim()
             : null;
 
-        await tx
+        const updatedAwardRows = await tx
           .update(awards)
           .set({
             approvalStatus: params.decision,
@@ -3627,8 +3675,17 @@ export class PgDataStore {
             decidedAt: nowIso,
           })
           .where(
-            and(eq(awards.id, awardRow.id), eq(awards.organizationId, params.organizationId))
-          );
+            and(
+              eq(awards.id, awardRow.id),
+              eq(awards.organizationId, params.organizationId),
+              eq(awards.approvalStatus, 'pending')
+            )
+          )
+          .returning({ id: awards.id });
+
+        if (updatedAwardRows.length === 0) {
+          throw new StoreError(409, 'This award decision has already been finalized.');
+        }
 
         const nextStatus: Rfq['status'] =
           params.decision === 'approved' ? 'awarded' : 'in_review';

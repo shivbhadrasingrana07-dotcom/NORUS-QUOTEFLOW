@@ -1,10 +1,12 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
-import { pool } from '../src/db/index.ts';
 import {
   cleanupTestOrganizationsAndUsers,
+  closeTestDbPool,
   createMinimalValidPng,
+  isSafeTestDbConfigured,
   startIntegratedTestServer,
+  TEST_DB_SKIP_REASON,
   TestCookieClient,
   uniqueRunTag,
 } from './_helpers.ts';
@@ -17,10 +19,13 @@ after(async () => {
     orgIds: createdOrgIds,
     userIds: createdUserIds,
   });
-  await pool.end();
+  await closeTestDbPool();
 });
 
-test('Authentication lifecycle: register, verify email, password reset revokes sessions, Google Sign-In, sessions list & revoke, CSRF/CORS/headers & brute-force rate limit', async () => {
+test(
+  'Authentication lifecycle: register, verify email, password reset revokes sessions, Google Sign-In, sessions list & revoke, CSRF/CORS/headers & brute-force rate limit',
+  { skip: isSafeTestDbConfigured() ? false : TEST_DB_SKIP_REASON },
+  async () => {
   const srv = await startIntegratedTestServer({ authRateLimitMax: 4 });
   const tag = uniqueRunTag();
   const email = `auth-${tag}@example.com`;
@@ -217,7 +222,10 @@ test('Authentication lifecycle: register, verify email, password reset revokes s
   }
 });
 
-test('Multi-tenancy isolation, organization switching, last-owner protection, and cross-tenant document blocking', async () => {
+test(
+  'Multi-tenancy isolation, organization switching, last-owner protection, and cross-tenant document blocking',
+  { skip: isSafeTestDbConfigured() ? false : TEST_DB_SKIP_REASON },
+  async () => {
   const srv = await startIntegratedTestServer();
   const tag = uniqueRunTag();
 

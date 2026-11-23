@@ -269,8 +269,13 @@ test('extractQuotationWithGemini works offline with generateContentOverride and 
 });
 
 test(
-  'Live Gemini API extraction smoke test (requires GEMINI_API_KEY)',
-  { skip: !process.env.GEMINI_API_KEY },
+  'Live Gemini API extraction smoke test (requires RUN_LIVE_GEMINI_TESTS=true and GEMINI_API_KEY)',
+  {
+    skip:
+      process.env.RUN_LIVE_GEMINI_TESTS !== 'true' ||
+      !process.env.GEMINI_API_KEY ||
+      process.env.GEMINI_API_KEY === 'MY_GEMINI_API_KEY',
+  },
   async () => {
     const ws = createInitialWorkspaceState();
     const rfq = ws.rfqs[0];

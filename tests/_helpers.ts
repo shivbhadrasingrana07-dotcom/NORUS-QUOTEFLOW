@@ -5,11 +5,14 @@ import { AddressInfo } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { inArray } from 'drizzle-orm';
+import { drizzle } from 'drizzle-orm/node-postgres';
+import { Pool, type PoolConfig } from 'pg';
 import { createApp, type AppOptions } from '../server.ts';
 import { DevOutboxEmailProvider } from '../server/emailService.ts';
 import { LocalPrivateStorageProvider } from '../server/objectStorage.ts';
 import { MemoryRateLimitStore } from '../server/rateLimiter.ts';
-import { db } from '../src/db/index.ts';
+import type { DrizzleDb } from '../src/db/index.ts';
+import * as schema from '../src/db/schema.ts';
 import {
   auditLogs,
   awardAllocations,
@@ -29,6 +32,94 @@ import {
   suppliers,
   users,
 } from '../src/db/schema.ts';
+
+export const TEST_DB_SKIP_REASON =
+  'Skipped: disposable TEST_DATABASE_URL or TEST_SQL_* test database is not configured (managed Cloud SQL is never used for tests).';
+
+const FORBIDDEN_TEST_DB_NAMES = new Set([
+  'cloud_sql_development_database',
+  'prod',
+  'production',
+  'staging',
+]);
+
+function isUnsafeTestDbName(dbName: string): boolean {
+  const normalized = dbName.trim().toLowerCase();
+  if (!normalized) return true;
+  if (FORBIDDEN_TEST_DB_NAMES.has(normalized)) return true;
+  if (normalized.includes('cloud_sql_development')) return true;
+  if (normalized === 'postgres' || normalized.includes('production')) return true;
+  return false;
+}
+
+export function getSafeTestDbConfig(): PoolConfig | null {
+  const testUrl = process.env.TEST_DATABASE_URL?.trim();
+  if (testUrl) {
+    try {
+      const parsed = new URL(testUrl);
+      const dbName = parsed.pathname.replace(/^\/+/, '');
+      if (isUnsafeTestDbName(dbName)) {
+        return null;
+      }
+      return {
+        connectionString: testUrl,
+        max: 5,
+        connectionTimeoutMillis: 10000,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  const host = process.env.TEST_SQL_HOST?.trim();
+  const user = process.env.TEST_SQL_USER?.trim();
+  const password = process.env.TEST_SQL_PASSWORD;
+  const database = process.env.TEST_SQL_DB_NAME?.trim();
+  if (!host || !user || password === undefined || !database) {
+    return null;
+  }
+  if (isUnsafeTestDbName(database)) {
+    return null;
+  }
+  return {
+    host,
+    port: process.env.TEST_SQL_PORT ? Number(process.env.TEST_SQL_PORT) : 5432,
+    user,
+    password,
+    database,
+    ssl: process.env.TEST_SQL_SSL === 'true' ? { rejectUnauthorized: false } : undefined,
+    max: 5,
+    connectionTimeoutMillis: 10000,
+  };
+}
+
+export function isSafeTestDbConfigured(): boolean {
+  return getSafeTestDbConfig() !== null;
+}
+
+let cachedTestPool: Pool | null = null;
+let cachedTestDb: DrizzleDb | null = null;
+
+export function getTestDbAndPool(): { db: DrizzleDb; pool: Pool } {
+  const cfg = getSafeTestDbConfig();
+  if (!cfg) {
+    throw new Error(TEST_DB_SKIP_REASON);
+  }
+  if (!cachedTestPool || !cachedTestDb) {
+    cachedTestPool = new Pool(cfg);
+    cachedTestDb = drizzle(cachedTestPool, { schema }) as unknown as DrizzleDb;
+  }
+  return { db: cachedTestDb, pool: cachedTestPool };
+}
+
+export async function closeTestDbPool(): Promise<void> {
+  if (cachedTestPool) {
+    const toClose = cachedTestPool;
+    cachedTestPool = null;
+    cachedTestDb = null;
+    await toClose.end();
+  }
+}
 
 export class TestCookieClient {
   private readonly baseUrl: string;
@@ -110,11 +201,22 @@ export async function startIntegratedTestServer(overrides: Partial<AppOptions> =
   const storageProvider = new LocalPrivateStorageProvider(storageDir);
   const rateLimitStore = overrides.rateLimitStore ?? new MemoryRateLimitStore();
 
+  let dbForApp: DrizzleDb;
+  if (overrides.db) {
+    dbForApp = overrides.db;
+  } else if (isSafeTestDbConfigured()) {
+    dbForApp = getTestDbAndPool().db;
+  } else if (overrides.demoMode === true) {
+    dbForApp = {} as DrizzleDb;
+  } else {
+    throw new Error(TEST_DB_SKIP_REASON);
+  }
+
   let rejectNextMath = false;
 
   const app = await createApp({
     enableVite: false,
-    db,
+    db: dbForApp,
     storageProvider,
     emailProvider,
     rateLimitStore,
@@ -186,9 +288,18 @@ export async function cleanupTestOrganizationsAndUsers(params: {
   userIds?: string[];
   rateBucketKeys?: string[];
 }) {
+  if (!isSafeTestDbConfigured()) {
+    return;
+  }
   const orgIds = Array.from(new Set(params.orgIds || [])).filter(Boolean);
   const userIds = Array.from(new Set(params.userIds || [])).filter(Boolean);
   const rateBucketKeys = Array.from(new Set(params.rateBucketKeys || [])).filter(Boolean);
+
+  if (orgIds.length === 0 && userIds.length === 0 && rateBucketKeys.length === 0) {
+    return;
+  }
+
+  const { db } = getTestDbAndPool();
 
   if (rateBucketKeys.length > 0) {
     await db.delete(rateLimitBuckets).where(inArray(rateLimitBuckets.bucketKey, rateBucketKeys));

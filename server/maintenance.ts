@@ -12,11 +12,13 @@ import {
 } from '../src/db/schema.ts';
 import { logEvent } from './monitoring.ts';
 import type { ObjectStorageProvider } from './objectStorage.ts';
+import { redactSensitiveText } from './security.ts';
 
 export interface MaintenanceSummary {
   startedAt: string;
   durationMs: number;
   batchSize: number;
+  skippedBecauseLocked?: boolean;
   deletedSessions: number;
   expiredPendingInvitations: number;
   deletedTerminalInvitations: number;
@@ -27,6 +29,15 @@ export interface MaintenanceSummary {
   cleanedTempStorageFiles: number;
   errors: string[];
 }
+
+export interface AdvisoryLockPool {
+  connect(): Promise<{
+    query(text: string, values?: unknown[]): Promise<{ rows: Array<Record<string, unknown>> }>;
+    release(): void;
+  }>;
+}
+
+const MAINTENANCE_ADVISORY_LOCK_ID = 842910384721;
 
 const DEFAULT_BATCH_SIZE = 500;
 const REVOKED_SESSION_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -61,6 +72,7 @@ async function cleanStaleTempFiles(dir: string, cutoffMs: number): Promise<numbe
 export async function runScheduledMaintenance(params: {
   db: DrizzleDb;
   storageProvider: ObjectStorageProvider;
+  lockPool?: AdvisoryLockPool | null;
   localStorageDir?: string;
   batchSize?: number;
   now?: Date;
@@ -80,6 +92,48 @@ export async function runScheduledMaintenance(params: {
   let deletedExpiredRateBuckets = 0;
   let cleanedOrphanedDocuments = 0;
   let cleanedTempStorageFiles = 0;
+
+  const lockPool: AdvisoryLockPool | undefined =
+    params.lockPool === null
+      ? undefined
+      : params.lockPool ??
+        (params.db as unknown as { $client?: AdvisoryLockPool }).$client;
+
+  let lockClient: Awaited<ReturnType<AdvisoryLockPool['connect']>> | null = null;
+  if (lockPool && typeof lockPool.connect === 'function') {
+    const client = await lockPool.connect();
+    try {
+      const lockRes = await client.query(
+        'SELECT pg_try_advisory_lock($1) AS acquired',
+        [MAINTENANCE_ADVISORY_LOCK_ID]
+      );
+      const acquired = Boolean(lockRes.rows?.[0]?.acquired);
+      if (!acquired) {
+        client.release();
+        return {
+          startedAt: startedAt.toISOString(),
+          durationMs: Date.now() - startedAt.getTime(),
+          batchSize,
+          skippedBecauseLocked: true,
+          deletedSessions: 0,
+          expiredPendingInvitations: 0,
+          deletedTerminalInvitations: 0,
+          clearedExpiredVerificationTokens: 0,
+          clearedExpiredResetTokens: 0,
+          deletedExpiredRateBuckets: 0,
+          cleanedOrphanedDocuments: 0,
+          cleanedTempStorageFiles: 0,
+          errors: [],
+        };
+      }
+      lockClient = client;
+    } catch (err) {
+      client.release();
+      throw err;
+    }
+  }
+
+  try {
 
   // 1. Delete expired sessions or sessions revoked more than 7 days ago (bounded batch)
   try {
@@ -222,7 +276,15 @@ export async function runScheduledMaintenance(params: {
       .limit(batchSize);
 
     for (const doc of candidates) {
-      await params.storageProvider.deleteObject(doc.storageKey).catch(() => undefined);
+      try {
+        await params.storageProvider.deleteObject(doc.storageKey);
+      } catch (delErr) {
+        const msg = redactSensitiveText(
+          delErr instanceof Error ? delErr.message : String(delErr)
+        );
+        errors.push(`orphaned_documents(${doc.id}): ${msg}`);
+        continue;
+      }
       const removed = await params.db
         .delete(storedDocuments)
         .where(
@@ -240,7 +302,7 @@ export async function runScheduledMaintenance(params: {
       cleanedOrphanedDocuments += removed.length;
     }
   } catch (err) {
-    errors.push(`orphaned_documents: ${err instanceof Error ? err.message : String(err)}`);
+    errors.push(`orphaned_documents: ${redactSensitiveText(err instanceof Error ? err.message : String(err))}`);
   }
 
   // 6. Clean incomplete .tmp artifacts from local private storage (if applicable)
@@ -279,4 +341,17 @@ export async function runScheduledMaintenance(params: {
   });
 
   return summary;
+  } finally {
+    if (lockClient) {
+      try {
+        await lockClient.query('SELECT pg_advisory_unlock($1)', [
+          MAINTENANCE_ADVISORY_LOCK_ID,
+        ]);
+      } catch {
+        // Ignore unlock error if connection already closed
+      } finally {
+        lockClient.release();
+      }
+    }
+  }
 }

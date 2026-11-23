@@ -400,7 +400,7 @@ describe('Task 006/007: Temporary No-Login Demo Workspace & Security Isolation',
   });
 
   it('restores normal authentication gate and disables /api/demo-workspace when demoMode is false', async () => {
-    const srv = await startIntegratedTestServer({ demoMode: false });
+    const srv = await startIntegratedTestServer({ demoMode: false, db: {} as never });
     cleanups.push(() => srv.close());
 
     const meRes = await fetch(`${srv.baseUrl}/api/auth/me`);
@@ -663,5 +663,52 @@ describe('Task 006/007: Temporary No-Login Demo Workspace & Security Isolation',
     });
     const pdfBytes = Buffer.from(pdfDoc.output('arraybuffer'));
     assert.equal(pdfBytes.subarray(0, 5).toString('ascii'), '%PDF-');
+  });
+
+  it('Task 007: demo quotation extraction ignores GEMINI_API_KEY and stays 100% offline', async () => {
+    const prevGeminiKey = process.env.GEMINI_API_KEY;
+    process.env.GEMINI_API_KEY = 'AIzaSyFakeKeyThatMustNeverTriggerExternalCall';
+
+    const tempDemoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'norus-demo-offline-'));
+
+    // Ensure generateContentOverride is undefined (production/runtime path)
+    const app = await createApp({
+      enableVite: false,
+      demoMode: true,
+      db: {} as never,
+      storageProvider: new LocalPrivateStorageProvider(tempDemoDir),
+      emailProvider: new DevOutboxEmailProvider(),
+    });
+    const server = (await import('node:http')).default.createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as { port: number }).port;
+    const baseUrl = `http://127.0.0.1:${port}`;
+
+    try {
+      const form = new FormData();
+      form.append('supplierId', 'sup-demo-1');
+      form.append('rawEmailText', 'Ball Valve DN50: 40 pcs @ INR 4200 = 168000');
+
+      const res = await fetch(`${baseUrl}/api/demo-workspace/rfqs/demo-rfq-2026-101/quotes/extract`, {
+        method: 'POST',
+        headers: { 'X-Demo-Session': `offline-check-${uniqueRunTag()}` },
+        body: form,
+      });
+      assert.equal(res.status, 201);
+      const quote = (await res.json()) as {
+        quoteReference: string;
+        lines: Array<{ rawDescription: string }>;
+      };
+      assert.match(quote.quoteReference, /^DEMO-EXT-/);
+      assert.ok(quote.lines.some((l) => l.rawDescription.includes('(Demo Parsed)')));
+    } finally {
+      if (prevGeminiKey === undefined) delete process.env.GEMINI_API_KEY;
+      else process.env.GEMINI_API_KEY = prevGeminiKey;
+      await new Promise<void>((resolve, reject) => {
+        server.closeAllConnections?.();
+        server.close((err) => (err ? reject(err) : resolve()));
+      });
+      fs.rmSync(tempDemoDir, { recursive: true, force: true });
+    }
   });
 });

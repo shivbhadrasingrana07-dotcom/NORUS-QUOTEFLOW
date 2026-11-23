@@ -416,6 +416,8 @@ export default function App() {
     totalAwardedLanded: number;
     isNonL1: boolean;
     nonL1Justification: string;
+    acceptedAlternateLineIds?: string[];
+    commercialExceptionAccepted?: boolean;
   }) => {
     await apiJson(`${apiPrefix}/rfqs/${params.rfqId}/award`, {
       method: 'POST',

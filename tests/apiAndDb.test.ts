@@ -5,12 +5,15 @@ import os from 'node:os';
 import path from 'node:path';
 import { migrateLegacyJsonToPostgres } from '../server/legacyMigration.ts';
 import { LocalPrivateStorageProvider } from '../server/objectStorage.ts';
-import { db, pool } from '../src/db/index.ts';
 import type { WorkspaceState } from '../src/types.ts';
 import {
   cleanupTestOrganizationsAndUsers,
+  closeTestDbPool,
   createMinimalValidPng,
+  getTestDbAndPool,
+  isSafeTestDbConfigured,
   startIntegratedTestServer,
+  TEST_DB_SKIP_REASON,
   TestCookieClient,
   uniqueRunTag,
 } from './_helpers.ts';
@@ -27,11 +30,14 @@ after(async () => {
   for (const dir of tempDirs) {
     fs.rmSync(dir, { recursive: true, force: true });
   }
-  await pool.end();
+  await closeTestDbPool();
 });
 
-test('End-to-end PostgreSQL procurement workflow: auth, RFQ, duplicate GSTIN guard, file upload security, math gate, RBAC, price memory, deletion guard', async () => {
-  const srv = await startIntegratedTestServer();
+test(
+  'End-to-end PostgreSQL procurement workflow: auth, RFQ, duplicate GSTIN guard, file upload security, math gate, RBAC, price memory, deletion guard',
+  { skip: isSafeTestDbConfigured() ? false : TEST_DB_SKIP_REASON },
+  async () => {
+    const srv = await startIntegratedTestServer();
   const tag = uniqueRunTag();
 
   try {
@@ -284,8 +290,12 @@ test('End-to-end PostgreSQL procurement workflow: auth, RFQ, duplicate GSTIN gua
   }
 });
 
-test('Legacy JSON migration extracts inline Base64 attachments into private object storage, preserves source JSON, creates backup, and is idempotent', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'norus-mig-test-'));
+test(
+  'Legacy JSON migration extracts inline Base64 attachments into private object storage, preserves source JSON, creates backup, and is idempotent',
+  { skip: isSafeTestDbConfigured() ? false : TEST_DB_SKIP_REASON },
+  async () => {
+    const { db } = getTestDbAndPool();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'norus-mig-test-'));
   tempDirs.push(dir);
 
   const tag = uniqueRunTag();
@@ -434,6 +444,7 @@ test('Legacy JSON migration extracts inline Base64 attachments into private obje
     jsonPath,
     backupDir,
     dryRun: false,
+    confirmed: true,
     organizationIdOverride: orgId,
   });
 
@@ -450,6 +461,7 @@ test('Legacy JSON migration extracts inline Base64 attachments into private obje
     jsonPath,
     backupDir,
     dryRun: false,
+    confirmed: true,
     organizationIdOverride: orgId,
   });
   assert.equal(report2.integrityVerified, true);

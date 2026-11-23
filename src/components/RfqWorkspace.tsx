@@ -62,6 +62,8 @@ interface RfqWorkspaceProps {
     totalAwardedLanded: number;
     isNonL1: boolean;
     nonL1Justification: string;
+    acceptedAlternateLineIds: string[];
+    commercialExceptionAccepted: boolean;
   }) => Promise<void>;
   onDecideAward: (
     awardId: string,
@@ -116,19 +118,28 @@ export function RfqWorkspace({
     isNonL1: boolean;
   } | null>(null);
   const [nonL1Justification, setNonL1Justification] = useState('');
+  const [acceptedAlternateLineIds, setAcceptedAlternateLineIds] = useState<string[]>([]);
+  const [commercialExceptionAccepted, setCommercialExceptionAccepted] = useState(false);
   const [approverNotes, setApproverNotes] = useState('');
   const [awardBusy, setAwardBusy] = useState(false);
   const [awardError, setAwardError] = useState<string | null>(null);
   const [deletingQuoteId, setDeletingQuoteId] = useState<string | null>(null);
 
   const quotesSignature = quotes
-    .map((q) => `${q.id}:${q.totalLandedCost}:${q.isVerified}`)
+    .map(
+      (q) =>
+        `${q.id}:${q.totalLandedCost}:${q.isVerified}:${q.missingFreightWarning}:${q.lines
+          .map((l) => `${l.id}:${l.matchStatus}`)
+          .join(',')}`
+    )
     .join('|');
 
   // Reset per-RFQ transient state when switching RFQs
   useEffect(() => {
     setDraftAward(null);
     setNonL1Justification('');
+    setAcceptedAlternateLineIds([]);
+    setCommercialExceptionAccepted(false);
     setApproverNotes('');
     setAwardError(null);
     setUploadError(null);
@@ -138,6 +149,8 @@ export function RfqWorkspace({
   // Clear stale draft award simulation if underlying quote numbers/verification change
   useEffect(() => {
     setDraftAward(null);
+    setAcceptedAlternateLineIds([]);
+    setCommercialExceptionAccepted(false);
   }, [rfq.id, quotesSignature]);
 
   const existingAward = awards.find((a) => a.rfqId === rfq.id) || null;
@@ -191,39 +204,107 @@ export function RfqWorkspace({
 
   // Default award payload if user opens Approval tab directly (uses verified-complete L1 if available)
   const rankedQuotes = rankQuotations(quotes, 'landed');
-  const l1Quote = rankedQuotes.find((r) => r.rankIndex === 1)?.quotation || rankedQuotes[0]?.quotation;
+  const l1EligibleQuote = rankedQuotes.find((r) => r.rankIndex === 1)?.quotation || null;
   const effectiveDraft =
     draftAward ||
-    (l1Quote
+    (l1EligibleQuote
       ? {
           isSplitAward: false,
           allocations: rfq.items
             .map((item) => {
-              const line = l1Quote.lines.find((l) => l.rfqItemId === item.id);
-              if (!line || line.matchStatus === 'not_quoted' || !line.mathValid || line.normalizedUnitLanded === null) {
+              const line = l1EligibleQuote.lines.find((l) => l.rfqItemId === item.id);
+              if (
+                !line ||
+                line.matchStatus === 'not_quoted' ||
+                line.matchStatus === 'unmapped' ||
+                !line.mathValid ||
+                line.normalizedUnitLanded === null
+              ) {
                 return null;
               }
               return {
                 rfqItemId: item.id,
-                quotationId: l1Quote.id,
+                quotationId: l1EligibleQuote.id,
                 quotationLineId: line.id,
-                supplierId: l1Quote.supplierId,
+                supplierId: l1EligibleQuote.supplierId,
                 awardedQty: item.quantity,
                 awardedUnitLanded: line.normalizedUnitLanded,
               };
             })
             .filter((x): x is AwardAllocation => x !== null),
-          totalAwardedLanded: l1Quote.totalLandedCost,
+          totalAwardedLanded: l1EligibleQuote.totalLandedCost,
           isNonL1: false,
         }
       : null);
+
+  const selectedQuotesInDraft = effectiveDraft
+    ? Array.from(new Set(effectiveDraft.allocations.map((a) => a.quotationId)))
+        .map((id) => quotes.find((q) => q.id === id))
+        .filter((q): q is Quotation => Boolean(q))
+    : [];
+  const draftMissingFreightQuotes = selectedQuotesInDraft.filter((q) => q.missingFreightWarning);
+  const draftAlternateLines = effectiveDraft
+    ? effectiveDraft.allocations
+        .map((al) => {
+          const q = quotes.find((itemQ) => itemQ.id === al.quotationId);
+          const l = q?.lines.find((itemL) => itemL.id === al.quotationLineId);
+          if (!q || !l || l.matchStatus !== 'alternate_spec') return null;
+          return {
+            lineId: l.id,
+            description: l.rawDescription,
+            supplierName: getSupplierName(q.supplierId),
+          };
+        })
+        .filter((x): x is { lineId: string; description: string; supplierName: string } => Boolean(x))
+    : [];
+  const draftHasUnverifiedQuote = selectedQuotesInDraft.some((q) => !q.isVerified);
+  const draftIncompleteBom = Boolean(
+    effectiveDraft && effectiveDraft.allocations.length !== rfq.items.length
+  );
+  const draftRequiresJustification = Boolean(
+    effectiveDraft &&
+      (effectiveDraft.isNonL1 ||
+        draftMissingFreightQuotes.length > 0 ||
+        draftAlternateLines.length > 0)
+  );
+  const allDraftAlternatesAccepted = draftAlternateLines.every((a) =>
+    acceptedAlternateLineIds.includes(a.lineId)
+  );
+  const draftSubmitBlocked = Boolean(
+    draftHasUnverifiedQuote ||
+      draftIncompleteBom ||
+      (draftMissingFreightQuotes.length > 0 && !commercialExceptionAccepted) ||
+      (draftAlternateLines.length > 0 && !allDraftAlternatesAccepted)
+  );
 
   const handleRecommendSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!effectiveDraft) return;
     setAwardError(null);
-    if (effectiveDraft.isNonL1 && !nonL1Justification.trim()) {
-      setAwardError('Non-L1 justification is mandatory because selected award exceeds L1 lowest landed cost.');
+    if (draftHasUnverifiedQuote) {
+      setAwardError('All quotations included in an award must be verified in Extraction Review.');
+      return;
+    }
+    if (draftIncompleteBom) {
+      setAwardError('Award recommendation must cover 100% of RFQ items.');
+      return;
+    }
+    if (draftMissingFreightQuotes.length > 0 && !commercialExceptionAccepted) {
+      setAwardError(
+        'Confirm freight terms in Extraction Review or accept the commercial exception before submitting.'
+      );
+      return;
+    }
+    if (draftAlternateLines.length > 0 && !allDraftAlternatesAccepted) {
+      setAwardError(
+        'Explicitly accept all alternate-specification line items before submitting.'
+      );
+      return;
+    }
+    if (draftRequiresJustification && !nonL1Justification.trim()) {
+      setAwardError(
+        'Written award justification is mandatory for non-L1, alternate-spec, or commercial-exception awards.'
+      );
       return;
     }
     try {
@@ -232,6 +313,8 @@ export function RfqWorkspace({
         rfqId: rfq.id,
         ...effectiveDraft,
         nonL1Justification,
+        acceptedAlternateLineIds,
+        commercialExceptionAccepted,
       });
     } catch (err) {
       setAwardError(err instanceof Error ? err.message : 'Failed to submit recommendation');
@@ -841,13 +924,73 @@ export function RfqWorkspace({
                   )}
                 </div>
 
+                {draftMissingFreightQuotes.length > 0 && (
+                  <div className="p-3 bg-[#FFFBEB] border border-[#FDE68A] rounded-md space-y-2 text-xs text-[#92400E]">
+                    <div className="font-semibold flex items-center gap-1.5">
+                      <AlertTriangle className="w-4 h-4 text-[#D97706]" />
+                      <span>
+                        Unconfirmed Freight / Commercial Terms on{' '}
+                        {draftMissingFreightQuotes.map((q) => q.quoteReference).join(', ')}
+                      </span>
+                    </div>
+                    <label className="flex items-start gap-2 cursor-pointer text-[#0F172A]">
+                      <input
+                        type="checkbox"
+                        checked={commercialExceptionAccepted}
+                        onChange={(e) => setCommercialExceptionAccepted(e.target.checked)}
+                        className="mt-0.5 rounded border-[#CBD5E1]"
+                      />
+                      <span>
+                        Acknowledge commercial exception (Freight To-Pay / unconfirmed) with written justification below
+                      </span>
+                    </label>
+                  </div>
+                )}
+
+                {draftAlternateLines.length > 0 && (
+                  <div className="p-3 bg-[#FFFBEB] border border-[#FDE68A] rounded-md space-y-2 text-xs text-[#92400E]">
+                    <div className="font-semibold flex items-center gap-1.5">
+                      <AlertTriangle className="w-4 h-4 text-[#D97706]" />
+                      <span>Alternate Specifications Included in Recommendation</span>
+                    </div>
+                    <div className="space-y-1.5">
+                      {draftAlternateLines.map((alt) => (
+                        <label
+                          key={alt.lineId}
+                          className="flex items-start gap-2 cursor-pointer text-[#0F172A]"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={acceptedAlternateLineIds.includes(alt.lineId)}
+                            onChange={(e) =>
+                              setAcceptedAlternateLineIds((prev) =>
+                                e.target.checked
+                                  ? [...prev, alt.lineId]
+                                  : prev.filter((id) => id !== alt.lineId)
+                              )
+                            }
+                            className="mt-0.5 rounded border-[#CBD5E1]"
+                          />
+                          <span>
+                            Accept alternate spec from <strong>{alt.supplierName}</strong>:{' '}
+                            {alt.description}
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
                 <div>
                   <label className="block text-xs font-medium text-[#475569] mb-1">
-                    Award Justification {effectiveDraft.isNonL1 ? '(Mandatory for Non-L1)' : '(Optional)'}
+                    Award Justification{' '}
+                    {draftRequiresJustification
+                      ? '(Mandatory for Non-L1 / Exceptions)'
+                      : '(Optional)'}
                   </label>
                   <textarea
                     rows={3}
-                    required={effectiveDraft.isNonL1}
+                    required={draftRequiresJustification}
                     value={nonL1Justification}
                     onChange={(e) => setNonL1Justification(e.target.value)}
                     placeholder="e.g., L1 has 14-day lead time and missing freight terms; recommended supplier offers Net 30 and complete BOM coverage."
@@ -857,7 +1000,7 @@ export function RfqWorkspace({
 
                 <button
                   type="submit"
-                  disabled={awardBusy}
+                  disabled={awardBusy || draftSubmitBlocked}
                   className="px-4 py-2 text-sm font-medium text-white bg-[#0F4C81] rounded-lg hover:bg-[#0A365C] disabled:opacity-50 flex items-center gap-2"
                 >
                   <ClipboardCheck className="w-4 h-4" />
@@ -866,7 +1009,7 @@ export function RfqWorkspace({
               </form>
             ) : (
               <div className="text-sm text-[#475569]">
-                Upload and review supplier quotations before submitting an award decision.
+                Verify at least one complete (100% BOM), commercially confirmed quotation—or configure a verified Split Award in the Compare Matrix—before submitting an award decision.
               </div>
             )}
           </div>

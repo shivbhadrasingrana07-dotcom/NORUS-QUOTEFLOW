@@ -1,22 +1,28 @@
 # Next Task — External Secrets, Domain Setup & Commercial Pilot Rollout
 
-## Completed Through Task 007
-- Dual server-verified authentication (Email/Password + hardened Google Sign-In with `openid`/`email`/`profile`, `FIREBASE_CHECK_REVOKED` opt-in, `aud`/`iss` validation, and verified-email linking guard).
-- Cloud SQL PostgreSQL 18.6 (`asia-southeast1`) with 17 relational tables, verified constraints/indexes, and migrated `org-kalyani-hydraulics` data (`data/quoteflow-db.json` preserved).
-- Safe first-owner bootstrap tooling (`npm run org:bootstrap-owner`), idempotent scheduled maintenance (`npm run ops:maintenance`), operational monitoring (`/api/health`, `/api/health/ready`, `X-Request-Id`, `ERROR_WEBHOOK_URL`), Task 006/007 hardened isolated synthetic demo mode (auto-disabled & fail-closed in production, zero-PG bounded rate limiters, genuine PDF/Excel sample previews), and comprehensive automated tests.
+## Completed Through Task 007 Stabilization
+- Dual server-verified authentication (Email/Password + hardened Google Sign-In with `openid`/`email`/`profile`, `FIREBASE_CHECK_REVOKED` opt-in, `aud`/`iss` validation, real `isGoogleAuthConfigured()` check, 10-session cap per user, and verified-email linking guard).
+- Composite same-organization SQL integrity migration authored & CI-wired (`drizzle/0001_tenant_integrity.sql` + preflight + rollback), row-locked bootstrap/award concurrency guards (`FOR UPDATE` + atomic `WHERE approval_status = 'pending'`), and `--confirm` + storage-rollback legacy migration safeguards.
+- Shared server/client award validation (`src/lib/awardValidation.ts`) enforcing freight-terms & `alternate_spec` acceptance gates, isolated offline-only demo quotation extraction, trusted-proxy IP rate limiting (`req.ip`), S3 `AbortController` timeouts, and advisory-locked maintenance.
+- Disposable test DB guard (`TEST_DATABASE_URL` / `TEST_SQL_*`), `RUN_LIVE_GEMINI_TESTS=true` gating, unit stabilization tests, and `.github/workflows/ci.yml`.
 
-## Remaining External Setup Actions Before Public Launch
+## Remaining Actions Before Public Launch
 
 0. **Exit Demo Mode & Restore Full Authentication:**
-   - In `NODE_ENV=production`, demo mode is **OFF by default** (and setting `DEMO_MODE=true` fails closed on boot). For local/staging auth testing in non-production environments, set `DEMO_MODE="false"` in `.env` and restart the server. This disables `/api/demo-workspace*` (`410 Gone`) and activates `AuthView` (Google Sign-In + Email/Password login, registration, email verification, password reset) and `OrganizationView` (team & org switching).
-1. **Link Founder Account to `org-kalyani-hydraulics`:**
+   - In `NODE_ENV=production`, demo mode is **OFF by default** (and setting `DEMO_MODE=true` fails closed on boot). For local/staging auth testing in non-production environments, set `DEMO_MODE="false"` in `.env` and restart the server. This disables `/api/demo-workspace*` (`410 Gone`) and activates `AuthView` and `OrganizationView`.
+1. **Apply Tenant Integrity Migration to Cloud SQL (Maintenance Window):**
+   - Take a Cloud SQL on-demand backup, run `psql -v ON_ERROR_STOP=1 -f drizzle/0001_tenant_integrity_preflight.sql` to verify zero legacy orphan/duplicate anomalies, then apply `drizzle/0001_tenant_integrity.sql` (keep `0001_tenant_integrity_rollback.sql` on standby).
+2. **Execute Live Disposable PostgreSQL, Live Gemini & Browser UI Verification:**
+   - Run the CI workflow (`.github/workflows/ci.yml`) or run `TEST_SQL_*` + `RUN_LIVE_GEMINI_TESTS=true GEMINI_API_KEY="..." npm test` against a disposable PostgreSQL 15+ instance.
+   - Perform manual/Playwright browser smoke testing across Extraction Review freight checkbox, Comparison Matrix award blocks, Approval commercial-exception / alternate-spec checkboxes, and PDF/XLSX downloads.
+3. **Link Founder Account to `org-kalyani-hydraulics`:**
    - Run `npm run org:bootstrap-owner -- --org-id=org-kalyani-hydraulics --issue-token --email="<founder-email>"` (or `--claim-direct`) once the authorized founder email is ready to take ownership.
-2. **Provision Production Runtime Secrets & Managed Services:**
+4. **Provision Production Runtime Secrets, Managed Services & Dependency Hygiene:**
    - Configure `SESSION_SECRET` (>= 32 random chars), live `GEMINI_API_KEY`, `RESEND_API_KEY` + verified `EMAIL_FROM` DNS (`SPF`/`DKIM`), `STORAGE_PROVIDER=s3` credentials (Cloudflare R2 or AWS S3 private bucket), and `APP_URL` / `ALLOWED_ORIGINS`.
    - Add staging & production domains to **Firebase Authentication → Settings → Authorized Domains**.
    - Enable Cloud SQL automated daily backups + 7-day PITR on an Enterprise tier instance before onboarding paying customers.
-   - Re-run `GEMINI_API_KEY="..." npm test` in CI/staging to verify live Gemini extraction alongside the offline suite.
-3. **Post-MVP Product Enhancements:**
+   - Optionally align `esbuild` version range (`^0.27.0`/`^0.28.0`) with `vite@8.3.x` when regenerating `package-lock.json` so `npm ci` runs without `--legacy-peer-deps`.
+5. **Post-MVP Product Enhancements:**
    - Multi-round revised quotation comparison (`Rev 1` vs. `Rev 2` negotiation deltas).
    - Inbound email/WhatsApp forwarding webhook to route supplier replies directly into an RFQ queue.
    - Organization-configurable dual-approval spend thresholds.

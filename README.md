@@ -10,20 +10,20 @@ It ingests non-standard vendor quotations across PDF, Excel (`.xlsx`/`.xls`), CS
 
 ## Implemented Capabilities
 
-1. **Multi-Organization SaaS Auth & Session Security** — Dual real authentication: Firebase Google Sign-In (`firebase` + `firebase-admin` server-side ID token verification with `openid`/`email`/`profile` scopes, Google X.509 certificate signature + `aud`/`iss` validation, optional `FIREBASE_CHECK_REVOKED=true`, and verified-email account-linking guard) and app-managed email/password accounts (`scrypt` hashing, email verification, password reset that revokes active sessions, revocable PostgreSQL sessions with `HttpOnly` cookies, and CSRF validation).
-2. **Organization Isolation, 5-Role RBAC & Safe First-Owner Bootstrap** — Strictly tenant-scoped PostgreSQL persistence (`organizationId` enforced on every query and mutation) with `owner`, `admin`, `buyer`, `approver`, and `viewer` roles, team invitations, last-owner protection, multi-org switching, and transactional first-owner bootstrap CLI (`npm run org:bootstrap-owner`) for migrated owner-less tenants.
-3. **Private Object Storage & Signed Previews** — Uploaded PDFs/images stored outside the public webroot (`S3CompatibleStorageProvider` via AWS SigV4 or `LocalPrivateStorageProvider` under `data/private-storage/`) with short-lived HMAC/SigV4 signed download URLs and storage readiness probes.
-4. **Operational Monitoring & Scheduled Maintenance** — Correlation IDs (`X-Request-Id`), redacted structured JSON logs, webhook error-tracking hook (`ERROR_WEBHOOK_URL`), split liveness (`GET /api/health`) vs. dependency readiness (`GET /api/health/ready`), and idempotent bounded-batch cleanup (`npm run ops:maintenance` + optional `MAINTENANCE_INTERVAL_MINUTES` background interval).
+1. **Multi-Organization SaaS Auth & Session Security** — Dual real authentication: Firebase Google Sign-In (`firebase` + `firebase-admin` server-side ID token verification with `openid`/`email`/`profile` scopes, Google X.509 certificate signature + `aud`/`iss` validation, opt-in `FIREBASE_CHECK_REVOKED=true`, real config-checked `googleAuthConfigured` readiness, and verified-email account-linking guard) and app-managed email/password accounts (`scrypt` hashing, email verification, password reset that revokes active sessions, revocable PostgreSQL sessions capped at 10 active sessions/user with `HttpOnly` cookies, and CSRF validation).
+2. **Organization Isolation, 5-Role RBAC & Safe First-Owner Bootstrap** — Strictly tenant-scoped PostgreSQL persistence (`organizationId` enforced on every query/mutation plus composite same-org FK/index hardening in `drizzle/0001_tenant_integrity.sql`), `owner`/`admin`/`buyer`/`approver`/`viewer` roles, team invitations, last-owner protection, multi-org switching, and transactional `FOR UPDATE` locked first-owner bootstrap CLI (`npm run org:bootstrap-owner`).
+3. **Private Object Storage & Signed Previews** — Uploaded PDFs/images stored outside the public webroot (`S3CompatibleStorageProvider` via AWS SigV4 with `AbortController` timeouts or `LocalPrivateStorageProvider` under `data/private-storage/`) with short-lived HMAC/SigV4 signed download URLs and storage readiness probes.
+4. **Operational Monitoring & Scheduled Maintenance** — Correlation IDs (`X-Request-Id`), redacted structured JSON logs, webhook error-tracking hook (`ERROR_WEBHOOK_URL`), split liveness (`GET /api/health`) vs. dependency readiness (`GET /api/health/ready`), trusted-proxy IP rate limiting (`req.ip`), and PostgreSQL advisory-locked bounded-batch cleanup (`npm run ops:maintenance`).
 5. **Command Center Dashboard** — Active RFQ queue, pending approvals, verified savings across complete bids, and item price memory alerts.
 6. **RFQ Creation & BOM Import** — Sequential `RFQ-YYYY-XXXX` creation per organization, multi-line BOM entry, CSV/clipboard BOM paste, and catalog auto-linking.
 7. **Supplier Invitation Copy Generator** — Ready-to-send email/WhatsApp RFQ invitation text for selected suppliers.
 8. **Multi-Format Quotation Ingestion** — PDF, Excel, CSV, image uploads (up to 25 MB, magic-byte validated), plus email/WhatsApp text paste.
-9. **Gemini Structured Extraction** — Server-side extraction using `@google/genai` (`gemini-4-hydrogen`) with strict JSON schema, timeout/retry handling, and zero-fabrication rules.
-10. **Deterministic Arithmetic Audit** — Server-side verification of `qty × rate - discount` (pre-tax and post-tax) within `max(1.5, 0.5%)` tolerance, blocking verification if discrepancies remain.
-11. **Source-Document Traceability** — Split-screen audit workbench linking extracted values to private signed PDF/image previews, spreadsheet sheet/cell coordinates, or text snippets.
+9. **Gemini Structured Extraction (Isolated From Demo)** — Authenticated organizations use server-side `@google/genai` (`gemini-4-hydrogen`) extraction with strict JSON schema and zero-fabrication rules; non-production demo mode runs exclusively offline (`extractDemoQuotationOffline`) and never invokes `GEMINI_API_KEY`.
+10. **Deterministic Arithmetic Audit** — Server-side verification of `qty × rate - discount` (pre-tax and post-tax) within `max(1.5, 0.5%)` tolerance, resetting `isVerified` on header edits and blocking verification if discrepancies remain.
+11. **Source-Document Traceability** — Split-screen audit workbench linking extracted values to private signed PDF/image previews, spreadsheet sheet/cell coordinates, or text snippets, with explicit freight/commercial terms confirmation.
 12. **Commercial & Tax Normalization** — UOM conversion multipliers, tax-inclusive vs. tax-exclusive unwinding, creditable vs. non-creditable tax (ITC/VAT), pro-rata freight/P&F/discount allocation, and FX conversion.
-13. **Side-by-Side Comparison Matrix & Split Award** — Normalized `L1`/`L2`/`L3` ranking strictly across 100%-complete, math-valid, human-verified quotes (`src/lib/ranking.ts`), plus per-line split-award simulation.
-14. **Approval Workflow, Item Price Memory & Exports** — Mandatory non-L1 justification, server-enforced approval RBAC, immutable audit trail, automatic Item Price Memory updates, and landscape PDF + 4-sheet Excel exports.
+13. **Side-by-Side Comparison Matrix & Split Award** — Normalized `L1`/`L2`/`L3` ranking strictly across 100%-complete, math-valid, human-verified, freight-confirmed, alternate-reviewed quotes (`src/lib/ranking.ts`), plus per-line split-award simulation.
+14. **Procurement Integrity & Approval Exports** — Shared server/client award validation (`src/lib/awardValidation.ts`), mandatory non-L1 justification, explicit commercial-exception & alternate-spec acceptance gates, row-locked atomic approval decisions, append-only audit trail (application-enforced), Item Price Memory updates, and landscape PDF + 4-sheet Excel exports.
 
 ## Tech Stack
 
@@ -37,15 +37,16 @@ It ingests non-standard vendor quotations across PDF, Excel (`.xlsx`/`.xls`), CS
 
 1. **Install dependencies:**
    ```bash
-   npm install
+   npm install # In clean CI / strict lockfile runs, use: npm ci --legacy-peer-deps (esbuild@^0.25.0 vs vite@8.3.x peer range)
    ```
 2. **Configure environment (see [Configuration Reference](docs/CONFIGURATION.md)):**
    Set PostgreSQL connection variables (`SQL_HOST`, `SQL_USER`, `SQL_PASSWORD`, `SQL_DB_NAME`), `SESSION_SECRET` (>= 32 chars, required in production), and `GEMINI_API_KEY` (required for live AI extraction).
-3. **Push Drizzle schema & inspect/bootstrap migrated organization ownership:**
+3. **Apply SQL migrations & inspect/bootstrap migrated organization ownership:**
    ```bash
-   npx drizzle-kit push
+   psql ... -v ON_ERROR_STOP=1 -f drizzle/0000_illegal_major_mapleleaf.sql
+   psql ... -v ON_ERROR_STOP=1 -f drizzle/0001_tenant_integrity.sql
    npm run db:migrate -- --dry-run
-   npm run db:migrate -- --apply
+   npm run db:migrate -- --apply --confirm
    npm run org:bootstrap-owner -- --inspect --org-id=org-kalyani-hydraulics
    ```
 4. **Run development server or scheduled maintenance:**
@@ -57,7 +58,7 @@ It ingests non-standard vendor quotations across PDF, Excel (`.xlsx`/`.xls`), CS
 5. **Verify types, tests, and production build:**
    ```bash
    npm run lint
-   npm test
+   npm test          # Live PG tests require disposable TEST_DATABASE_URL or TEST_SQL_*; live Gemini requires RUN_LIVE_GEMINI_TESTS=true
    npm run build
    ```
 
