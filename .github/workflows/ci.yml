@@ -83,6 +83,7 @@ jobs:
     env:
       NODE_ENV: development
       DEMO_MODE: 'true'
+      DISABLE_HMR: 'true'
       PORT: '3000'
       SESSION_SECRET: ci-e2e-demo-session-secret-0123456789abcdef0123456789abcdef
 
@@ -115,12 +116,13 @@ jobs:
           trap cleanup EXIT
 
           READY=0
-          for i in $(seq 1 40); do
+          for i in $(seq 1 45); do
             if ! kill -0 "$SERVER_PID" 2>/dev/null; then
               echo "Demo server process exited unexpectedly before healthcheck."
+              cat /tmp/norus-e2e-server.log || true
               exit 1
             fi
-            if curl -fsS --max-time 5 http://127.0.0.1:3000/api/health > /dev/null; then
+            if curl -sf --max-time 5 http://127.0.0.1:3000/api/health > /dev/null; then
               READY=1
               break
             fi
@@ -129,6 +131,7 @@ jobs:
 
           if [ "$READY" -ne 1 ]; then
             echo "Timed out waiting for DEMO_MODE server healthcheck."
+            cat /tmp/norus-e2e-server.log || true
             exit 1
           fi
 

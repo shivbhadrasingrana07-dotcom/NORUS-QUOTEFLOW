@@ -14,10 +14,10 @@ npm run build
 **Disposable Test Database Guard (`tests/_helpers.ts`):** All PostgreSQL integration tests refuse Unix socket/`/cloudsql/` hosts, managed Cloud SQL (`cloud_sql_development_database`), production/staging names (`prod`, `production`, `staging`, `postgres`), and live `SQL_HOST`+`SQL_DB_NAME` overlap (except `NODE_ENV=test` local CI loopback hosts `127.0.0.1`/`localhost`/`::1`/`postgres` targeting `*_test`/`*-test` databases). Live database tests run **only** when `TEST_DATABASE_URL` or `TEST_SQL_*` (`TEST_SQL_HOST`, `TEST_SQL_USER`, `TEST_SQL_PASSWORD`, `TEST_SQL_DB_NAME`, `TEST_SQL_SSL`, `TEST_SQL_SSL_CA`, `TEST_SQL_SSL_ALLOW_SELF_SIGNED`) points to a disposable PostgreSQL test database; when unset, PG-dependent tests skip explicitly while unit and demo isolation tests execute normally. In CI (`.github/workflows/ci.yml`), a temporary PostgreSQL 16 service (`quoteflow_test`) runs `drizzle/0000_illegal_major_mapleleaf.sql`, `drizzle/0001_tenant_integrity_preflight.sql`, `drizzle/0001_tenant_integrity.sql`, `drizzle/0001_tenant_integrity_rollback.sql`, and re-applies `drizzle/0001_tenant_integrity.sql` before running `npm test`.
 
 ### Headless Browser E2E (`tests/browserE2E.mjs`)
-Executed automatically in CI's isolated `browser-e2e` job (`DEMO_MODE=true`, zero database credentials):
+Executed automatically in CI's isolated `browser-e2e` job (`DEMO_MODE=true`, `DISABLE_HMR=true`, zero database credentials):
 ```bash
 npm install --no-save playwright && npx playwright install --with-deps chromium
-DEMO_MODE=true NODE_ENV=development npx tsx server.ts &
+DEMO_MODE=true NODE_ENV=development DISABLE_HMR=true npx tsx server.ts &
 node tests/browserE2E.mjs
 ```
 
@@ -33,9 +33,9 @@ One test in `tests/extractionValidation.test.ts` (`Live Gemini API extraction sm
 RUN_LIVE_GEMINI_TESTS=true GEMINI_API_KEY="your-key" npm test
 ```
 
-## Latest Verification Scope (Task 010)
-- **VERIFIED (Local Sandbox):** `npm ci --dry-run` (exits `0` without `--legacy-peer-deps`), `npm run lint` (`tsc --noEmit`), `npm run build` (`vite build`), `npm audit --json`, and `45` offline passing tests (`0` failing, `13` skipped) covering hardened ZIP container LFH/CD parity/encryption/backslash/overlap rejection + TSV/`65,536`-char cell limits + isolated subprocess bounds (`tests/extractionValidation.test.ts`), `1e-6` award precision, Kahan split-total summation & multi-supplier item splits (`tests/stabilizationUnit.test.ts`), HTTP macro `415` + split-item precision (`tests/demoWorkspace.test.ts`), normalization, and PDF/XLSX exports (`tests/exporters.test.ts`).
-- **IMPLEMENTED — NOT VERIFIED in Current Sandbox:** `.github/workflows/ci.yml` (hardened with `permissions: contents: read`, fail-fast server PID checks, `verify` migration/rollback cycle, and isolated `browser-e2e` job) and `tests/browserE2E.mjs` require GitHub Actions / Chromium / Playwright runtime absent in this container.
+## Latest Verification Scope (Task 010.1)
+- **VERIFIED (Local Sandbox):** Direct `npx tsx server.ts` live process boot in `DEMO_MODE=true` (`NODE_ENV=development`, `DISABLE_HMR=true`, HTTP `200` on `/api/health`, `/api/auth/me`, `/api/demo-workspace`, signed PDF preview `/api/demo-workspace/documents/.../content`, `PATCH` line mismatch fix, `POST /verify`, and `/`), fail-closed `exit 1` on `NODE_ENV=production DEMO_MODE=true`, `npm run lint` (`tsc --noEmit`), `npm run build` (`vite build`), and `46` offline passing tests (`0` failing, `13` skipped) including the new direct-server startup regression test in `tests/demoWorkspace.test.ts`.
+- **IMPLEMENTED — NOT VERIFIED in Current Sandbox:** `.github/workflows/ci.yml` (`browser-e2e` job with `DISABLE_HMR=true`, silent readiness polling, fail-fast PID + server log diagnostics, and `verify` PG migration/rollback cycle) and `tests/browserE2E.mjs` require GitHub Actions / Chromium / Playwright runtime (`playwright` and Chromium are verified absent in this container).
 - **BLOCKED in Current Container (Requires External PostgreSQL 15+ / API Key):**
   - Disposable PostgreSQL integration & concurrency suites (`12` skipped tests across `tests/apiAndDb.test.ts`, `tests/authAndMultiTenancy.test.ts`, `tests/e2eWorkflow.test.ts`, `tests/opsAndMonitoring.test.ts`, and `tests/objectStorageAndRateLimit.test.ts`) and live `psql` execution of `0001_tenant_integrity*.sql` / rollback require `TEST_DATABASE_URL` or `TEST_SQL_*` against PostgreSQL 15+ (`docker` and `psql` are absent in this sandbox).
   - Live Gemini API smoke test (`1` skipped test in `tests/extractionValidation.test.ts`) requires `RUN_LIVE_GEMINI_TESTS=true` and `GEMINI_API_KEY`.

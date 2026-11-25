@@ -52,11 +52,12 @@ async function runBrowserE2E() {
     // Confirm no login screen appears
     assert.equal(await page.getByText('Continue with Google').count(), 0);
 
-    // 2. Open DEMO-RFQ-2026-101 into Comparison Matrix
-    await page.getByText('DEMO-RFQ-2026-101').first().click();
-    await page.getByText('Sample Batch — SS316L Process Valves & Flange Hardware (Demo)').waitFor({
-      state: 'visible',
-    });
+    // 2. Open DEMO-RFQ-2026-101 into Comparison Matrix via its clickable table row
+    await page.locator('tbody tr', { hasText: 'DEMO-RFQ-2026-101' }).click();
+    await page
+      .getByRole('heading', { name: 'Sample Batch — SS316L Process Valves & Flange Hardware (Demo)' })
+      .waitFor({ state: 'visible' });
+    await page.getByRole('button', { name: 'Compare Matrix' }).waitFor({ state: 'visible' });
 
     // Assert exclusion indicators and cost basis toggling in Comparison Matrix
     await page.getByText(/Freight To-Pay/i).first().waitFor({ state: 'visible' });

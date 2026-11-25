@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { after, describe, it } from 'node:test';
@@ -1094,6 +1096,128 @@ describe('Task 006/007: Temporary No-Login Demo Workspace & Security Isolation',
     assert.equal(splitRes.status, 201);
     const createdSplitAward = (await splitRes.json()) as AwardDecision;
     assert.equal(createdSplitAward.allocations.length, 2);
+  });
+
+  it('Task 010.1: direct server.ts process starts and serves DEMO_MODE health/auth/workspace/HTML without SQL and exits non-zero on invalid prod DEMO_MODE', async () => {
+    const findFreePort = () =>
+      new Promise<number>((resolve, reject) => {
+        const srv = net.createServer();
+        srv.unref();
+        srv.on('error', reject);
+        srv.listen(0, '127.0.0.1', () => {
+          const addr = srv.address();
+          const port = typeof addr === 'object' && addr ? addr.port : 0;
+          srv.close((err) => (err ? reject(err) : resolve(port)));
+        });
+      });
+
+    const port = await findFreePort();
+    const tsxCli = path.resolve(process.cwd(), 'node_modules', 'tsx', 'dist', 'cli.mjs');
+    const cleanEnv = {
+      PATH: process.env.PATH || '',
+      HOME: process.env.HOME || '',
+      NODE_ENV: 'development',
+      DEMO_MODE: 'true',
+      DISABLE_HMR: 'true',
+      PORT: String(port),
+      SESSION_SECRET: 'task0101-e2e-startup-test-secret-0123456789abcdef',
+    };
+
+    const child = spawn(process.execPath, [tsxCli, 'server.ts'], {
+      cwd: process.cwd(),
+      env: cleanEnv,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let logs = '';
+    child.stdout.on('data', (d) => {
+      logs += d.toString();
+    });
+    child.stderr.on('data', (d) => {
+      logs += d.toString();
+    });
+
+    try {
+      let ready = false;
+      const deadline = Date.now() + 25_000;
+      while (Date.now() < deadline) {
+        if (child.exitCode !== null) {
+          throw new Error(`server.ts exited early (${child.exitCode}): ${logs}`);
+        }
+        try {
+          const res = await fetch(`http://127.0.0.1:${port}/api/health`);
+          if (res.ok) {
+            ready = true;
+            break;
+          }
+        } catch {
+          // Wait until listening
+        }
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      assert.equal(ready, true, `Timed out waiting for direct server.ts startup. Logs:\n${logs}`);
+
+      const authRes = await fetch(`http://127.0.0.1:${port}/api/auth/me`);
+      assert.equal(authRes.status, 200);
+      const authJson = (await authRes.json()) as { demoMode: boolean };
+      assert.equal(authJson.demoMode, true);
+
+      const wsRes = await fetch(`http://127.0.0.1:${port}/api/demo-workspace`);
+      assert.equal(wsRes.status, 200);
+      const wsJson = (await wsRes.json()) as {
+        rfqs: Array<{ rfqNumber: string }>;
+        quotations: Array<{ rfqId: string; missingFreightWarning: boolean }>;
+      };
+      assert.ok(wsJson.rfqs.some((r) => r.rfqNumber === 'DEMO-RFQ-2026-101'));
+      assert.ok(
+        wsJson.quotations.some(
+          (q) => q.rfqId === 'demo-rfq-2026-101' && q.missingFreightWarning === true
+        )
+      );
+
+      const htmlRes = await fetch(`http://127.0.0.1:${port}/`);
+      assert.equal(htmlRes.status, 200);
+      const html = await htmlRes.text();
+      assert.match(html, /NORUS QUOTEFLOW/);
+    } finally {
+      if (child.exitCode === null) {
+        child.kill('SIGTERM');
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(() => {
+            child.kill('SIGKILL');
+            resolve();
+          }, 5_000);
+          child.once('exit', () => {
+            clearTimeout(timer);
+            resolve();
+          });
+        });
+      }
+    }
+
+    // Confirm invalid production DEMO_MODE=true fails closed and exits cleanly with code 1
+    const failExit = await new Promise<{ code: number | null; out: string }>((resolve) => {
+      const badChild = spawn(process.execPath, [tsxCli, 'server.ts'], {
+        cwd: process.cwd(),
+        env: {
+          ...cleanEnv,
+          NODE_ENV: 'production',
+          DEMO_MODE: 'true',
+          PORT: String(port),
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let out = '';
+      badChild.stdout.on('data', (d) => {
+        out += d.toString();
+      });
+      badChild.stderr.on('data', (d) => {
+        out += d.toString();
+      });
+      badChild.once('exit', (code) => resolve({ code, out }));
+    });
+    assert.equal(failExit.code, 1);
+    assert.match(failExit.out, /server_startup_failed|DEMO_MODE=true is forbidden/i);
   });
 });
 

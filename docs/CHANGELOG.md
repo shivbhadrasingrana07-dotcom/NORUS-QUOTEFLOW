@@ -1,5 +1,11 @@
 # Changelog
 
+## Task 010.1 — Browser E2E Failure Diagnosis & Repair
+
+### Fixed
+- **Browser E2E RFQ Navigation Selector (`tests/browserE2E.mjs`):** Fixed step 2 (`page.getByText('DEMO-RFQ-2026-101').first().click()`), which previously clicked the inert `<span>` inside Dashboard "Needs Your Attention" instead of opening the RFQ, falsely matched the Dashboard table `<td>` title, and timed out waiting for `getByText(/Freight To-Pay/i)` because `ComparisonMatrixPane` never mounted. Updated selector to click `tbody tr` for `DEMO-RFQ-2026-101` and wait on the workspace `<h1>` heading plus `Compare Matrix` button.
+- **Direct Server Startup Diagnostics & CI E2E Readiness (`server.ts`, `.github/workflows/ci.yml`, `tests/demoWorkspace.test.ts`):** Added `.on('error')` listen handling and `.catch(...)` startup failure logging + `process.exit(1)` to direct `server.ts` execution; set `DISABLE_HMR=true` and silent `curl -sf` readiness polling (suppressing transient `Connection refused` stderr noise during ~6s Vite middleware boot while printing `/tmp/norus-e2e-server.log` immediately on exit/timeout) in `.github/workflows/ci.yml`; and added a direct-process startup + fail-closed production test in `tests/demoWorkspace.test.ts`.
+
 ## Task 010 — Independent Security Audit, CI Validation & Production-Risk Closure
 
 ### Fixed & Hardened

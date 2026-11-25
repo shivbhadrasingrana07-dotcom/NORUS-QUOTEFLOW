@@ -1856,25 +1856,45 @@ const isDirectExecution =
 if (isDirectExecution) {
   const PORT = Number(process.env.PORT) || 3000;
   const storageProvider = createObjectStorageProvider();
-  createApp({ enableVite: true, storageProvider }).then((app) => {
-    app.listen(PORT, '0.0.0.0', () => {
-      logEvent('info', 'server_started', {
+  createApp({ enableVite: true, storageProvider })
+    .then((app) => {
+      const httpServer = app.listen(PORT, '0.0.0.0', () => {
+        logEvent('info', 'server_started', {
+          port: PORT,
+          nodeEnv: process.env.NODE_ENV || 'development',
+          demoMode: resolveDemoMode(),
+          storageProvider: storageProvider.mode,
+        });
+      });
+
+      httpServer.on('error', (err) => {
+        logEvent('error', 'server_listen_failed', {
+          port: PORT,
+          error: redactSensitiveText(err instanceof Error ? err.message : String(err)),
+        });
+        process.exit(1);
+      });
+
+      const intervalMinutes = Number(process.env.MAINTENANCE_INTERVAL_MINUTES ?? '360');
+      if (Number.isFinite(intervalMinutes) && intervalMinutes > 0 && isSqlEnvConfigured()) {
+        const timer = setInterval(() => {
+          runScheduledMaintenance({ db: defaultDb, storageProvider, lockPool: defaultPool }).catch(
+            (err) => {
+              logEvent('error', 'scheduled_maintenance_failed', {
+                error: redactSensitiveText(err instanceof Error ? err.message : String(err)),
+              });
+            }
+          );
+        }, intervalMinutes * 60 * 1000);
+        timer.unref();
+      }
+    })
+    .catch((err) => {
+      logEvent('error', 'server_startup_failed', {
         port: PORT,
         nodeEnv: process.env.NODE_ENV || 'development',
-        storageProvider: storageProvider.mode,
+        error: redactSensitiveText(err instanceof Error ? err.message : String(err)),
       });
+      process.exit(1);
     });
-
-    const intervalMinutes = Number(process.env.MAINTENANCE_INTERVAL_MINUTES ?? '360');
-    if (Number.isFinite(intervalMinutes) && intervalMinutes > 0 && isSqlEnvConfigured()) {
-      const timer = setInterval(() => {
-        runScheduledMaintenance({ db: defaultDb, storageProvider, lockPool: defaultPool }).catch((err) => {
-          logEvent('error', 'scheduled_maintenance_failed', {
-            error: redactSensitiveText(err instanceof Error ? err.message : String(err)),
-          });
-        });
-      }, intervalMinutes * 60 * 1000);
-      timer.unref();
-    }
-  });
 }
