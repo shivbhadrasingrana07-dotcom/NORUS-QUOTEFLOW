@@ -1,7 +1,6 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import * as XLSX from 'xlsx';
-import { pool } from '../src/db/index.ts';
 import {
   buildComparativeStatementPdfDoc,
   buildComparativeStatementWorkbook,

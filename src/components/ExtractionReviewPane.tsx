@@ -20,6 +20,7 @@ interface ExtractionReviewPaneProps {
   quotes: Quotation[];
   suppliers: Supplier[];
   selectedQuoteId: string | null;
+  lockedQuoteIds?: Set<string>;
   onSelectQuote: (id: string) => void;
   onUpdateHeader: (quoteId: string, patch: Partial<Quotation>) => Promise<void>;
   onUpdateLine: (quoteId: string, lineId: string, patch: Partial<QuotationLine>) => Promise<void>;
@@ -52,6 +53,7 @@ export function ExtractionReviewPane({
   quotes,
   suppliers,
   selectedQuoteId,
+  lockedQuoteIds,
   onSelectQuote,
   onUpdateHeader,
   onUpdateLine,
@@ -61,6 +63,7 @@ export function ExtractionReviewPane({
   demoSessionId = null,
 }: ExtractionReviewPaneProps) {
   const activeQuote = quotes.find((q) => q.id === selectedQuoteId) || quotes[0] || null;
+  const isQuoteLocked = Boolean(activeQuote && lockedQuoteIds?.has(activeQuote.id));
   const [focusedLineId, setFocusedLineId] = useState<string | null>(null);
   const [focusedHeaderField, setFocusedHeaderField] = useState<string | null>(null);
   const [zoom, setZoom] = useState(100);
@@ -347,10 +350,12 @@ export function ExtractionReviewPane({
           ) : (
             <button
               onClick={handleVerify}
-              disabled={savingId === 'verify' || unresolvedMathCount > 0}
+              disabled={savingId === 'verify' || unresolvedMathCount > 0 || isQuoteLocked}
               className="px-3.5 py-1.5 text-xs font-medium text-white bg-[#0F4C81] rounded-md hover:bg-[#0A365C] disabled:opacity-50 whitespace-nowrap flex items-center gap-1.5"
               title={
-                unresolvedMathCount > 0
+                isQuoteLocked
+                  ? 'Withdraw pending award or use an unlocked quote before re-verifying'
+                  : unresolvedMathCount > 0
                   ? 'Resolve arithmetic mismatch before verifying'
                   : 'Confirm extracted figures and mark verified'
               }
@@ -361,6 +366,15 @@ export function ExtractionReviewPane({
           )}
         </div>
       </div>
+
+      {isQuoteLocked && (
+        <div className="p-3 bg-[#FFFBEB] border border-[#FDE68A] text-[#92400E] text-xs rounded-md flex items-center gap-2">
+          <AlertTriangle className="w-4 h-4 text-[#D97706] shrink-0" />
+          <span>
+            This quotation is locked because it is referenced by a pending or approved award decision. Withdraw any pending recommendation in the Approval &amp; Export tab before modifying extracted figures.
+          </span>
+        </div>
+      )}
 
       {errorMsg && (
         <div className="p-3 bg-[#FEF2F2] border border-[#FECACA] text-[#DC2626] text-xs rounded-md flex items-center gap-2">
@@ -675,7 +689,10 @@ export function ExtractionReviewPane({
         </div>
 
         {/* RIGHT PANE: Buffered Structured Header + Line Editor */}
-        <div className="xl:col-span-5 space-y-4">
+        <fieldset
+          disabled={isQuoteLocked}
+          className="xl:col-span-5 space-y-4 disabled:opacity-75"
+        >
           <div className="bg-white border border-[#E2E8F0] rounded-lg p-4 space-y-3">
             <div className="flex items-center justify-between">
               <h3 className="font-display text-sm font-semibold text-[#0F172A]">
@@ -1082,7 +1099,7 @@ export function ExtractionReviewPane({
               })}
             </div>
           </div>
-        </div>
+        </fieldset>
       </div>
     </div>
   );

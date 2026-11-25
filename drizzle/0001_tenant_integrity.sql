@@ -1,12 +1,17 @@
--- NORUS QUOTEFLOW Task 007 — Additive Tenant Data Integrity Migration
+-- NORUS QUOTEFLOW Task 007 / 007.2 — Additive Tenant Data Integrity Migration
 -- Requires PostgreSQL 15+ (uses column-list ON DELETE SET NULL (<col>) on composite nullable FKs).
+-- Applied explicitly via psql / CI workflow (outside drizzle-kit's automatic _journal.json).
 -- Run 0001_tenant_integrity_preflight.sql first.
 --
--- Documented Exception:
---   `price_history` composite FKs referencing `(rfqs)` and `(suppliers)` are intentionally OMITTED
---   because historical customer price_history entries retain archived rfq_id/supplier_id references
---   that may not exist in current `rfqs` / `suppliers` rows (verified 3 historical rows in dev Cloud SQL).
---   Only `(organization_id, catalog_item_id)` is FK-enforced on `price_history`.
+-- Documented Exceptions & Snapshot Rules:
+--   1. `price_history` composite FKs referencing `(rfqs)` and `(suppliers)` are intentionally OMITTED
+--      because historical customer price_history entries retain archived rfq_id/supplier_id references
+--      that may not exist in current `rfqs` / `suppliers` rows. Only `(organization_id, catalog_item_id)` is FK-enforced.
+--   2. `award_allocations` enforces `ON DELETE RESTRICT` on `(organization_id, quotation_id)`,
+--      `(organization_id, quotation_line_id)`, and `(organization_id, supplier_id)` so historical
+--      approved/rejected award snapshots remain intact; pending awards must be explicitly withdrawn first.
+
+BEGIN;
 
 -- 1. Parent composite unique constraints on (organization_id, id)
 ALTER TABLE suppliers
@@ -124,3 +129,5 @@ CREATE UNIQUE INDEX IF NOT EXISTS suppliers_org_norm_name_uidx
 CREATE UNIQUE INDEX IF NOT EXISTS suppliers_org_norm_tax_id_uidx
   ON suppliers (organization_id, lower(btrim(tax_id)))
   WHERE btrim(tax_id) <> '';
+
+COMMIT;

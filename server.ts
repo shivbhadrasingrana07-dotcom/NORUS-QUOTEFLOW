@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import crypto from 'crypto';
+import fs from 'fs';
 import express, { NextFunction, Request, Response } from 'express';
 import multer from 'multer';
 import path from 'path';
@@ -48,6 +49,7 @@ import {
   getSigningSecret,
   parseCookies,
   redactSensitiveText,
+  resolveCookieSameSite,
   SESSION_COOKIE_NAME,
   setAuthCookies,
   signHmac,
@@ -127,6 +129,83 @@ export function resolveDemoMode(params: {
   throw new Error(
     'Configuration error: Invalid DEMO_MODE value. Set "true", "false", or leave unset.'
   );
+}
+
+export function resolveTrustProxySetting(
+  env: Record<string, string | undefined> = process.env
+): number | false {
+  const raw = (env.TRUST_PROXY_HOPS ?? '').trim().toLowerCase();
+  if (!raw) return 1;
+  if (raw === 'false' || raw === '0') return false;
+  if (/^\d+$/.test(raw)) {
+    const hops = Number(raw);
+    if (Number.isSafeInteger(hops) && hops > 0) return hops;
+  }
+  throw new Error(
+    'Configuration error: Invalid TRUST_PROXY_HOPS value. Expected a positive integer, "0", or "false".'
+  );
+}
+
+export function buildProductionCspPolicy(
+  env: Record<string, string | undefined> = process.env
+): string {
+  let s3Origin = '';
+  const rawS3 = (env.S3_ENDPOINT || '').trim();
+  if (rawS3) {
+    try {
+      s3Origin = new URL(rawS3).origin;
+    } catch {
+      s3Origin = '';
+    }
+  }
+
+  let firebaseFrameOrigin = '';
+  const explicitAuthDomain = (env.FIREBASE_AUTH_DOMAIN || '').trim();
+  if (explicitAuthDomain) {
+    firebaseFrameOrigin = explicitAuthDomain.startsWith('https://')
+      ? explicitAuthDomain
+      : `https://${explicitAuthDomain}`;
+  } else {
+    try {
+      const cfgPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
+      if (fs.existsSync(cfgPath)) {
+        const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8')) as { authDomain?: unknown };
+        if (typeof cfg.authDomain === 'string' && cfg.authDomain.trim() && !cfg.authDomain.includes('*')) {
+          firebaseFrameOrigin = `https://${cfg.authDomain.trim()}`;
+        }
+      }
+    } catch {
+      firebaseFrameOrigin = '';
+    }
+  }
+
+  const imgSrc = ["'self'", 'data:', 'blob:', s3Origin].filter(Boolean).join(' ');
+  const connectSrc = [
+    "'self'",
+    'https://identitytoolkit.googleapis.com',
+    'https://securetoken.googleapis.com',
+    'https://www.googleapis.com',
+    'https://apis.google.com',
+    s3Origin,
+  ]
+    .filter(Boolean)
+    .join(' ');
+  const frameSrc = ["'self'", 'blob:', firebaseFrameOrigin, 'https://accounts.google.com']
+    .filter(Boolean)
+    .join(' ');
+
+  return [
+    "default-src 'self'",
+    "base-uri 'self'",
+    "form-action 'self'",
+    "object-src 'none'",
+    "script-src 'self' https://apis.google.com https://www.gstatic.com",
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    "font-src 'self' https://fonts.gstatic.com data:",
+    `img-src ${imgSrc}`,
+    `connect-src ${connectSrc}`,
+    `frame-src ${frameSrc}`,
+  ].join('; ');
 }
 
 function safeTimingEqual(a: string, b: string): boolean {
@@ -212,7 +291,7 @@ export async function createApp(options: AppOptions = {}) {
 
   const app = express();
   app.disable('x-powered-by');
-  app.set('trust proxy', 1);
+  app.set('trust proxy', resolveTrustProxySetting());
   app.use(createCorrelationMiddleware());
 
   // Security headers
@@ -226,6 +305,12 @@ export async function createApp(options: AppOptions = {}) {
       'Permissions-Policy',
       'camera=(), microphone=(), geolocation=(), payment=()'
     );
+    const cspMode = (process.env.CSP_MODE || '').trim().toLowerCase();
+    if (cspMode === 'enforce') {
+      res.setHeader('Content-Security-Policy', buildProductionCspPolicy());
+    } else if (process.env.NODE_ENV === 'production' || cspMode === 'report-only') {
+      res.setHeader('Content-Security-Policy-Report-Only', buildProductionCspPolicy());
+    }
     if (process.env.NODE_ENV === 'production') {
       res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
     }
@@ -371,8 +456,6 @@ export async function createApp(options: AppOptions = {}) {
     };
   }
 
-  const googleAuthEnabled = isGoogleAuthConfigured();
-
   function buildAuthResponse(ctx: SessionAuthContext) {
     return {
       authenticated: true,
@@ -380,7 +463,7 @@ export async function createApp(options: AppOptions = {}) {
       activeOrganization: ctx.activeOrganization,
       organizations: ctx.organizations,
       csrfToken: ctx.csrfToken,
-      googleAuthEnabled,
+      googleAuthEnabled: isGoogleAuthConfigured(),
       demoMode: demoModeEnabled,
     };
   }
@@ -408,7 +491,7 @@ export async function createApp(options: AppOptions = {}) {
       geminiConfigured: Boolean(
         process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'
       ),
-      googleAuthConfigured: googleAuthEnabled,
+      googleAuthConfigured: isGoogleAuthConfigured(),
       timestamp: new Date().toISOString(),
       uptimeSec: Math.floor(process.uptime()),
     });
@@ -442,7 +525,7 @@ export async function createApp(options: AppOptions = {}) {
         activeOrganization: null,
         organizations: [],
         csrfToken: null,
-        googleAuthEnabled,
+        googleAuthEnabled: isGoogleAuthConfigured(),
         demoMode: demoModeEnabled,
       });
     }
@@ -479,7 +562,7 @@ export async function createApp(options: AppOptions = {}) {
         process.env.NODE_ENV === 'production' ||
         req.secure ||
         (typeof proto === 'string' && proto.split(',')[0].trim() === 'https');
-      const sameSite = secure ? 'None' : 'Lax';
+      const sameSite = resolveCookieSameSite(secure);
       res.setHeader(
         'Set-Cookie',
         [
@@ -730,6 +813,16 @@ export async function createApp(options: AppOptions = {}) {
         allocations,
       });
       res.status(201).json(award);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post('/api/demo-workspace/awards/:awardId/withdraw', requireDemoMode, demoMutationRateLimiter, (req, res, next) => {
+    try {
+      const sessionId = resolveDemoSessionId(req, res);
+      const result = demoStore.withdrawAward(sessionId, req.params.awardId);
+      res.json(result);
     } catch (err) {
       next(err);
     }
@@ -1552,6 +1645,29 @@ export async function createApp(options: AppOptions = {}) {
           actorRole: org.role,
         });
         res.status(201).json(award);
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
+  app.post(
+    '/api/awards/:awardId/withdraw',
+    requireAuth,
+    requireCsrf,
+    mutationRateLimiter,
+    requireOrgAndPermission('award:recommend'),
+    async (req, res, next) => {
+      try {
+        const org = req.auth!.activeOrganization!;
+        const result = await store.withdrawAward({
+          organizationId: org.id,
+          awardId: req.params.awardId,
+          actorUserId: req.auth!.user.id,
+          actorName: req.auth!.user.fullName,
+          actorRole: org.role,
+        });
+        res.json(result);
       } catch (err) {
         next(err);
       }

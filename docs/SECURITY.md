@@ -10,14 +10,15 @@
    - `POST /api/demo/switch-persona` is permanently disabled (`410 Gone`), and `PATCH /api/settings` ignores client-supplied role properties.
 
 2. **Session Management & CSRF Protection (`server.ts`, `server/security.ts`, `server/pgStore.ts`):**
-   - `nf_session` cookie carries a 256-bit opaque token stored as `SHA-256` in PostgreSQL `sessions` (revocable individually or globally), flagged `HttpOnly`, `SameSite=Lax` (or `None; Secure` over HTTPS), and `Secure` in production (`NODE_ENV=production`).
+   - `nf_session` cookie carries a 256-bit opaque token stored as `SHA-256` in PostgreSQL `sessions` (revocable individually or globally), flagged `HttpOnly`, `SameSite` resolved via `resolveCookieSameSite()` (`COOKIE_SAMESITE=lax|strict|none`, defaulting to `None; Secure` over HTTPS and `Lax` over HTTP), and `Secure` over HTTPS / production.
    - `createSessionTx` bounds active sessions per user to `10` (`MAX_ACTIVE_SESSIONS_PER_USER`), revoking excess oldest sessions automatically.
    - All authenticated `POST`, `PATCH`, and `DELETE` requests enforce timing-safe comparison of `X-CSRF-Token` against the active session's `csrf_token` (`403` if missing or invalid).
    - `getSigningSecret()` fails closed in production if `SESSION_SECRET` is unset or shorter than `32` characters.
 
-3. **Strict Multi-Tenant Isolation, 5-Role RBAC & Safe First-Owner Bootstrap (`server/rbac.ts`, `server/pgStore.ts`, `server/ownerBootstrap.ts`):**
+3. **Strict Multi-Tenant Isolation, 5-Role RBAC, Historical Snapshots & First-Owner Bootstrap (`server/rbac.ts`, `server/pgStore.ts`, `server/demoWorkspace.ts`, `server/ownerBootstrap.ts`):**
    - Every organization resource (`suppliers`, `catalog_items`, `rfqs`, `quotations`, `stored_documents`, `awards`, `audit_logs`) is keyed by `organization_id`, backed at the SQL layer by composite same-organization foreign keys (`drizzle/0001_tenant_integrity.sql`).
    - Cross-tenant reads, updates, deletes, award decisions, or document downloads return `404` or `403`.
+   - Quotations referenced by `pending` or `approved` awards reject header/line edits and re-verification (`409`); quotations referenced by `approved`, `pending`, or `rejected` awards reject deletion (`409`) to preserve immutable historical award snapshots.
    - 5 roles enforced on the server: `owner`, `admin`, `buyer`, `approver`, `viewer`, plus last-owner protection (`409` on demotion/removal of the sole owner).
    - Owner-less migrated organizations (`org-kalyani-hydraulics`) require explicit operator/founder bootstrap via `npm run org:bootstrap-owner`, which locks the `organizations` row (`FOR UPDATE`) inside the transaction and blocks reassignment (`409`) if an active owner already exists.
 
@@ -29,10 +30,11 @@
 5. **Upload Magic-Byte & Spreadsheet Sanitization (`server/fileSecurity.ts`, `src/lib/exporters.ts`):**
    - 25 MB Multer limit (`413`), active/executable/macro extension blocklist, magic-byte inspection (`415` on mismatch), and Excel/CSV formula injection escaping (`sanitizeSpreadsheetCell`).
 
-6. **PostgreSQL Rate Limiting, Strict CORS, Headers & Secret Scrubbing (`server/rateLimiter.ts`, `server/monitoring.ts`, `server.ts`):**
-   - Atomic `rate_limit_buckets` protection on auth endpoints (`authRateLimiter`), AI extraction (`extractRateLimiter`), and general mutations (`mutationRateLimiter`), deriving client IP via Express `req.ip` (`trust proxy = 1`, ignoring raw spoofable `X-Forwarded-For` headers) and returning `429` with `Retry-After` headers.
+6. **PostgreSQL TLS, Rate Limiting, Strict CORS, Headers/CSP & Secret Scrubbing (`src/db/index.ts`, `server/rateLimiter.ts`, `server/monitoring.ts`, `server.ts`):**
+   - `buildPgSslConfig()` enforces `rejectUnauthorized: true` by default on TCP PostgreSQL TLS (`SQL_SSL=true`), supports explicit CA bundles (`SQL_SSL_CA`), requires explicit `SQL_SSL_ALLOW_SELF_SIGNED=true` for unverified self-signed certs, and skips TLS only for Cloud SQL Unix sockets (`/app/cloudsql/...`).
+   - Atomic `rate_limit_buckets` protection on auth endpoints (`authRateLimiter`), AI extraction (`extractRateLimiter`), and general mutations (`mutationRateLimiter`), deriving client IP via Express `req.ip` (`TRUST_PROXY_HOPS` via `resolveTrustProxySetting()`, default `1`, ignoring raw spoofable `X-Forwarded-For` headers) and returning `429` with `Retry-After` headers.
    - Strict CORS allowlist (`req.headers.host`, `APP_URL`, `ALLOWED_ORIGINS`, plus `localhost`/`127.0.0.1` in non-production); untrusted origins rejected with `403`.
-   - Security headers: `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`, `Cross-Origin-Opener-Policy: same-origin-allow-popups`, `Referrer-Policy: strict-origin-when-cross-origin`, `Cross-Origin-Resource-Policy: same-origin`, `Permissions-Policy`, and production `Strict-Transport-Security`.
+   - Security headers: `X-Content-Type-Options: nosniff`, `X-Frame-Options: SAMEORIGIN`, `Cross-Origin-Opener-Policy: same-origin-allow-popups`, `Referrer-Policy: strict-origin-when-cross-origin`, `Cross-Origin-Resource-Policy: same-origin`, `Permissions-Policy`, production `Strict-Transport-Security`, and `Content-Security-Policy-Report-Only` / `Content-Security-Policy` built via `buildProductionCspPolicy()` (no `*` wildcards, no `'unsafe-eval'`).
    - `redactSensitiveText` strips configured secret env values plus `Bearer` tokens, `re_live_`/`re_test_`/`AIza*` keys, and `password`/`apiKey`/`secretAccessKey` parameter patterns from logs, errors, and webhook notifications.
 
 ## Operational Requirements for Public Internet Deployment

@@ -6,6 +6,7 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 import { promisify } from 'node:util';
 import type { Request } from 'express';
+import { buildProductionCspPolicy, resolveTrustProxySetting } from '../server.ts';
 import {
   DemoStoreError,
   DemoWorkspaceStore,
@@ -21,14 +22,17 @@ import {
   S3CompatibleStorageProvider,
 } from '../server/objectStorage.ts';
 import { getClientIp } from '../server/rateLimiter.ts';
+import { resolveCookieSameSite } from '../server/security.ts';
 import {
   AwardValidationError,
+  isExceedingL1Total,
+  isLineQuantitySufficient,
   validateAwardSubmission,
 } from '../src/lib/awardValidation.ts';
-import { rankQuotations } from '../src/lib/ranking.ts';
-import type { DrizzleDb } from '../src/db/index.ts';
+import { computeEvaluatedSavings, rankQuotations } from '../src/lib/ranking.ts';
+import { buildPgSslConfig, type DrizzleDb } from '../src/db/index.ts';
 import type { Quotation, QuotationLine, Rfq, WorkspaceState } from '../src/types.ts';
-import { createMinimalValidPng } from './_helpers.ts';
+import { createMinimalValidPng, getSafeTestDbConfig } from './_helpers.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -709,5 +713,304 @@ describe('Task 007 Stabilization Unit Suite', () => {
     assert.equal(maintResult.errors.length, 1);
     assert.equal(maintResult.errors[0].includes('supersecret999'), false);
     assert.ok(maintResult.errors[0].includes('[REDACTED]'));
+  });
+
+  it('Task 007.2: enforces quotation quantity sufficiency, UOM epsilon, cent-level non-L1 checks, and pending-award 409', () => {
+    const { rfq, q1, q2 } = makeSampleRfqAndQuotes();
+
+    // 1. Short quoted quantity (5 vs 10 required) fails rankQuotations(rfq), savings, and validateAwardSubmission (422)
+    const q1ShortQty: Quotation = {
+      ...q1,
+      totalLandedCost: 9000,
+      lines: [
+        { ...q1.lines[0], quotedQty: 5, lineTotalQuoted: 5000, expectedLineTotal: 5000 },
+        q1.lines[1],
+      ],
+    };
+    assert.equal(isLineQuantitySufficient(q1ShortQty.lines[0], rfq.items[0]).ok, false);
+    const rankedWithShort = rankQuotations([q1ShortQty, q2], 'landed', rfq);
+    const shortRank = rankedWithShort.find((r) => r.quotation.id === q1.id)!;
+    assert.equal(shortRank.eligibleForAwardRank, false);
+    assert.ok(shortRank.ineligibilityReasons.some((reason) => /insufficient quoted (qty|quantity)/i.test(reason)));
+    assert.equal(rankedWithShort.find((r) => r.quotation.id === q2.id)?.rankLabel, 'L1');
+
+    // Savings must exclude quantity-insufficient quotes even if their nominal unit rate looks cheaper
+    assert.equal(computeEvaluatedSavings([rfq], [q1ShortQty]), 0);
+
+    assert.throws(
+      () =>
+        validateAwardSubmission({
+          rfq,
+          rfqQuotes: [q1ShortQty, q2],
+          isSplitAward: false,
+          allocations: [
+            { rfqItemId: 'item-1', quotationId: q1ShortQty.id, quotationLineId: q1ShortQty.lines[0].id },
+            { rfqItemId: 'item-2', quotationId: q1ShortQty.id, quotationLineId: q1ShortQty.lines[1].id },
+          ],
+        }),
+      (err: unknown) => err instanceof AwardValidationError && err.statusCode === 422
+    );
+
+    // 2. Pack-of-10 conversion (quotedQty=1, factor=10) & repeating-fraction tolerance (3.3333 * 3 = 9.9999) succeed
+    const convertedOk = isLineQuantitySufficient(
+      { ...q1.lines[0], quotedQty: 1, uomConversionFactor: 10 },
+      rfq.items[0]
+    );
+    assert.equal(convertedOk.ok, true);
+    const epsilonOk = isLineQuantitySufficient(
+      { ...q1.lines[0], quotedQty: 3.3333, uomConversionFactor: 3 },
+      rfq.items[0]
+    );
+    assert.equal(epsilonOk.ok, true);
+    const belowEpsilon = isLineQuantitySufficient(
+      { ...q1.lines[0], quotedQty: 3.33, uomConversionFactor: 3 },
+      rfq.items[0]
+    );
+    assert.equal(belowEpsilon.ok, false);
+
+    // 3. Cent-level L1 boundary: 14000.01, 14000.50, 14001.00 exceed 14000.00; 14000.004 does not
+    assert.equal(isExceedingL1Total(14000.0, 14000.0), false);
+    assert.equal(isExceedingL1Total(14000.004, 14000.0), false);
+    assert.equal(isExceedingL1Total(14000.01, 14000.0), true);
+    assert.equal(isExceedingL1Total(14000.5, 14000.0), true);
+    assert.equal(isExceedingL1Total(14001.0, 14000.0), true);
+
+    const qSlightlyAboveL1: Quotation = {
+      ...q2,
+      totalLandedCost: 14000.5,
+      lines: [
+        { ...q2.lines[0], normalizedUnitLanded: 1000.05 },
+        q2.lines[1],
+      ],
+    };
+    assert.throws(
+      () =>
+        validateAwardSubmission({
+          rfq,
+          rfqQuotes: [q1, qSlightlyAboveL1],
+          isSplitAward: false,
+          allocations: [
+            { rfqItemId: 'item-1', quotationId: qSlightlyAboveL1.id, quotationLineId: qSlightlyAboveL1.lines[0].id },
+            { rfqItemId: 'item-2', quotationId: qSlightlyAboveL1.id, quotationLineId: qSlightlyAboveL1.lines[1].id },
+          ],
+        }),
+      (err: unknown) => err instanceof AwardValidationError && err.statusCode === 400
+    );
+
+    // 4. Existing pending award blocks replacement with 409 until withdrawn
+    assert.throws(
+      () =>
+        validateAwardSubmission({
+          rfq,
+          rfqQuotes: [q1, q2],
+          isSplitAward: false,
+          allocations: [
+            { rfqItemId: 'item-1', quotationId: q1.id, quotationLineId: q1.lines[0].id },
+            { rfqItemId: 'item-2', quotationId: q1.id, quotationLineId: q1.lines[1].id },
+          ],
+          hasPendingAward: true,
+        }),
+      (err: unknown) => err instanceof AwardValidationError && err.statusCode === 409
+    );
+  });
+
+  it('Task 007.2: enforces strict PostgreSQL TLS, CSP, cookie SameSite, trust proxy, and safe test DB guards', () => {
+    // 1. PostgreSQL TLS configuration never weakens rejectUnauthorized by default
+    assert.equal(buildPgSslConfig({ SQL_SSL: 'false', SQL_HOST: 'db.example.com' }), undefined);
+    assert.deepEqual(buildPgSslConfig({ SQL_SSL: 'true', SQL_HOST: 'db.example.com' }), {
+      rejectUnauthorized: true,
+    });
+    assert.equal(
+      buildPgSslConfig({ SQL_SSL: 'true', SQL_HOST: '/app/cloudsql/proj:asia:db' }),
+      undefined
+    );
+    const pemSsl = buildPgSslConfig({
+      SQL_SSL: 'true',
+      SQL_HOST: 'db.example.com',
+      SQL_SSL_CA: '-----BEGIN CERTIFICATE-----\\nABC\\n-----END CERTIFICATE-----',
+    });
+    assert.equal(pemSsl?.rejectUnauthorized, true);
+    assert.ok(pemSsl?.ca?.includes('\nABC\n'));
+    assert.throws(
+      () =>
+        buildPgSslConfig({
+          SQL_SSL: 'true',
+          SQL_HOST: 'db.example.com',
+          SQL_SSL_CA: '/nonexistent/path/server-ca.pem',
+        }),
+      /SQL_SSL_CA/
+    );
+
+    // 2. Production CSP contains no '*' wildcard and no 'unsafe-eval', and includes valid S3 origin
+    const csp = buildProductionCspPolicy({ S3_ENDPOINT: 'https://r2.example.com/bucket' });
+    assert.equal(csp.includes('*'), false);
+    assert.equal(csp.includes('unsafe-eval'), false);
+    assert.ok(csp.includes("object-src 'none'"));
+    assert.ok(csp.includes('https://r2.example.com'));
+
+    // 3. Cookie SameSite policy & trust proxy parsing
+    assert.equal(resolveCookieSameSite(true, {}), 'None');
+    assert.equal(resolveCookieSameSite(false, {}), 'Lax');
+    assert.equal(resolveCookieSameSite(true, { COOKIE_SAMESITE: 'strict' }), 'Strict');
+    assert.equal(resolveCookieSameSite(false, { COOKIE_SAMESITE: 'none' }), 'Lax');
+
+    assert.equal(resolveTrustProxySetting({}), 1);
+    assert.equal(resolveTrustProxySetting({ TRUST_PROXY_HOPS: '2' }), 2);
+    assert.equal(resolveTrustProxySetting({ TRUST_PROXY_HOPS: 'false' }), false);
+    assert.equal(resolveTrustProxySetting({ TRUST_PROXY_HOPS: '0' }), false);
+    assert.throws(() => resolveTrustProxySetting({ TRUST_PROXY_HOPS: '-1' }), /TRUST_PROXY_HOPS/);
+
+    // 4. Test DB config blocks Cloud SQL sockets, production/postgres DB names, and live SQL overlap, while allowing CI loopback *_test
+    assert.equal(
+      getSafeTestDbConfig({
+        TEST_SQL_HOST: '/app/cloudsql/proj:reg:inst',
+        TEST_SQL_USER: 'u',
+        TEST_SQL_PASSWORD: 'p',
+        TEST_SQL_DB_NAME: 'quoteflow_test',
+      }),
+      null
+    );
+    assert.equal(
+      getSafeTestDbConfig({
+        TEST_DATABASE_URL: 'postgres://u:p@/quoteflow_test?host=/cloudsql/proj:reg:inst',
+      }),
+      null
+    );
+    assert.equal(
+      getSafeTestDbConfig({
+        TEST_SQL_HOST: '127.0.0.1',
+        TEST_SQL_USER: 'u',
+        TEST_SQL_PASSWORD: 'p',
+        TEST_SQL_DB_NAME: 'postgres',
+      }),
+      null
+    );
+    assert.equal(
+      getSafeTestDbConfig({
+        NODE_ENV: 'development',
+        SQL_HOST: '10.0.0.5',
+        SQL_DB_NAME: 'app_db',
+        TEST_SQL_HOST: '10.0.0.5',
+        TEST_SQL_USER: 'u',
+        TEST_SQL_PASSWORD: 'p',
+        TEST_SQL_DB_NAME: 'app_db',
+      }),
+      null
+    );
+    const ciCfg = getSafeTestDbConfig({
+      NODE_ENV: 'test',
+      SQL_HOST: '127.0.0.1',
+      SQL_DB_NAME: 'quoteflow_test',
+      TEST_SQL_HOST: '127.0.0.1',
+      TEST_SQL_USER: 'postgres',
+      TEST_SQL_PASSWORD: 'ci_test_password',
+      TEST_SQL_DB_NAME: 'quoteflow_test',
+    });
+    assert.ok(ciCfg);
+    assert.equal(ciCfg.database, 'quoteflow_test');
+  });
+
+  it('Task 007.2: DemoWorkspaceStore validates inputs, locks pending/approved quotes, supports withdrawAward, and preserves rejected history', () => {
+    const store = new DemoWorkspaceStore();
+    const sess = 'unit-task-007-2';
+    const ws = store.getWorkspace(sess);
+    const rfq = ws.rfqs.find((r) => r.id === 'demo-rfq-2026-101')!;
+    const q1 = ws.quotations.find((q) => q.id === 'demo-rfq-2026-101-q1')!;
+
+    // 1. Header & line validation checks
+    assert.throws(
+      () => store.updateQuotationHeader(sess, q1.id, { quoteReference: '   ' }),
+      (e: unknown) => e instanceof DemoStoreError && e.statusCode === 400
+    );
+    assert.throws(
+      () => store.updateQuotationHeader(sess, q1.id, { leadTimeDays: 4.5 }),
+      (e: unknown) => e instanceof DemoStoreError && e.statusCode === 400
+    );
+    assert.throws(
+      () => store.updateQuotationHeader(sess, q1.id, { leadTimeDays: true as unknown as number }),
+      (e: unknown) => e instanceof DemoStoreError && e.statusCode === 400
+    );
+    assert.throws(
+      () => store.updateQuotationLine(sess, q1.id, q1.lines[0].id, { matchStatus: 'bogus' as 'matched' }),
+      (e: unknown) => e instanceof DemoStoreError && e.statusCode === 400
+    );
+
+    const altUpdated = store.updateQuotationLine(sess, q1.id, q1.lines[0].id, {
+      matchStatus: 'alternate_spec',
+    });
+    assert.equal(altUpdated.isVerified, false);
+    assert.equal(altUpdated.verifiedBy, null);
+    assert.equal(altUpdated.lines[0].verifiedField, false);
+
+    // Restore matched & re-verify q1
+    store.updateQuotationLine(sess, q1.id, q1.lines[0].id, { matchStatus: 'matched' });
+    store.verifyQuotation(sess, q1.id);
+
+    const q1Allocs = rfq.items.map((it) => ({
+      rfqItemId: it.id,
+      quotationId: q1.id,
+      quotationLineId: q1.lines.find((l) => l.rfqItemId === it.id)!.id,
+    }));
+
+    // 2. Submit pending award -> quote locked (409) & duplicate pending award blocked (409)
+    const pending1 = store.submitAward(sess, {
+      rfqId: rfq.id,
+      isSplitAward: false,
+      allocations: q1Allocs,
+    });
+    assert.throws(
+      () => store.updateQuotationHeader(sess, q1.id, { freightCharges: 999 }),
+      (e: unknown) => e instanceof DemoStoreError && e.statusCode === 409
+    );
+    assert.throws(
+      () => store.deleteQuotation(sess, q1.id),
+      (e: unknown) => e instanceof DemoStoreError && e.statusCode === 409
+    );
+    assert.throws(
+      () =>
+        store.submitAward(sess, {
+          rfqId: rfq.id,
+          isSplitAward: false,
+          allocations: q1Allocs,
+        }),
+      (e: unknown) => e instanceof DemoStoreError && e.statusCode === 409
+    );
+
+    // 3. Withdraw pending award -> RFQ reverts to in_review & quote becomes editable again
+    const withdrawn = store.withdrawAward(sess, pending1.id);
+    assert.equal(withdrawn.withdrawnAwardId, pending1.id);
+    assert.equal(withdrawn.rfq.status, 'in_review');
+    store.updateQuotationHeader(sess, q1.id, { freightCharges: q1.freightCharges });
+    store.verifyQuotation(sess, q1.id);
+
+    // 4. Resubmit & reject -> historical rejected snapshot preserved, deletion still 409, quote editable & re-verifiable, revision + approval preserves both
+    const pending2 = store.submitAward(sess, {
+      rfqId: rfq.id,
+      isSplitAward: false,
+      allocations: q1Allocs,
+    });
+    const rejected = store.decideAward(sess, pending2.id, 'rejected', 'Revise payment terms');
+    assert.equal(rejected.approvalStatus, 'rejected');
+
+    assert.throws(
+      () => store.deleteQuotation(sess, q1.id),
+      (e: unknown) => e instanceof DemoStoreError && e.statusCode === 409
+    );
+
+    store.updateQuotationHeader(sess, q1.id, { paymentTerms: 'Net 45 Revised' });
+    store.verifyQuotation(sess, q1.id);
+
+    const pending3 = store.submitAward(sess, {
+      rfqId: rfq.id,
+      isSplitAward: false,
+      allocations: q1Allocs,
+    });
+    const approved = store.decideAward(sess, pending3.id, 'approved', 'Approved after revision');
+    assert.equal(approved.approvalStatus, 'approved');
+
+    const finalWs = store.getWorkspace(sess);
+    const rfqAwards = finalWs.awards.filter((a) => a.rfqId === rfq.id);
+    assert.equal(rfqAwards.some((a) => a.id === rejected.id && a.approvalStatus === 'rejected'), true);
+    assert.equal(rfqAwards.some((a) => a.id === approved.id && a.approvalStatus === 'approved'), true);
   });
 });

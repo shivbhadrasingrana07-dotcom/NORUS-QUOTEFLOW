@@ -1950,6 +1950,7 @@ export class DemoWorkspaceStore {
     if (!rfq) {
       throw new DemoStoreError('Parent demo RFQ not found.', 404);
     }
+    this.assertQuotationMutable(session, q.id);
 
     const updatedRaw: Quotation = {
       ...q,
@@ -1957,6 +1958,12 @@ export class DemoWorkspaceStore {
       verifiedBy: null,
       verifiedAt: null,
     };
+    if (body.quoteReference !== undefined) {
+      if (typeof body.quoteReference !== 'string' || !body.quoteReference.trim()) {
+        throw new DemoStoreError('quoteReference cannot be empty.', 400);
+      }
+      updatedRaw.quoteReference = body.quoteReference.trim().slice(0, 120);
+    }
     if (body.freightCharges !== undefined) {
       const n = Number(body.freightCharges);
       if (!Number.isFinite(n) || n < 0) throw new DemoStoreError('Invalid freightCharges.', 400);
@@ -1986,9 +1993,16 @@ export class DemoWorkspaceStore {
       if (body.leadTimeDays === null || body.leadTimeDays === '') {
         updatedRaw.leadTimeDays = null;
       } else {
-        const n = Number(body.leadTimeDays);
-        if (!Number.isFinite(n) || n < 0) throw new DemoStoreError('Invalid leadTimeDays.', 400);
-        updatedRaw.leadTimeDays = Math.round(n);
+        const n =
+          typeof body.leadTimeDays === 'boolean'
+            ? NaN
+            : typeof body.leadTimeDays === 'number'
+            ? body.leadTimeDays
+            : Number(String(body.leadTimeDays).trim());
+        if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) {
+          throw new DemoStoreError('leadTimeDays must be a non-negative whole integer.', 400);
+        }
+        updatedRaw.leadTimeDays = n;
       }
     }
     if (typeof body.paymentTerms === 'string') {
@@ -2026,9 +2040,23 @@ export class DemoWorkspaceStore {
     const q = session.workspace.quotations[qIdx];
     const rfq = session.workspace.rfqs.find((r) => r.id === q.rfqId);
     if (!rfq) throw new DemoStoreError('Parent demo RFQ not found.', 404);
+    this.assertQuotationMutable(session, q.id);
 
     const lineIdx = q.lines.findIndex((l) => l.id === lineId);
     if (lineIdx === -1) throw new DemoStoreError('Demo quotation line not found.', 404);
+
+    if (
+      body.matchStatus !== undefined &&
+      body.matchStatus !== 'matched' &&
+      body.matchStatus !== 'unmapped' &&
+      body.matchStatus !== 'not_quoted' &&
+      body.matchStatus !== 'alternate_spec'
+    ) {
+      throw new DemoStoreError(
+        'matchStatus must be one of: matched, unmapped, not_quoted, alternate_spec.',
+        400
+      );
+    }
 
     const nextLines = q.lines.map((l, idx) => {
       if (idx !== lineIdx) return l;
@@ -2080,19 +2108,20 @@ export class DemoWorkspaceStore {
         next.taxCreditable = body.taxCreditable;
       }
       if (body.rfqItemId !== undefined) {
-        next.rfqItemId =
-          typeof body.rfqItemId === 'string' && rfq.items.some((it) => it.id === body.rfqItemId)
-            ? body.rfqItemId
-            : null;
+        if (body.rfqItemId !== null && !rfq.items.some((it) => it.id === body.rfqItemId)) {
+          throw new DemoStoreError('rfqItemId does not belong to this demo RFQ.', 400);
+        }
+        next.rfqItemId = (body.rfqItemId as string | null) ?? null;
       }
-      if (
-        body.matchStatus === 'matched' ||
-        body.matchStatus === 'unmapped' ||
-        body.matchStatus === 'not_quoted' ||
-        body.matchStatus === 'alternate_spec'
-      ) {
-        next.matchStatus = body.matchStatus;
+      if (body.matchStatus !== undefined) {
+        next.matchStatus = body.matchStatus as QuotationLine['matchStatus'];
       }
+      next.verifiedField =
+        typeof body.verifiedField === 'boolean'
+          ? body.verifiedField
+          : next.matchStatus === 'alternate_spec'
+          ? false
+          : true;
       return next;
     });
 
@@ -2112,6 +2141,24 @@ export class DemoWorkspaceStore {
     return structuredClone(recomputed);
   }
 
+  private assertQuotationMutable(session: DemoSessionState, quoteId: string): void {
+    const linked = session.workspace.awards.filter((a) =>
+      a.allocations.some((al) => al.quotationId === quoteId)
+    );
+    if (linked.some((a) => a.approvalStatus === 'approved')) {
+      throw new DemoStoreError(
+        'Cannot modify or re-verify a quotation locked by an approved award decision.',
+        409
+      );
+    }
+    if (linked.some((a) => a.approvalStatus === 'pending')) {
+      throw new DemoStoreError(
+        'Cannot modify or re-verify a quotation while an award recommendation referencing it is pending approval. Withdraw the pending award first.',
+        409
+      );
+    }
+  }
+
   verifyQuotation(sessionId: string, quoteId: string): Quotation {
     const session = this.getOrCreateSession(sessionId);
     const qIdx = session.workspace.quotations.findIndex((q) => q.id === quoteId);
@@ -2119,6 +2166,7 @@ export class DemoWorkspaceStore {
     const q = session.workspace.quotations[qIdx];
     const rfq = session.workspace.rfqs.find((r) => r.id === q.rfqId);
     if (!rfq) throw new DemoStoreError('Parent demo RFQ not found.', 404);
+    this.assertQuotationMutable(session, q.id);
 
     const recomputed = recomputeQuotation(q, rfq);
     if (recomputed.lines.some((l) => !l.mathValid)) {
@@ -2154,14 +2202,24 @@ export class DemoWorkspaceStore {
     if (qIdx === -1) throw new DemoStoreError('Demo quotation not found.', 404);
     const q = session.workspace.quotations[qIdx];
 
-    const blocksApproved = session.workspace.awards.some(
-      (a) =>
-        a.approvalStatus === 'approved' &&
-        a.allocations.some((al) => al.quotationId === quoteId)
+    const linkedAwards = session.workspace.awards.filter((a) =>
+      a.allocations.some((al) => al.quotationId === quoteId)
     );
-    if (blocksApproved) {
+    if (linkedAwards.some((a) => a.approvalStatus === 'approved')) {
       throw new DemoStoreError(
         'Cannot delete a quotation referenced by an approved award.',
+        409
+      );
+    }
+    if (linkedAwards.some((a) => a.approvalStatus === 'pending')) {
+      throw new DemoStoreError(
+        'Cannot delete a quotation referenced by a pending award recommendation. Withdraw the pending award first.',
+        409
+      );
+    }
+    if (linkedAwards.some((a) => a.approvalStatus === 'rejected')) {
+      throw new DemoStoreError(
+        'Cannot delete a quotation referenced by a historical rejected award decision to preserve procurement auditability.',
         409
       );
     }
@@ -2198,6 +2256,9 @@ export class DemoWorkspaceStore {
     const existingApproved = session.workspace.awards.some(
       (a) => a.rfqId === rfq.id && a.approvalStatus === 'approved'
     );
+    const existingPending = session.workspace.awards.some(
+      (a) => a.rfqId === rfq.id && a.approvalStatus === 'pending'
+    );
     const rfqQuotes = session.workspace.quotations.filter((q) => q.rfqId === rfq.id);
 
     let validated;
@@ -2211,6 +2272,7 @@ export class DemoWorkspaceStore {
         acceptedAlternateLineIds: params.acceptedAlternateLineIds,
         commercialExceptionAccepted: params.commercialExceptionAccepted,
         hasApprovedAward: existingApproved,
+        hasPendingAward: existingPending,
       });
     } catch (err) {
       if (err instanceof AwardValidationError) {
@@ -2218,11 +2280,6 @@ export class DemoWorkspaceStore {
       }
       throw err;
     }
-
-    // Replace any prior pending/rejected award on this demo RFQ
-    session.workspace.awards = session.workspace.awards.filter(
-      (a) => !(a.rfqId === rfq.id && a.approvalStatus !== 'approved')
-    );
 
     const award: AwardDecision = {
       id: `demo-award-${Date.now().toString(36)}-${crypto.randomBytes(2).toString('hex')}`,
@@ -2239,6 +2296,7 @@ export class DemoWorkspaceStore {
       createdAt: new Date().toISOString(),
     };
 
+    // Preserve historical rejected award decisions; prepend latest pending recommendation
     session.workspace.awards.unshift(award);
     rfq.status = 'pending_approval';
     rfq.updatedAt = new Date().toISOString();
@@ -2252,6 +2310,42 @@ export class DemoWorkspaceStore {
       detail: `Submitted demo ${award.isSplitAward ? 'split' : 'package'} award recommendation for ${rfq.rfqNumber}.`,
     });
     return structuredClone(award);
+  }
+
+  withdrawAward(
+    sessionId: string,
+    awardId: string
+  ): { withdrawnAwardId: string; rfq: Rfq } {
+    const session = this.getOrCreateSession(sessionId);
+    const awardIdx = session.workspace.awards.findIndex((a) => a.id === awardId);
+    if (awardIdx === -1) throw new DemoStoreError('Demo award recommendation not found.', 404);
+    const award = session.workspace.awards[awardIdx];
+    if (award.approvalStatus !== 'pending') {
+      throw new DemoStoreError(
+        'Only pending demo award recommendations can be withdrawn; finalized decisions are preserved for audit.',
+        409
+      );
+    }
+    const rfq = session.workspace.rfqs.find((r) => r.id === award.rfqId);
+    if (!rfq) throw new DemoStoreError('Parent demo RFQ not found.', 404);
+
+    session.workspace.awards.splice(awardIdx, 1);
+    const now = new Date().toISOString();
+    if (rfq.status === 'pending_approval') {
+      rfq.status = 'in_review';
+    }
+    rfq.updatedAt = now;
+
+    this.addAudit(session, {
+      actorName: DEMO_USER.fullName,
+      actorRole: 'owner',
+      entityType: 'award',
+      entityId: award.id,
+      action: 'DEMO_AWARD_WITHDRAWN',
+      detail: `Withdrew pending demo award recommendation for ${rfq.rfqNumber}.`,
+    });
+
+    return { withdrawnAwardId: award.id, rfq: structuredClone(rfq) };
   }
 
   decideAward(

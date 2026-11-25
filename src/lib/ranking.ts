@@ -1,4 +1,10 @@
-import { CostBasis, Quotation, Rfq } from '../types.ts';
+import { CostBasis, Quotation, QuotationLine, Rfq, RfqItem } from '../types.ts';
+
+/**
+ * Tolerance in RFQ base-UOM units for floating-point UOM conversion rounding
+ * (e.g. fractional pack/weight conversions such as 3 * 0.333333 kg).
+ */
+export const QUANTITY_EPSILON = 1e-4;
 
 export interface RankedQuotation {
   quotation: Quotation;
@@ -9,13 +15,56 @@ export interface RankedQuotation {
   totalForBasis: number;
 }
 
+export function getConvertedQuotedQuantity(line: QuotationLine): number | null {
+  if (
+    line.quotedQty === null ||
+    !Number.isFinite(line.quotedQty) ||
+    line.quotedQty <= 0 ||
+    !Number.isFinite(line.uomConversionFactor) ||
+    line.uomConversionFactor <= 0
+  ) {
+    return null;
+  }
+  return Math.round(line.quotedQty * line.uomConversionFactor * 1_000_000) / 1_000_000;
+}
+
+export function isLineQuantitySufficient(
+  line: QuotationLine,
+  rfqItem: RfqItem
+): { ok: boolean; convertedQty: number | null; requiredQty: number } {
+  const convertedQty = getConvertedQuotedQuantity(line);
+  const requiredQty = rfqItem.quantity;
+  if (convertedQty === null || !Number.isFinite(requiredQty) || requiredQty <= 0) {
+    return { ok: false, convertedQty, requiredQty };
+  }
+  return {
+    ok: convertedQty + QUANTITY_EPSILON >= requiredQty,
+    convertedQty,
+    requiredQty,
+  };
+}
+
+/**
+ * Currency amounts are compared at integer-cent precision (0.01 currency units)
+ * with tiny floating-point normalization (1e-9) so exact ties never trigger
+ * non-L1 justification while any >= $0.01 / ₹0.01 exceedance is enforced.
+ */
+export function roundCurrencyCents(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.round((value + Math.sign(value) * 1e-9) * 100);
+}
+
+export function isExceedingL1Total(recommendedTotal: number, l1Total: number): boolean {
+  return roundCurrencyCents(recommendedTotal) > roundCurrencyCents(l1Total);
+}
+
 export function getQuoteTotalForBasis(q: Quotation, basis: CostBasis): number {
   if (basis === 'base') return q.subtotalBase;
   if (basis === 'gross') return q.totalGrossPayable;
   return q.totalLandedCost;
 }
 
-export function getIneligibilityReasons(q: Quotation): string[] {
+export function getIneligibilityReasons(q: Quotation, rfq?: Rfq): string[] {
   const reasons: string[] = [];
   if (q.completenessRatio < 1) {
     reasons.push(`Incomplete (${Math.round(q.completenessRatio * 100)}% lines)`);
@@ -36,19 +85,53 @@ export function getIneligibilityReasons(q: Quotation): string[] {
   if (unreviewedAlternate > 0) {
     reasons.push(`${unreviewedAlternate} unreviewed alternate spec`);
   }
+  if (rfq) {
+    let shortCount = 0;
+    for (const item of rfq.items) {
+      const line = q.lines.find(
+        (l) =>
+          l.rfqItemId === item.id &&
+          l.matchStatus !== 'not_quoted' &&
+          l.matchStatus !== 'unmapped'
+      );
+      if (line && !isLineQuantitySufficient(line, item).ok) {
+        shortCount += 1;
+      }
+    }
+    if (shortCount > 0) {
+      reasons.push(`${shortCount} insufficient quoted qty`);
+    }
+  } else {
+    const missingQty = q.lines.filter(
+      (l) =>
+        Boolean(l.rfqItemId) &&
+        l.matchStatus !== 'not_quoted' &&
+        l.matchStatus !== 'unmapped' &&
+        getConvertedQuotedQuantity(l) === null
+    ).length;
+    if (missingQty > 0) {
+      reasons.push(`${missingQty} missing/invalid quoted qty`);
+    }
+  }
   return reasons;
 }
 
 /**
  * Deterministic ranking convention:
- * 1. Only complete (100% of RFQ items quoted), math-valid, commercially confirmed,
- *    human-verified quotations are eligible for L1 / L2 / L3 package ranking.
- * 2. Incomplete, invalid, or unverified quotations sort after eligible quotes and are
- *    explicitly labeled so they can never masquerade as L1 due to missing items or omitted freight.
+ * 1. Only complete (100% of RFQ items quoted with sufficient converted qty),
+ *    math-valid, commercially confirmed, human-verified quotations are eligible
+ *    for L1 / L2 / L3 package ranking.
+ * 2. Incomplete, insufficient-quantity, invalid, or unverified quotations sort
+ *    after eligible quotes and are explicitly labeled so they can never
+ *    masquerade as L1 due to missing items, short quantities, or omitted freight.
  */
-export function rankQuotations(quotes: Quotation[], basis: CostBasis): RankedQuotation[] {
+export function rankQuotations(
+  quotes: Quotation[],
+  basis: CostBasis,
+  rfq?: Rfq
+): RankedQuotation[] {
   const enriched = quotes.map((q) => {
-    const reasons = getIneligibilityReasons(q);
+    const reasons = getIneligibilityReasons(q, rfq);
     return {
       quotation: q,
       eligibleForAwardRank: reasons.length === 0,
@@ -95,8 +178,8 @@ export function rankQuotations(quotes: Quotation[], basis: CostBasis): RankedQuo
 }
 
 /**
- * Honest evaluated savings: compares only complete, math-valid quotations
- * (100% BOM coverage) so partial/incomplete quotes never inflate savings.
+ * Honest evaluated savings: compares only complete, math-valid, quantity-sufficient
+ * quotations (100% BOM coverage) so partial/short quotes never inflate savings.
  */
 export function computeEvaluatedSavings(rfqs: Rfq[], quotations: Quotation[]): number {
   let savings = 0;
@@ -106,7 +189,16 @@ export function computeEvaluatedSavings(rfqs: Rfq[], quotations: Quotation[]): n
         q.rfqId === rfq.id &&
         q.completenessRatio >= 1 &&
         q.totalLandedCost > 0 &&
-        q.lines.every((l) => l.mathValid)
+        q.lines.every((l) => l.mathValid) &&
+        rfq.items.every((item) => {
+          const line = q.lines.find(
+            (l) =>
+              l.rfqItemId === item.id &&
+              l.matchStatus !== 'not_quoted' &&
+              l.matchStatus !== 'unmapped'
+          );
+          return Boolean(line && isLineQuantitySufficient(line, item).ok);
+        })
     );
     if (completeValid.length >= 2) {
       const min = Math.min(...completeValid.map((q) => q.totalLandedCost));

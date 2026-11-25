@@ -41,24 +41,58 @@ const FORBIDDEN_TEST_DB_NAMES = new Set([
   'prod',
   'production',
   'staging',
+  'postgres',
 ]);
+
+const LOCAL_CI_TEST_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', 'postgres']);
 
 function isUnsafeTestDbName(dbName: string): boolean {
   const normalized = dbName.trim().toLowerCase();
   if (!normalized) return true;
   if (FORBIDDEN_TEST_DB_NAMES.has(normalized)) return true;
   if (normalized.includes('cloud_sql_development')) return true;
-  if (normalized === 'postgres' || normalized.includes('production')) return true;
+  if (normalized.includes('production') || normalized.includes('staging')) return true;
   return false;
 }
 
-export function getSafeTestDbConfig(): PoolConfig | null {
-  const testUrl = process.env.TEST_DATABASE_URL?.trim();
+function isUnsafeSocketHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase();
+  return normalized.startsWith('/') || normalized.includes('/cloudsql/');
+}
+
+function isPermittedOverlap(
+  env: Record<string, string | undefined>,
+  testHost: string,
+  testDbName: string
+): boolean {
+  const sqlHost = env.SQL_HOST?.trim().toLowerCase();
+  const sqlDb = env.SQL_DB_NAME?.trim().toLowerCase();
+  if (!sqlHost || !sqlDb) return true;
+  if (testHost.trim().toLowerCase() !== sqlHost || testDbName.trim().toLowerCase() !== sqlDb) {
+    return true;
+  }
+  const nodeEnv = (env.NODE_ENV || '').trim().toLowerCase();
+  const dbLower = testDbName.trim().toLowerCase();
+  return (
+    nodeEnv === 'test' &&
+    LOCAL_CI_TEST_HOSTS.has(testHost.trim().toLowerCase()) &&
+    (dbLower.endsWith('_test') || dbLower.endsWith('-test'))
+  );
+}
+
+export function getSafeTestDbConfig(
+  env: Record<string, string | undefined> = process.env
+): PoolConfig | null {
+  const testUrl = env.TEST_DATABASE_URL?.trim();
   if (testUrl) {
     try {
       const parsed = new URL(testUrl);
-      const dbName = parsed.pathname.replace(/^\/+/, '');
-      if (isUnsafeTestDbName(dbName)) {
+      const dbName = decodeURIComponent(parsed.pathname.replace(/^\/+/, ''));
+      const urlHost = parsed.searchParams.get('host') || parsed.hostname || '';
+      if (isUnsafeTestDbName(dbName) || isUnsafeSocketHost(urlHost) || isUnsafeSocketHost(testUrl)) {
+        return null;
+      }
+      if (!isPermittedOverlap(env, urlHost, dbName)) {
         return null;
       }
       return {
@@ -71,23 +105,29 @@ export function getSafeTestDbConfig(): PoolConfig | null {
     }
   }
 
-  const host = process.env.TEST_SQL_HOST?.trim();
-  const user = process.env.TEST_SQL_USER?.trim();
-  const password = process.env.TEST_SQL_PASSWORD;
-  const database = process.env.TEST_SQL_DB_NAME?.trim();
+  const host = env.TEST_SQL_HOST?.trim();
+  const user = env.TEST_SQL_USER?.trim();
+  const password = env.TEST_SQL_PASSWORD;
+  const database = env.TEST_SQL_DB_NAME?.trim();
   if (!host || !user || password === undefined || !database) {
     return null;
   }
-  if (isUnsafeTestDbName(database)) {
+  if (isUnsafeTestDbName(database) || isUnsafeSocketHost(host)) {
+    return null;
+  }
+  if (!isPermittedOverlap(env, host, database)) {
     return null;
   }
   return {
     host,
-    port: process.env.TEST_SQL_PORT ? Number(process.env.TEST_SQL_PORT) : 5432,
+    port: env.TEST_SQL_PORT ? Number(env.TEST_SQL_PORT) : 5432,
     user,
     password,
     database,
-    ssl: process.env.TEST_SQL_SSL === 'true' ? { rejectUnauthorized: false } : undefined,
+    ssl:
+      env.TEST_SQL_SSL === 'true'
+        ? { rejectUnauthorized: env.TEST_SQL_SSL_ALLOW_SELF_SIGNED !== 'true' }
+        : undefined,
     max: 5,
     connectionTimeoutMillis: 10000,
   };

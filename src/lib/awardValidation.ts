@@ -1,5 +1,17 @@
 import type { AwardAllocation, Quotation, QuotationLine, Rfq } from '../types.ts';
-import { rankQuotations } from './ranking.ts';
+import {
+  isExceedingL1Total,
+  isLineQuantitySufficient,
+  rankQuotations,
+} from './ranking.ts';
+
+export {
+  QUANTITY_EPSILON,
+  getConvertedQuotedQuantity,
+  isExceedingL1Total,
+  isLineQuantitySufficient,
+  roundCurrencyCents,
+} from './ranking.ts';
 
 export class AwardValidationError extends Error {
   statusCode: number;
@@ -20,6 +32,7 @@ export interface AwardValidationInput {
   acceptedAlternateLineIds?: unknown;
   commercialExceptionAccepted?: unknown;
   hasApprovedAward?: boolean;
+  hasPendingAward?: boolean;
 }
 
 export interface ValidatedAwardResult {
@@ -36,6 +49,13 @@ export function validateAwardSubmission(params: AwardValidationInput): Validated
 
   if (params.hasApprovedAward) {
     throw new AwardValidationError(409, 'This RFQ already has an approved award.');
+  }
+
+  if (params.hasPendingAward) {
+    throw new AwardValidationError(
+      409,
+      'This RFQ already has a pending award recommendation. Withdraw the pending award before submitting a replacement.'
+    );
   }
 
   const rawAllocs = Array.isArray(params.allocations) ? params.allocations : [];
@@ -130,6 +150,18 @@ export function validateAwardSubmission(params: AwardValidationInput): Validated
       );
     }
 
+    const qtyCheck = isLineQuantitySufficient(line, rfqItem);
+    if (!qtyCheck.ok) {
+      const convertedLabel =
+        qtyCheck.convertedQty === null
+          ? 'missing/invalid'
+          : `${qtyCheck.convertedQty} ${rfqItem.uom}`;
+      throw new AwardValidationError(
+        422,
+        `Quoted quantity (${convertedLabel}) for "${line.rawDescription}" is below required RFQ quantity (${rfqItem.quantity} ${rfqItem.uom}).`
+      );
+    }
+
     referencedQuotesMap.set(quote.id, quote);
     referencedLines.push(line);
 
@@ -215,9 +247,11 @@ export function validateAwardSubmission(params: AwardValidationInput): Validated
     }
   }
 
-  const ranked = rankQuotations(rfqQuotes, 'landed');
+  const ranked = rankQuotations(rfqQuotes, 'landed', rfq);
   const l1Eligible = ranked.find((r) => r.rankIndex === 1);
-  const isNonL1 = Boolean(l1Eligible && computedTotalLanded > l1Eligible.totalForBasis + 1);
+  const isNonL1 = Boolean(
+    l1Eligible && isExceedingL1Total(computedTotalLanded, l1Eligible.totalForBasis)
+  );
   if (isNonL1 && !trimmedJustification) {
     throw new AwardValidationError(
       400,

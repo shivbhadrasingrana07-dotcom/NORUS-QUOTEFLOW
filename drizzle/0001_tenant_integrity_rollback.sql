@@ -1,4 +1,6 @@
--- NORUS QUOTEFLOW Task 007 — Rollback for 0001_tenant_integrity.sql
+-- NORUS QUOTEFLOW Task 007 / 007.2 — Rollback for 0001_tenant_integrity.sql
+
+BEGIN;
 
 DROP INDEX IF EXISTS suppliers_org_norm_tax_id_uidx;
 DROP INDEX IF EXISTS suppliers_org_norm_name_uidx;
@@ -33,3 +35,5 @@ ALTER TABLE rfq_items DROP CONSTRAINT IF EXISTS rfq_items_org_id_uniq;
 ALTER TABLE rfqs DROP CONSTRAINT IF EXISTS rfqs_org_id_uniq;
 ALTER TABLE catalog_items DROP CONSTRAINT IF EXISTS catalog_items_org_id_uniq;
 ALTER TABLE suppliers DROP CONSTRAINT IF EXISTS suppliers_org_id_uniq;
+
+COMMIT;

@@ -19,7 +19,6 @@ import {
   users,
 } from '../src/db/schema.ts';
 import { AwardValidationError, validateAwardSubmission } from '../src/lib/awardValidation.ts';
-import { rankQuotations } from '../src/lib/ranking.ts';
 import type {
   AuditLogEntry,
   AuthUser,
@@ -73,6 +72,7 @@ const DEFAULT_UOM_ALIASES: Record<string, string> = {
 
 const VALID_CURRENCIES = new Set(['INR', 'USD', 'GBP', 'EUR']);
 const VALID_TAX_REGIMES = new Set(['INDIA_GST', 'UK_VAT', 'US_TAX', 'NONE']);
+const VALID_MATCH_STATUSES = new Set(['matched', 'unmapped', 'not_quoted', 'alternate_spec']);
 
 function makeId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${generateSecureToken(6)}`;
@@ -92,6 +92,18 @@ function isNonNegativeFinite(val: unknown): val is number {
 
 function isPositiveFinite(val: unknown): val is number {
   return typeof val === 'number' && Number.isFinite(val) && val > 0;
+}
+
+function parseOptionalNonNegativeInt(val: unknown): number | null {
+  if (val === null || val === '') return null;
+  if (typeof val === 'boolean') {
+    throw new StoreError(400, 'leadTimeDays must be a non-negative whole integer.');
+  }
+  const n = typeof val === 'number' ? val : typeof val === 'string' ? Number(val.trim()) : NaN;
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) {
+    throw new StoreError(400, 'leadTimeDays must be a non-negative whole integer.');
+  }
+  return n;
 }
 
 function handleDbError(err: unknown, context: string): never {
@@ -1963,7 +1975,7 @@ export class PgDataStore {
       const m = r.rfqNumber.match(/^RFQ-\d{4}-(\d+)$/);
       if (m) {
         const n = parseInt(m[1], 10);
-        if (Number.isFinite(n) && n > maxSeq && n < 9000) {
+        if (Number.isFinite(n) && n > maxSeq) {
           maxSeq = n;
         }
       }
@@ -2015,6 +2027,7 @@ export class PgDataStore {
           .select()
           .from(organizations)
           .where(eq(organizations.id, params.organizationId))
+          .for('update')
           .limit(1);
         if (!org) throw new StoreError(404, 'Organization not found.');
 
@@ -2943,6 +2956,38 @@ export class PgDataStore {
     }
   }
 
+  private async assertQuotationMutableTx(
+    tx: Parameters<Parameters<DrizzleDb['transaction']>[0]>[0],
+    organizationId: string,
+    quotationId: string
+  ): Promise<void> {
+    const linkedAwards = await tx
+      .select({
+        approvalStatus: awards.approvalStatus,
+      })
+      .from(awardAllocations)
+      .innerJoin(awards, eq(awardAllocations.awardId, awards.id))
+      .where(
+        and(
+          eq(awardAllocations.quotationId, quotationId),
+          eq(awardAllocations.organizationId, organizationId)
+        )
+      );
+
+    if (linkedAwards.some((row) => row.approvalStatus === 'approved')) {
+      throw new StoreError(
+        409,
+        'Cannot modify or re-verify a quotation locked by an approved award decision.'
+      );
+    }
+    if (linkedAwards.some((row) => row.approvalStatus === 'pending')) {
+      throw new StoreError(
+        409,
+        'Cannot modify or re-verify a quotation while an award recommendation referencing it is pending approval. Withdraw the pending award first.'
+      );
+    }
+  }
+
   async updateQuotationHeader(params: {
     organizationId: string;
     quoteId: string;
@@ -2966,12 +3011,14 @@ export class PgDataStore {
       if (body.exchangeRateToRfq !== undefined && !isPositiveFinite(body.exchangeRateToRfq)) {
         throw new StoreError(400, 'exchangeRateToRfq must be greater than 0.');
       }
-      if (
-        body.leadTimeDays !== undefined &&
-        body.leadTimeDays !== null &&
-        (!Number.isFinite(body.leadTimeDays) || Number(body.leadTimeDays) < 0)
-      ) {
-        throw new StoreError(400, 'leadTimeDays cannot be negative.');
+      const parsedLeadTimeDays =
+        body.leadTimeDays !== undefined
+          ? parseOptionalNonNegativeInt(body.leadTimeDays)
+          : undefined;
+      if (body.quoteReference !== undefined) {
+        if (typeof body.quoteReference !== 'string' || !body.quoteReference.trim()) {
+          throw new StoreError(400, 'quoteReference cannot be empty.');
+        }
       }
 
       return await this.db.transaction(async (tx) => {
@@ -2980,16 +3027,25 @@ export class PgDataStore {
           params.organizationId,
           params.quoteId
         );
+        await this.assertQuotationMutableTx(tx, params.organizationId, quote.id);
 
-        const updated: Quotation = { ...quote, isVerified: false };
+        const updated: Quotation = {
+          ...quote,
+          isVerified: false,
+          verifiedBy: null,
+          verifiedAt: null,
+        };
         if (body.quoteReference !== undefined) {
-          updated.quoteReference = String(body.quoteReference).trim();
+          updated.quoteReference = String(body.quoteReference).trim().slice(0, 120);
         }
-        if (body.leadTimeDays !== undefined) {
-          updated.leadTimeDays = body.leadTimeDays as number | null;
+        if (parsedLeadTimeDays !== undefined) {
+          updated.leadTimeDays = parsedLeadTimeDays;
         }
         if (body.paymentTerms !== undefined) {
-          updated.paymentTerms = body.paymentTerms as string | null;
+          updated.paymentTerms =
+            typeof body.paymentTerms === 'string' && body.paymentTerms.trim()
+              ? body.paymentTerms.trim()
+              : null;
         }
         if (body.freightCharges !== undefined) {
           updated.freightCharges = body.freightCharges as number;
@@ -3013,7 +3069,10 @@ export class PgDataStore {
           updated.exchangeRateToRfq = body.exchangeRateToRfq as number;
         }
         if (body.validUntil !== undefined) {
-          updated.validUntil = body.validUntil as string | null;
+          updated.validUntil =
+            typeof body.validUntil === 'string' && body.validUntil.trim()
+              ? body.validUntil.trim()
+              : null;
         }
 
         const recomputed = recomputeQuotation(updated, rfq);
@@ -3051,6 +3110,7 @@ export class PgDataStore {
       if (
         body.quotedQty !== undefined &&
         body.quotedQty !== null &&
+        body.quotedQty !== '' &&
         !isPositiveFinite(body.quotedQty)
       ) {
         throw new StoreError(400, 'quotedQty must be greater than 0.');
@@ -3058,6 +3118,7 @@ export class PgDataStore {
       if (
         body.quotedUnitRate !== undefined &&
         body.quotedUnitRate !== null &&
+        body.quotedUnitRate !== '' &&
         !isNonNegativeFinite(body.quotedUnitRate)
       ) {
         throw new StoreError(400, 'quotedUnitRate cannot be negative.');
@@ -3080,9 +3141,19 @@ export class PgDataStore {
       if (
         body.lineTotalQuoted !== undefined &&
         body.lineTotalQuoted !== null &&
+        body.lineTotalQuoted !== '' &&
         !isNonNegativeFinite(body.lineTotalQuoted)
       ) {
         throw new StoreError(400, 'lineTotalQuoted cannot be negative.');
+      }
+      if (
+        body.matchStatus !== undefined &&
+        (typeof body.matchStatus !== 'string' || !VALID_MATCH_STATUSES.has(body.matchStatus))
+      ) {
+        throw new StoreError(
+          400,
+          'matchStatus must be one of: matched, unmapped, not_quoted, alternate_spec.'
+        );
       }
 
       return await this.db.transaction(async (tx) => {
@@ -3091,6 +3162,7 @@ export class PgDataStore {
           params.organizationId,
           params.quoteId
         );
+        await this.assertQuotationMutableTx(tx, params.organizationId, quote.id);
 
         const lineIndex = quote.lines.findIndex((l) => l.id === params.lineId);
         if (lineIndex === -1) throw new StoreError(404, 'Quotation line not found.');
@@ -3102,15 +3174,28 @@ export class PgDataStore {
         }
 
         const prevLine = quote.lines[lineIndex];
+        const nextMatchStatus = (
+          body.matchStatus !== undefined ? body.matchStatus : prevLine.matchStatus
+        ) as QuotationLine['matchStatus'];
+        const nextVerifiedField =
+          typeof body.verifiedField === 'boolean'
+            ? body.verifiedField
+            : nextMatchStatus === 'alternate_spec'
+            ? false
+            : true;
+
         const updatedLine: QuotationLine = {
           ...prevLine,
           ...(body.rfqItemId !== undefined ? { rfqItemId: body.rfqItemId as string | null } : {}),
-          ...(body.matchStatus !== undefined
-            ? { matchStatus: body.matchStatus as QuotationLine['matchStatus'] }
+          ...(body.matchStatus !== undefined ? { matchStatus: nextMatchStatus } : {}),
+          ...(body.quotedQty !== undefined
+            ? { quotedQty: body.quotedQty === '' ? null : (body.quotedQty as number | null) }
             : {}),
-          ...(body.quotedQty !== undefined ? { quotedQty: body.quotedQty as number | null } : {}),
           ...(body.quotedUnitRate !== undefined
-            ? { quotedUnitRate: body.quotedUnitRate as number | null }
+            ? {
+                quotedUnitRate:
+                  body.quotedUnitRate === '' ? null : (body.quotedUnitRate as number | null),
+              }
             : {}),
           ...(body.uomConversionFactor !== undefined
             ? { uomConversionFactor: body.uomConversionFactor as number }
@@ -3123,15 +3208,20 @@ export class PgDataStore {
             ? { discountAmount: body.discountAmount as number }
             : {}),
           ...(body.lineTotalQuoted !== undefined
-            ? { lineTotalQuoted: body.lineTotalQuoted as number | null }
+            ? {
+                lineTotalQuoted:
+                  body.lineTotalQuoted === '' ? null : (body.lineTotalQuoted as number | null),
+              }
             : {}),
           humanEdited: true,
-          verifiedField: typeof body.verifiedField === 'boolean' ? body.verifiedField : true,
+          verifiedField: nextVerifiedField,
         };
 
         const nextQuote: Quotation = {
           ...quote,
           isVerified: false,
+          verifiedBy: null,
+          verifiedAt: null,
           lines: quote.lines.map((l, idx) => (idx === lineIndex ? updatedLine : l)),
         };
 
@@ -3170,6 +3260,7 @@ export class PgDataStore {
           params.organizationId,
           params.quoteId
         );
+        await this.assertQuotationMutableTx(tx, params.organizationId, quote.id);
 
         const recomputedPre = recomputeQuotation(quote, rfq);
         const unresolvedMath = recomputedPre.lines.filter((l) => !l.mathValid);
@@ -3251,31 +3342,18 @@ export class PgDataStore {
           );
         }
 
-        const pendingAwardIds = [
-          ...new Set(
-            linkedAllocs
-              .filter((row) => row.award.approvalStatus === 'pending')
-              .map((row) => row.award.id)
-          ),
-        ];
-
-        for (const awardId of pendingAwardIds) {
-          await tx
-            .delete(awards)
-            .where(and(eq(awards.id, awardId), eq(awards.organizationId, params.organizationId)));
+        if (linkedAllocs.some((row) => row.award.approvalStatus === 'pending')) {
+          throw new StoreError(
+            409,
+            'Cannot delete a quotation referenced by a pending award recommendation. Withdraw the pending award first.'
+          );
         }
 
-        if (pendingAwardIds.length > 0) {
-          await tx
-            .update(rfqs)
-            .set({ status: 'in_review', updatedAt: new Date().toISOString() })
-            .where(
-              and(
-                eq(rfqs.id, target.rfqId),
-                eq(rfqs.organizationId, params.organizationId),
-                eq(rfqs.status, 'pending_approval')
-              )
-            );
+        if (linkedAllocs.some((row) => row.award.approvalStatus === 'rejected')) {
+          throw new StoreError(
+            409,
+            'Cannot delete a quotation referenced by a historical rejected award decision to preserve procurement auditability.'
+          );
         }
 
         let deletedDoc: { id: string; storageKey: string } | undefined;
@@ -3364,17 +3442,13 @@ export class PgDataStore {
           .limit(1);
         if (!rfqRow) throw new StoreError(404, 'RFQ not found.');
 
-        const [existingApproved] = await tx
-          .select({ id: awards.id })
+        const existingAwards = await tx
+          .select({ id: awards.id, approvalStatus: awards.approvalStatus })
           .from(awards)
-          .where(
-            and(
-              eq(awards.rfqId, rfqRow.id),
-              eq(awards.organizationId, params.organizationId),
-              eq(awards.approvalStatus, 'approved')
-            )
-          )
-          .limit(1);
+          .where(and(eq(awards.rfqId, rfqRow.id), eq(awards.organizationId, params.organizationId)));
+
+        const existingApproved = existingAwards.some((a) => a.approvalStatus === 'approved');
+        const existingPending = existingAwards.some((a) => a.approvalStatus === 'pending');
 
         const rItems = await tx
           .select()
@@ -3507,22 +3581,13 @@ export class PgDataStore {
           nonL1Justification: params.nonL1Justification,
           acceptedAlternateLineIds: params.acceptedAlternateLineIds,
           commercialExceptionAccepted: params.commercialExceptionAccepted,
-          hasApprovedAward: Boolean(existingApproved),
+          hasApprovedAward: existingApproved,
+          hasPendingAward: existingPending,
         });
 
         const verifiedAllocations = validated.allocations;
         const computedTotalLanded = validated.totalAwardedLanded;
         const trimmedJust = validated.nonL1Justification;
-
-        await tx
-          .delete(awards)
-          .where(
-            and(
-              eq(awards.rfqId, rfqRow.id),
-              eq(awards.organizationId, params.organizationId),
-              eq(awards.approvalStatus, 'pending')
-            )
-          );
 
         const nowIso = new Date().toISOString();
         const awardId = makeId('award');
@@ -3592,6 +3657,113 @@ export class PgDataStore {
       });
     } catch (err) {
       handleDbError(err, 'submitAward');
+    }
+  }
+
+  async withdrawAward(params: {
+    organizationId: string;
+    awardId: string;
+    actorUserId: string;
+    actorName: string;
+    actorRole: UserRole;
+  }): Promise<{ withdrawnAwardId: string; rfq: Rfq }> {
+    try {
+      return await this.db.transaction(async (tx) => {
+        const [awardRow] = await tx
+          .select()
+          .from(awards)
+          .where(
+            and(eq(awards.id, params.awardId), eq(awards.organizationId, params.organizationId))
+          )
+          .for('update')
+          .limit(1);
+
+        if (!awardRow) throw new StoreError(404, 'Award recommendation not found.');
+        if (awardRow.approvalStatus !== 'pending') {
+          throw new StoreError(
+            409,
+            'Only pending award recommendations can be withdrawn; finalized decisions are preserved for audit.'
+          );
+        }
+
+        const [rfqRow] = await tx
+          .select()
+          .from(rfqs)
+          .where(
+            and(eq(rfqs.id, awardRow.rfqId), eq(rfqs.organizationId, params.organizationId))
+          )
+          .for('update')
+          .limit(1);
+        if (!rfqRow) throw new StoreError(404, 'Parent RFQ not found.');
+
+        const rItems = await tx
+          .select()
+          .from(rfqItems)
+          .where(
+            and(eq(rfqItems.rfqId, rfqRow.id), eq(rfqItems.organizationId, params.organizationId))
+          )
+          .orderBy(asc(rfqItems.lineNo));
+
+        await tx
+          .delete(awards)
+          .where(
+            and(
+              eq(awards.id, awardRow.id),
+              eq(awards.organizationId, params.organizationId),
+              eq(awards.approvalStatus, 'pending')
+            )
+          );
+
+        const nowIso = new Date().toISOString();
+        const nextStatus: Rfq['status'] =
+          rfqRow.status === 'pending_approval' ? 'in_review' : (rfqRow.status as Rfq['status']);
+        await tx
+          .update(rfqs)
+          .set({ status: nextStatus, updatedAt: nowIso })
+          .where(and(eq(rfqs.id, rfqRow.id), eq(rfqs.organizationId, params.organizationId)));
+
+        await this.appendAuditTx(tx, {
+          organizationId: params.organizationId,
+          actorUserId: params.actorUserId,
+          actorName: params.actorName,
+          actorRole: params.actorRole,
+          entityType: 'award',
+          entityId: awardRow.id,
+          action: 'AWARD_WITHDRAWN',
+          detail: `Withdrew pending award recommendation for ${rfqRow.rfqNumber}.`,
+        });
+
+        return {
+          withdrawnAwardId: awardRow.id,
+          rfq: {
+            id: rfqRow.id,
+            rfqNumber: rfqRow.rfqNumber,
+            title: rfqRow.title,
+            status: nextStatus,
+            currency: rfqRow.currency as Rfq['currency'],
+            incoterms: rfqRow.incoterms,
+            deliveryLocation: rfqRow.deliveryLocation,
+            deadlineDate: rfqRow.deadlineDate,
+            createdBy: rfqRow.createdBy,
+            createdAt: rfqRow.createdAt,
+            updatedAt: nowIso,
+            invitedSupplierIds: rfqRow.invitedSupplierIds || [],
+            items: rItems.map((it) => ({
+              id: it.id,
+              rfqId: it.rfqId,
+              itemId: it.itemId,
+              lineNo: it.lineNo,
+              skuCode: it.skuCode,
+              description: it.description,
+              quantity: it.quantity,
+              uom: it.uom,
+              targetUnitPrice: it.targetUnitPrice,
+            })),
+          },
+        };
+      });
+    } catch (err) {
+      handleDbError(err, 'withdrawAward');
     }
   }
 

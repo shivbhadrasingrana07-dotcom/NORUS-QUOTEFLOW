@@ -2,7 +2,7 @@
 
 NORUS QUOTEFLOW persists all identity, multi-tenant access control, procurement records, private document metadata, audit trails, and rate-limit buckets in PostgreSQL (`src/db/schema.ts`, initial migration `drizzle/0000_illegal_major_mapleleaf.sql`, and tenant-integrity hardening migration `drizzle/0001_tenant_integrity.sql` with preflight `drizzle/0001_tenant_integrity_preflight.sql` and rollback `drizzle/0001_tenant_integrity_rollback.sql`).
 
-> **Deployment Note:** `drizzle/0001_tenant_integrity.sql` is checked into the repository and applied in CI against PostgreSQL 16; apply it to Cloud SQL only after running `0001_tenant_integrity_preflight.sql` and taking an instance backup.
+> **Deployment Note:** `drizzle/0001_tenant_integrity.sql` and `drizzle/0001_tenant_integrity_rollback.sql` wrap all DDL statements in `BEGIN; ... COMMIT;` and target **PostgreSQL 15+** (using column-list `ON DELETE SET NULL (<col>)`). They are executed explicitly via `psql` / CI outside Drizzle `_journal.json`. Apply to Cloud SQL only during a scheduled maintenance window after running `0001_tenant_integrity_preflight.sql` and taking an instance backup.
 
 ## Relational Tables (17 Tables)
 
@@ -42,8 +42,11 @@ Every table below enforces a non-null `organization_id` FK (`ON DELETE CASCADE`)
    - `price_history.rfq_id` and `price_history.supplier_id` are intentionally stored as historical snapshot references without foreign keys to `rfqs` or `suppliers`, preserving historical awarded landed-price memory (`price_history.catalog_item_id` remains scoped via `(organization_id, catalog_item_id)`).
 3. **Audit Logs (`audit_logs`):**
    - Immutability (append-only behavior) is **application-enforced**: `PgDataStore`, `ownerBootstrap.ts`, and `legacyMigration.ts` perform `INSERT`-only writes with no update/delete endpoints or queries (no PostgreSQL trigger/rule is installed at the DB layer).
-4. **Approved Quote Deletion & Row Locking:**
-   - Deleting a quotation referenced by an `approved` award is blocked with `409 Conflict` (`award_allocations.quotation_id` uses `ON DELETE RESTRICT` + explicit server check). `submitAward` and `decideAward` use row locks (`FOR UPDATE`) plus atomic conditional `UPDATE ... WHERE approval_status = 'pending'`.
+4. **Historical Award Snapshot Preservation, Locking & Concurrent RFQ Numbering:**
+   - `award_allocations.quotation_id` and `award_allocations.quotation_line_id` use `ON DELETE RESTRICT` by design, and server handlers reject quotation deletion (`409 Conflict`) whenever a quotation is referenced by an `approved`, `pending`, or `rejected` award so historical award snapshots remain intact.
+   - Header/line mutations and verification are blocked (`409 Conflict`) when a quotation is referenced by a `pending` or `approved` award.
+   - `submitAward` preserves historical `rejected` award rows instead of deleting them and rejects duplicate `pending`/`approved` awards (`409`). `submitAward`, `decideAward`, and `withdrawAward` hold transaction row locks (`FOR UPDATE`).
+   - `createRfq` acquires a `FOR UPDATE` row lock on the parent `organizations` row and scans existing yearly `RFQ-YYYY-XXXX` numbers without any `< 9000` upper cutoff.
 5. **Cross-Tenant & Supplier Protection:** Every query filters by `organization_id = req.auth.activeOrganization.id`; duplicate supplier name/Tax ID returns `409 Conflict`.
 
 ## Legacy JSON Migration (`server/legacyMigration.ts`)

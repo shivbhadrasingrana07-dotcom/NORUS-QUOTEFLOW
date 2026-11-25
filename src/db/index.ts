@@ -1,3 +1,4 @@
+import fs from 'fs';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { Pool } from 'pg';
 import * as schema from './schema.ts';
@@ -16,6 +17,39 @@ export function isSqlEnvConfigured(): boolean {
   );
 }
 
+export function buildPgSslConfig(
+  env: Record<string, string | undefined> = process.env
+): { rejectUnauthorized: boolean; ca?: string } | undefined {
+  if ((env.SQL_SSL || '').trim().toLowerCase() !== 'true') {
+    return undefined;
+  }
+  const host = (env.SQL_HOST || '').trim();
+  // Cloud SQL Auth Proxy / Unix domain socket connections do not use TCP TLS
+  if (host.startsWith('/')) {
+    return undefined;
+  }
+
+  const rawCa = env.SQL_SSL_CA?.trim();
+  let ca: string | undefined;
+  if (rawCa) {
+    if (rawCa.includes('BEGIN CERTIFICATE')) {
+      ca = rawCa.replace(/\\n/g, '\n');
+    } else {
+      try {
+        ca = fs.readFileSync(rawCa, 'utf8');
+      } catch {
+        throw new Error(`Configuration error: Unable to read SQL_SSL_CA certificate file at "${rawCa}".`);
+      }
+    }
+  }
+
+  const allowSelfSigned = (env.SQL_SSL_ALLOW_SELF_SIGNED || '').trim().toLowerCase() === 'true';
+  return {
+    rejectUnauthorized: !allowSelfSigned,
+    ...(ca ? { ca } : {}),
+  };
+}
+
 export const createPool = () => {
   if (!global._postgresPool) {
     global._postgresPool = new Pool({
@@ -24,7 +58,7 @@ export const createPool = () => {
       user: process.env.SQL_USER,
       password: process.env.SQL_PASSWORD,
       database: process.env.SQL_DB_NAME,
-      ssl: process.env.SQL_SSL === 'true' ? { rejectUnauthorized: false } : undefined,
+      ssl: buildPgSslConfig(process.env),
       max: 10,
       connectionTimeoutMillis: 15000,
     });

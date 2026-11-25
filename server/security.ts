@@ -122,6 +122,18 @@ function shouldUseSecureCookie(req: Request): boolean {
   return false;
 }
 
+export function resolveCookieSameSite(
+  secure: boolean,
+  env: Record<string, string | undefined> = process.env
+): 'None' | 'Lax' | 'Strict' {
+  const configured = (env.COOKIE_SAMESITE || '').trim().toLowerCase();
+  if (configured === 'strict') return 'Strict';
+  if (configured === 'lax') return 'Lax';
+  if (configured === 'none') return secure ? 'None' : 'Lax';
+  // HTTPS preview iframes require SameSite=None; Secure; plain HTTP localhost uses Lax
+  return secure ? 'None' : 'Lax';
+}
+
 export function setAuthCookies(
   req: Request,
   res: Response,
@@ -129,7 +141,7 @@ export function setAuthCookies(
   csrfToken: string
 ): void {
   const secure = shouldUseSecureCookie(req);
-  const sameSite = secure ? 'None' : 'Lax';
+  const sameSite = resolveCookieSameSite(secure);
   const maxAgeSec = Math.floor(SESSION_TTL_MS / 1000);
 
   const sessionCookie = [
@@ -158,7 +170,7 @@ export function setAuthCookies(
 
 export function clearAuthCookies(req: Request, res: Response): void {
   const secure = shouldUseSecureCookie(req);
-  const sameSite = secure ? 'None' : 'Lax';
+  const sameSite = resolveCookieSameSite(secure);
   const expire = 'Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT';
   res.setHeader('Set-Cookie', [
     `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; ${expire}; SameSite=${sameSite}${secure ? '; Secure' : ''}`,

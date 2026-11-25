@@ -114,7 +114,7 @@ export function RfqsListView({
             <tbody className="divide-y divide-[#E2E8F0]">
               {filtered.map((rfq) => {
                 const rq = quotations.filter((q) => q.rfqId === rfq.id);
-                const l1 = rankQuotations(rq, 'landed').find((r) => r.rankIndex === 1);
+                const l1 = rankQuotations(rq, 'landed', rfq).find((r) => r.rankIndex === 1);
                 const best = l1 ? l1.totalForBasis : null;
                 return (
                   <tr

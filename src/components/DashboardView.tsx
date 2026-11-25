@@ -252,7 +252,7 @@ export function DashboardView({
             <tbody className="divide-y divide-[#E2E8F0] text-sm">
               {rfqs.map((rfq) => {
                 const rQuotes = quotations.filter((q) => q.rfqId === rfq.id);
-                const ranked = rankQuotations(rQuotes, 'landed');
+                const ranked = rankQuotations(rQuotes, 'landed', rfq);
                 const l1 = ranked.find((r) => r.rankIndex === 1);
                 const bestLanded = l1 ? l1.totalForBasis : null;
                 return (

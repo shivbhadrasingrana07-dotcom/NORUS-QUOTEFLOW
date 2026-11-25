@@ -26,6 +26,7 @@ import {
 } from '../types.ts';
 import { formatDateShort, formatMoney, rfqStatusLabel } from '../lib/format.ts';
 import { exportComparativeStatementExcel, exportComparativeStatementPdf } from '../lib/exporters.ts';
+import { isLineQuantitySufficient } from '../lib/awardValidation.ts';
 import { rankQuotations } from '../lib/ranking.ts';
 import { ExtractionReviewPane } from './ExtractionReviewPane.tsx';
 import { ComparisonMatrixPane } from './ComparisonMatrixPane.tsx';
@@ -70,6 +71,7 @@ interface RfqWorkspaceProps {
     decision: 'approved' | 'rejected',
     approverNotes: string
   ) => Promise<void>;
+  onWithdrawAward: (awardId: string) => Promise<void>;
   demoMode?: boolean;
   demoSessionId?: string | null;
 }
@@ -94,6 +96,7 @@ export function RfqWorkspace({
   onDeleteQuote,
   onSubmitAward,
   onDecideAward,
+  onWithdrawAward,
   demoMode = false,
   demoSessionId = null,
 }: RfqWorkspaceProps) {
@@ -123,13 +126,14 @@ export function RfqWorkspace({
   const [approverNotes, setApproverNotes] = useState('');
   const [awardBusy, setAwardBusy] = useState(false);
   const [awardError, setAwardError] = useState<string | null>(null);
+  const [showRevisionForm, setShowRevisionForm] = useState(false);
   const [deletingQuoteId, setDeletingQuoteId] = useState<string | null>(null);
 
   const quotesSignature = quotes
     .map(
       (q) =>
         `${q.id}:${q.totalLandedCost}:${q.isVerified}:${q.missingFreightWarning}:${q.lines
-          .map((l) => `${l.id}:${l.matchStatus}`)
+          .map((l) => `${l.id}:${l.matchStatus}:${l.quotedQty}:${l.uomConversionFactor}`)
           .join(',')}`
     )
     .join('|');
@@ -143,6 +147,7 @@ export function RfqWorkspace({
     setApproverNotes('');
     setAwardError(null);
     setUploadError(null);
+    setShowRevisionForm(false);
     setUploadSupplierId(rfq.invitedSupplierIds[0] || suppliers[0]?.id || '');
   }, [rfq.id]);
 
@@ -153,7 +158,31 @@ export function RfqWorkspace({
     setCommercialExceptionAccepted(false);
   }, [rfq.id, quotesSignature]);
 
-  const existingAward = awards.find((a) => a.rfqId === rfq.id) || null;
+  const rfqAwards = awards
+    .filter((a) => a.rfqId === rfq.id)
+    .slice()
+    .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+  const approvedAward = rfqAwards.find((a) => a.approvalStatus === 'approved') || null;
+  const pendingAward = rfqAwards.find((a) => a.approvalStatus === 'pending') || null;
+  const rejectedAwards = rfqAwards.filter((a) => a.approvalStatus === 'rejected');
+  const activeAward = approvedAward || pendingAward;
+
+  const editLockedQuoteIds = new Set<string>();
+  const deleteLockedQuoteIds = new Set<string>();
+  for (const aw of rfqAwards) {
+    for (const al of aw.allocations) {
+      deleteLockedQuoteIds.add(al.quotationId);
+      if (aw.approvalStatus === 'approved' || aw.approvalStatus === 'pending') {
+        editLockedQuoteIds.add(al.quotationId);
+      }
+    }
+  }
+
+  const canWithdrawPending =
+    demoMode || ['owner', 'admin', 'buyer'].includes(settings.activeUserRole);
+  const canDecidePending =
+    demoMode || ['owner', 'admin', 'approver'].includes(settings.activeUserRole);
+
   const getSupplierName = (id: string) =>
     suppliers.find((s) => s.id === id)?.name || 'Unknown Supplier';
 
@@ -203,7 +232,7 @@ export function RfqWorkspace({
   };
 
   // Default award payload if user opens Approval tab directly (uses verified-complete L1 if available)
-  const rankedQuotes = rankQuotations(quotes, 'landed');
+  const rankedQuotes = rankQuotations(quotes, 'landed', rfq);
   const l1EligibleQuote = rankedQuotes.find((r) => r.rankIndex === 1)?.quotation || null;
   const effectiveDraft =
     draftAward ||
@@ -218,7 +247,8 @@ export function RfqWorkspace({
                 line.matchStatus === 'not_quoted' ||
                 line.matchStatus === 'unmapped' ||
                 !line.mathValid ||
-                line.normalizedUnitLanded === null
+                line.normalizedUnitLanded === null ||
+                !isLineQuantitySufficient(line, item).ok
               ) {
                 return null;
               }
@@ -316,6 +346,8 @@ export function RfqWorkspace({
         acceptedAlternateLineIds,
         commercialExceptionAccepted,
       });
+      setDraftAward(null);
+      setShowRevisionForm(false);
     } catch (err) {
       setAwardError(err instanceof Error ? err.message : 'Failed to submit recommendation');
     } finally {
@@ -324,13 +356,30 @@ export function RfqWorkspace({
   };
 
   const handleDecision = async (decision: 'approved' | 'rejected') => {
-    if (!existingAward) return;
+    if (!pendingAward) return;
     setAwardError(null);
     try {
       setAwardBusy(true);
-      await onDecideAward(existingAward.id, decision, approverNotes);
+      await onDecideAward(pendingAward.id, decision, approverNotes);
+      setApproverNotes('');
+      setShowRevisionForm(false);
     } catch (err) {
       setAwardError(err instanceof Error ? err.message : 'Decision failed');
+    } finally {
+      setAwardBusy(false);
+    }
+  };
+
+  const handleWithdraw = async () => {
+    if (!pendingAward) return;
+    setAwardError(null);
+    try {
+      setAwardBusy(true);
+      await onWithdrawAward(pendingAward.id);
+      setDraftAward(null);
+      setShowRevisionForm(false);
+    } catch (err) {
+      setAwardError(err instanceof Error ? err.message : 'Unable to withdraw recommendation');
     } finally {
       setAwardBusy(false);
     }
@@ -381,7 +430,7 @@ export function RfqWorkspace({
                 suppliers,
                 settings,
                 auditLogs,
-                award: existingAward || undefined,
+                award: activeAward || undefined,
               })
             }
             disabled={quotes.length === 0}
@@ -398,7 +447,7 @@ export function RfqWorkspace({
                 suppliers,
                 settings,
                 basis,
-                award: existingAward || undefined,
+                award: activeAward || undefined,
               })
             }
             disabled={quotes.length === 0}
@@ -669,6 +718,12 @@ export function RfqWorkspace({
                           ) : (
                             <span className="text-[#D97706] font-medium">Needs Review</span>
                           )}
+                          {editLockedQuoteIds.has(q.id) && (
+                            <>
+                              <span aria-hidden="true">·</span>
+                              <span className="text-[#0F4C81] font-medium">Locked by Award</span>
+                            </>
+                          )}
                         </div>
                       </div>
 
@@ -684,7 +739,7 @@ export function RfqWorkspace({
                         </button>
                         <button
                           onClick={async () => {
-                            if (deletingQuoteId) return;
+                            if (deletingQuoteId || deleteLockedQuoteIds.has(q.id)) return;
                             setUploadError(null);
                             try {
                               setDeletingQuoteId(q.id);
@@ -697,8 +752,12 @@ export function RfqWorkspace({
                               setDeletingQuoteId(null);
                             }
                           }}
-                          disabled={deletingQuoteId === q.id}
-                          title="Delete quotation"
+                          disabled={deletingQuoteId === q.id || deleteLockedQuoteIds.has(q.id)}
+                          title={
+                            deleteLockedQuoteIds.has(q.id)
+                              ? 'Quotation is preserved because it is referenced by a pending, rejected, or approved award'
+                              : 'Delete quotation'
+                          }
                           className="p-1.5 text-[#475569] hover:text-[#DC2626] rounded disabled:opacity-40"
                         >
                           <Trash2 className="w-4 h-4" />
@@ -720,6 +779,7 @@ export function RfqWorkspace({
           quotes={quotes}
           suppliers={suppliers}
           selectedQuoteId={selectedQuoteId}
+          lockedQuoteIds={editLockedQuoteIds}
           onSelectQuote={onSelectQuote}
           onUpdateHeader={onUpdateHeader}
           onUpdateLine={onUpdateLine}
@@ -745,6 +805,7 @@ export function RfqWorkspace({
           }}
           onProceedToAward={(draft) => {
             setDraftAward(draft);
+            setShowRevisionForm(true);
             onChangeTab('approval');
           }}
           onExportPdf={() =>
@@ -754,7 +815,7 @@ export function RfqWorkspace({
               suppliers,
               settings,
               basis,
-              award: existingAward || undefined,
+              award: activeAward || undefined,
             })
           }
           onExportExcel={() =>
@@ -764,7 +825,7 @@ export function RfqWorkspace({
               suppliers,
               settings,
               auditLogs,
-              award: existingAward || undefined,
+              award: activeAward || undefined,
             })
           }
         />
@@ -794,45 +855,43 @@ export function RfqWorkspace({
               </div>
             )}
 
-            {existingAward ? (
+            {activeAward ? (
               <div className="space-y-4">
                 <div className="p-4 bg-[#F8FAFC] border border-[#E2E8F0] rounded-lg space-y-2 text-xs">
                   <div className="flex items-center justify-between">
                     <span className="font-semibold text-[#0F172A]">
-                      {existingAward.isSplitAward ? 'Split-Vendor Award' : 'Single-Vendor Package Award'}
+                      {activeAward.isSplitAward ? 'Split-Vendor Award' : 'Single-Vendor Package Award'}
                     </span>
                     <span
                       className={`font-semibold ${
-                        existingAward.approvalStatus === 'approved'
+                        activeAward.approvalStatus === 'approved'
                           ? 'text-[#059669]'
-                          : existingAward.approvalStatus === 'rejected'
-                          ? 'text-[#DC2626]'
                           : 'text-[#0F4C81]'
                       }`}
                     >
-                      {existingAward.approvalStatus.toUpperCase()}
+                      {activeAward.approvalStatus.toUpperCase()}
                     </span>
                   </div>
                   <div className="font-mono tabular-nums text-lg font-bold text-[#0F172A]">
-                    {formatMoney(existingAward.totalAwardedLanded, rfq.currency)}
+                    {formatMoney(activeAward.totalAwardedLanded, rfq.currency)}
                     <span className="text-xs font-sans font-normal text-[#475569] ml-2">
                       Total Landed Cost
                     </span>
                   </div>
                   <div className="text-[#475569]">
-                    Recommended by {existingAward.recommendedBy} on{' '}
-                    {formatDateShort(existingAward.createdAt)}
-                    {existingAward.approvedBy &&
-                      ` · Decided by ${existingAward.approvedBy} on ${formatDateShort(existingAward.decidedAt)}`}
+                    Recommended by {activeAward.recommendedBy} on{' '}
+                    {formatDateShort(activeAward.createdAt)}
+                    {activeAward.approvedBy &&
+                      ` · Decided by ${activeAward.approvedBy} on ${formatDateShort(activeAward.decidedAt)}`}
                   </div>
-                  {existingAward.nonL1Justification && (
+                  {activeAward.nonL1Justification && (
                     <div className="pt-2 border-t border-[#E2E8F0] text-[#0F172A]">
-                      <strong>Non-L1 Justification:</strong> {existingAward.nonL1Justification}
+                      <strong>Award Justification:</strong> {activeAward.nonL1Justification}
                     </div>
                   )}
-                  {existingAward.approverNotes && (
+                  {activeAward.approverNotes && (
                     <div className="text-[#0F172A]">
-                      <strong>Approver Notes:</strong> {existingAward.approverNotes}
+                      <strong>Approver Notes:</strong> {activeAward.approverNotes}
                     </div>
                   )}
                 </div>
@@ -848,7 +907,7 @@ export function RfqWorkspace({
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-[#E2E8F0]">
-                      {existingAward.allocations.map((al) => {
+                      {activeAward.allocations.map((al) => {
                         const item = rfq.items.find((i) => i.id === al.rfqItemId);
                         return (
                           <tr key={al.rfqItemId}>
@@ -871,11 +930,23 @@ export function RfqWorkspace({
                   </table>
                 </div>
 
-                {existingAward.approvalStatus === 'pending' && (
+                {activeAward.approvalStatus === 'pending' && (
                   <div className="p-4 border border-[#E2E8F0] rounded-lg space-y-3">
-                    <div className="text-xs font-semibold text-[#0F172A] flex items-center gap-1.5">
-                      <ShieldCheck className="w-4 h-4 text-[#0F4C81]" />
-                      <span>MD / Approver Sign-Off</span>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="text-xs font-semibold text-[#0F172A] flex items-center gap-1.5">
+                        <ShieldCheck className="w-4 h-4 text-[#0F4C81]" />
+                        <span>MD / Approver Sign-Off</span>
+                      </div>
+                      {canWithdrawPending && (
+                        <button
+                          type="button"
+                          onClick={handleWithdraw}
+                          disabled={awardBusy}
+                          className="px-3 py-1 text-xs font-medium text-[#475569] bg-[#F8FAFC] border border-[#E2E8F0] rounded-md hover:bg-slate-100 disabled:opacity-50"
+                        >
+                          Withdraw Pending Recommendation
+                        </button>
+                      )}
                     </div>
                     <textarea
                       rows={2}
@@ -884,27 +955,154 @@ export function RfqWorkspace({
                       placeholder="Optional approval instructions (e.g., Release PO in Tally with 30-day credit)..."
                       className="w-full p-2.5 text-xs border border-[#E2E8F0] rounded-md"
                     />
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
                       <button
+                        type="button"
                         onClick={() => handleDecision('approved')}
-                        disabled={awardBusy}
+                        disabled={awardBusy || !canDecidePending}
                         className="px-4 py-2 text-xs font-medium text-white bg-[#059669] rounded-md hover:bg-emerald-700 disabled:opacity-50"
                       >
                         Approve Award & Update Price Memory
                       </button>
                       <button
+                        type="button"
                         onClick={() => handleDecision('rejected')}
-                        disabled={awardBusy}
+                        disabled={awardBusy || !canDecidePending}
                         className="px-4 py-2 text-xs font-medium text-[#DC2626] bg-[#FEF2F2] border border-[#FECACA] rounded-md hover:bg-red-100 disabled:opacity-50"
                       >
                         Return for Revision
                       </button>
                     </div>
+                    {!canDecidePending && (
+                      <div className="text-[11px] text-[#475569]">
+                        Only an Owner, Admin, or Approver can finalize or return a pending recommendation.
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {rejectedAwards.length > 0 && (
+                  <div className="p-3 bg-[#F8FAFC] border border-[#E2E8F0] rounded-lg space-y-1.5 text-xs">
+                    <div className="font-semibold text-[#475569]">
+                      Prior Returned Recommendations ({rejectedAwards.length})
+                    </div>
+                    {rejectedAwards.map((rej) => (
+                      <div key={rej.id} className="text-[#475569]">
+                        <span className="font-mono font-semibold text-[#DC2626]">REJECTED</span>{' '}
+                        · {formatMoney(rej.totalAwardedLanded, rfq.currency)} · Decided{' '}
+                        {formatDateShort(rej.decidedAt)}
+                        {rej.approverNotes ? ` — "${rej.approverNotes}"` : ''}
+                      </div>
+                    ))}
                   </div>
                 )}
               </div>
+            ) : rejectedAwards.length > 0 && !showRevisionForm && !draftAward ? (
+              <div className="space-y-4">
+                <div className="p-4 bg-[#FEF2F2]/60 border border-[#FECACA] rounded-lg space-y-2 text-xs">
+                  <div className="flex items-center justify-between">
+                    <span className="font-semibold text-[#0F172A]">
+                      {rejectedAwards[0].isSplitAward
+                        ? 'Prior Split-Vendor Recommendation'
+                        : 'Prior Single-Vendor Recommendation'}
+                    </span>
+                    <span className="font-semibold text-[#DC2626]">REJECTED — HISTORICAL SNAPSHOT</span>
+                  </div>
+                  <div className="font-mono tabular-nums text-lg font-bold text-[#0F172A]">
+                    {formatMoney(rejectedAwards[0].totalAwardedLanded, rfq.currency)}
+                    <span className="text-xs font-sans font-normal text-[#475569] ml-2">
+                      Total Landed Cost
+                    </span>
+                  </div>
+                  <div className="text-[#475569]">
+                    Recommended by {rejectedAwards[0].recommendedBy} on{' '}
+                    {formatDateShort(rejectedAwards[0].createdAt)}
+                    {rejectedAwards[0].approvedBy &&
+                      ` · Returned by ${rejectedAwards[0].approvedBy} on ${formatDateShort(rejectedAwards[0].decidedAt)}`}
+                  </div>
+                  {rejectedAwards[0].approverNotes && (
+                    <div className="pt-2 border-t border-[#FECACA] text-[#0F172A]">
+                      <strong>Approver Feedback:</strong> {rejectedAwards[0].approverNotes}
+                    </div>
+                  )}
+                  {rejectedAwards[0].nonL1Justification && (
+                    <div className="text-[#0F172A]">
+                      <strong>Submitted Justification:</strong> {rejectedAwards[0].nonL1Justification}
+                    </div>
+                  )}
+                </div>
+
+                <div className="border border-[#E2E8F0] rounded-lg overflow-hidden">
+                  <table className="w-full text-left text-xs border-collapse">
+                    <thead>
+                      <tr className="bg-[#F8FAFC] border-b border-[#E2E8F0] text-[#475569]">
+                        <th className="py-2 px-3">Item</th>
+                        <th className="py-2 px-3">Previously Recommended Supplier</th>
+                        <th className="py-2 px-3 text-right">Qty</th>
+                        <th className="py-2 px-3 text-right">Landed Unit</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-[#E2E8F0]">
+                      {rejectedAwards[0].allocations.map((al) => {
+                        const item = rfq.items.find((i) => i.id === al.rfqItemId);
+                        return (
+                          <tr key={al.rfqItemId}>
+                            <td className="py-2 px-3 font-medium text-[#0F172A]">
+                              {item?.description || al.rfqItemId}
+                            </td>
+                            <td className="py-2 px-3 text-[#475569]">
+                              {getSupplierName(al.supplierId)}
+                            </td>
+                            <td className="py-2 px-3 text-right font-mono tabular-nums">
+                              {al.awardedQty} {item?.uom}
+                            </td>
+                            <td className="py-2 px-3 text-right font-mono tabular-nums font-semibold">
+                              {formatMoney(al.awardedUnitLanded, rfq.currency)}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowRevisionForm(true)}
+                    className="px-4 py-2 text-xs font-medium text-white bg-[#0F4C81] rounded-md hover:bg-[#0A365C]"
+                  >
+                    Revise &amp; Resubmit Recommendation
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onChangeTab('compare')}
+                    className="px-4 py-2 text-xs font-medium text-[#0F172A] bg-white border border-[#E2E8F0] rounded-md hover:bg-[#F8FAFC]"
+                  >
+                    Re-evaluate in Compare Matrix
+                  </button>
+                </div>
+              </div>
             ) : effectiveDraft ? (
               <form onSubmit={handleRecommendSubmit} className="space-y-4">
+                {rejectedAwards.length > 0 && (
+                  <div className="p-3 bg-[#FFFBEB] border border-[#FDE68A] rounded-md text-xs text-[#92400E] flex items-center justify-between gap-2">
+                    <span>
+                      Submitting a revised recommendation for {rfq.rfqNumber}. Prior rejected decision(s) remain preserved in the audit trail.
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDraftAward(null);
+                        setShowRevisionForm(false);
+                      }}
+                      className="underline font-medium shrink-0"
+                    >
+                      View Prior Rejection
+                    </button>
+                  </div>
+                )}
+
                 <div className="p-4 bg-[#F8FAFC] border border-[#E2E8F0] rounded-lg space-y-2">
                   <div className="text-xs text-[#475569]">
                     {effectiveDraft.isSplitAward
@@ -1009,7 +1207,7 @@ export function RfqWorkspace({
               </form>
             ) : (
               <div className="text-sm text-[#475569]">
-                Verify at least one complete (100% BOM), commercially confirmed quotation—or configure a verified Split Award in the Compare Matrix—before submitting an award decision.
+                Verify at least one complete (100% BOM), quantity-sufficient, commercially confirmed quotation—or configure a verified Split Award in the Compare Matrix—before submitting an award decision.
               </div>
             )}
           </div>
@@ -1031,7 +1229,7 @@ export function RfqWorkspace({
                     suppliers,
                     settings,
                     basis,
-                    award: existingAward || undefined,
+                    award: activeAward || undefined,
                   })
                 }
                 disabled={quotes.length === 0}
@@ -1048,7 +1246,7 @@ export function RfqWorkspace({
                     suppliers,
                     settings,
                     auditLogs,
-                    award: existingAward || undefined,
+                    award: activeAward || undefined,
                   })
                 }
                 disabled={quotes.length === 0}

@@ -440,6 +440,13 @@ export default function App() {
     await refreshAll();
   };
 
+  const handleWithdrawAward = async (awardId: string) => {
+    await apiJson(`${apiPrefix}/awards/${awardId}/withdraw`, {
+      method: 'POST',
+    });
+    await refreshAll();
+  };
+
   if (loading) {
     return (
       <div className="min-h-screen bg-[#F8FAFC] flex items-center justify-center">
@@ -618,6 +625,7 @@ export default function App() {
               onDeleteQuote={handleDeleteQuote}
               onSubmitAward={handleSubmitAward}
               onDecideAward={handleDecideAward}
+              onWithdrawAward={handleWithdrawAward}
               demoMode={demoMode}
               demoSessionId={demoSessionId}
             />

@@ -47,11 +47,14 @@ NORUS QUOTEFLOW is a multi-tenant TypeScript full-stack SaaS web application ser
 2. **Multi-Tenancy, 5-Role RBAC & First-Owner Bootstrap (`server/pgStore.ts`, `server/rbac.ts`, `server/ownerBootstrap.ts`):**
    - Every procurement domain row is scoped by `organization_id`, reinforced by composite same-organization foreign keys and functional uniqueness indexes in `drizzle/0001_tenant_integrity.sql` (see `docs/DATABASE_SCHEMA.md` for the documented `price_history` exception). `audit_logs` immutability is **application-enforced** (insert-only store helpers).
    - Migrated owner-less organizations (such as `org-kalyani-hydraulics`) require explicit operator/founder bootstrap via `scripts/bootstrap-org-owner.ts`, which acquires a `FOR UPDATE` lock on the `organizations` row inside a transaction before verifying `activeOwnerCount === 0`.
-3. **Operational Monitoring, Storage Timeouts & Scheduled Maintenance (`server/monitoring.ts`, `server/objectStorage.ts`, `server/maintenance.ts`):**
-   - Requests receive a validated or generated `X-Request-Id` header propagated in structured JSON logs and error responses. Rate limiters derive client IP safely via Express `req.ip` (`trust proxy = 1`) rather than raw `X-Forwarded-For`.
+3. **Operational Monitoring, Storage Timeouts, Security Headers & Scheduled Maintenance (`server/monitoring.ts`, `server/objectStorage.ts`, `server/maintenance.ts`, `server.ts`):**
+   - Requests receive a validated or generated `X-Request-Id` header propagated in structured JSON logs and error responses. Express configures `trust proxy` via `resolveTrustProxySetting()` (`TRUST_PROXY_HOPS`, defaulting to `1` hop; `false` when `0`) so rate limiters derive client IP safely via `req.ip` rather than raw `X-Forwarded-For`.
+   - `server.ts` emits a strict `Content-Security-Policy` / `Content-Security-Policy-Report-Only` header built via `buildProductionCspPolicy()` (no `*` wildcards, no `'unsafe-eval'`, Firebase/Google auth popup origins scoped explicitly; defaults to `report-only` in `NODE_ENV=production` or `CSP_MODE=report-only`, and enforces when `CSP_MODE=enforce`) alongside configurable `COOKIE_SAMESITE` (`resolveCookieSameSite()`).
    - `S3CompatibleStorageProvider` enforces `AbortController` timeouts (`15s` object ops / `5s` readiness probe).
    - Unhandled `500` errors emit redacted `unhandled_server_error` events and trigger `ErrorTrackerHook` / `ERROR_WEBHOOK_URL` while returning `{ error: 'Internal server error.', requestId }` to clients.
    - `runScheduledMaintenance` uses a dedicated-connection PostgreSQL advisory lock (`pg_try_advisory_lock`) to prevent concurrent overlap, runs bounded batches (`500` rows/run), and deletes unreferenced `stored_documents` DB rows **only after** `storageProvider.deleteObject` succeeds (retaining DB rows on storage error for retry).
+4. **Award Revision & Historical Integrity (`src/components/RfqWorkspace.tsx`, `server/pgStore.ts`, `server/demoWorkspace.ts`):**
+   - Preserves historical `rejected` award rows (and their `award_allocations` quotation snapshots) when buyers revise or resubmit new recommendations, blocks duplicate `pending` or `approved` awards (`409`), provides explicit `withdrawAward` (`POST .../awards/:awardId/withdraw`) cancellation for `pending` recommendations, and locks referenced quotations against mutations/deletions.
 
 ## Private Object Storage Strategy & Cost Comparison
 
@@ -64,8 +67,8 @@ NORUS QUOTEFLOW is a multi-tenant TypeScript full-stack SaaS web application ser
 ## Cloud SQL Database Operations, Backup/Recovery & Monthly Cost Estimates (`asia-southeast1`)
 
 ### Pool, Schema & Integrity Posture (Verified on Live PostgreSQL 18.6)
-- **Connection Pooling (`src/db/index.ts`):** Lazy singleton `pg.Pool` (`max: 10`, `connectionTimeoutMillis: 15000`) connecting via Cloud SQL Unix socket (`/app/cloudsql/...`) in managed runtime or TCP/SSL (`SQL_SSL=true`).
-- **Constraints & Indexes:** All 17 tables enforce primary keys, `organization_id` foreign keys, unique constraints (`users.email`, `organizations.slug`, `rfqs(organization_id, rfq_number)`, `organization_memberships(organization_id, user_id)`), and `ON DELETE RESTRICT` guards on `award_allocations` referencing approved quotations.
+- **Connection Pooling (`src/db/index.ts`):** Lazy singleton `pg.Pool` (`max: 10`, `connectionTimeoutMillis: 15000`) configured via `buildPgSslConfig()`, connecting over Cloud SQL Unix socket (`/app/cloudsql/...`) in managed runtime or TCP TLS (`SQL_SSL=true`) enforcing `rejectUnauthorized: true` by default with optional `SQL_SSL_CA` (inline PEM or file path) and explicit `SQL_SSL_ALLOW_SELF_SIGNED=true` override.
+- **Constraints & Indexes:** All 17 tables enforce primary keys, `organization_id` foreign keys, unique constraints (`users.email`, `organizations.slug`, `rfqs(organization_id, rfq_number)`, `organization_memberships(organization_id, user_id)`), and `ON DELETE RESTRICT` guards on `award_allocations` referencing historical `approved`, `pending`, and `rejected` award quotations.
 
 ### Backup, PITR & Rollback Runbook
 1. **Managed Automated Backups & PITR (Production Requirement):**

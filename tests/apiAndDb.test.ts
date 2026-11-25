@@ -467,3 +467,219 @@ test(
   assert.equal(report2.integrityVerified, true);
   assert.equal(report2.targetCountsAfter?.quotations, 1);
 });
+
+test(
+  'Task 007.2 PG integrity: rejected award preservation, award withdrawal, pending/approved quote lock (409), header validation, and RFQ numbering >= 9000',
+  { skip: isSafeTestDbConfigured() ? false : TEST_DB_SKIP_REASON },
+  async () => {
+    const { db } = getTestDbAndPool();
+    const { rfqs } = await import('../src/db/schema.ts');
+    const srv = await startIntegratedTestServer();
+    const tag = uniqueRunTag();
+
+    try {
+      const ownerClient = new TestCookieClient(srv.baseUrl);
+      const regRes = await ownerClient.request('/api/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: `owner-0072-${tag}@example.com`,
+          password: 'StrongPassword#2026',
+          fullName: 'Task0072 Owner',
+          organizationName: `Task0072 Org ${tag}`,
+        }),
+      });
+      assert.equal(regRes.status, 201);
+      const regBody = (await regRes.json()) as {
+        user: { id: string };
+        activeOrganization: { id: string };
+      };
+      createdUserIds.push(regBody.user.id);
+      createdOrgIds.push(regBody.activeOrganization.id);
+
+      const sup = (await (
+        await ownerClient.request('/api/suppliers', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: 'PG Integrity Vendor', taxId: `27INT${tag.slice(0, 6).toUpperCase()}Z1` }),
+        })
+      ).json()) as { id: string };
+
+      const rfqRes = await ownerClient.request('/api/rfqs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: 'PG Integrity Valve Lot',
+          currency: 'INR',
+          items: [{ skuCode: 'VLV-1', description: 'Check Valve', quantity: 10, uom: 'pcs' }],
+        }),
+      });
+      assert.equal(rfqRes.status, 201);
+      const rfq = (await rfqRes.json()) as {
+        id: string;
+        rfqNumber: string;
+        items: Array<{ id: string }>;
+      };
+
+      // Verify sequential RFQ numbering continues cleanly past 9000
+      const year = new Date().getFullYear();
+      await db.insert(rfqs).values({
+        id: `rfq-seed-9000-${tag}`,
+        organizationId: regBody.activeOrganization.id,
+        rfqNumber: `RFQ-${year}-9000`,
+        title: 'Seed 9000 RFQ',
+        status: 'draft',
+        currency: 'INR',
+        incoterms: 'FOR',
+        deliveryLocation: 'Plant',
+        deadlineDate: '2026-12-31',
+        createdBy: 'Owner',
+        invitedSupplierIds: [],
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+      const nextRfq = (await (
+        await ownerClient.request('/api/rfqs', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            title: 'Post-9000 RFQ',
+            currency: 'INR',
+            items: [{ description: 'Bolt', quantity: 5, uom: 'pcs' }],
+          }),
+        })
+      ).json()) as { rfqNumber: string };
+      assert.equal(nextRfq.rfqNumber, `RFQ-${year}-9001`);
+
+      // Extract & verify quote
+      const f = new FormData();
+      f.append('supplierId', sup.id);
+      f.append('rawEmailText', 'Check Valve 10 pcs @ 200');
+      const q = (await (
+        await ownerClient.request(`/api/rfqs/${rfq.id}/quotes/extract`, {
+          method: 'POST',
+          body: f,
+        })
+      ).json()) as { id: string; lines: Array<{ id: string }> };
+
+      // Empty quoteReference and fractional leadTimeDays return 400
+      assert.equal(
+        (
+          await ownerClient.request(`/api/quotations/${q.id}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ quoteReference: '   ' }),
+          })
+        ).status,
+        400
+      );
+      assert.equal(
+        (
+          await ownerClient.request(`/api/quotations/${q.id}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ leadTimeDays: 3.5 }),
+          })
+        ).status,
+        400
+      );
+
+      assert.equal(
+        (await ownerClient.request(`/api/quotations/${q.id}/verify`, { method: 'POST' })).status,
+        200
+      );
+
+      const allocs = [{ rfqItemId: rfq.items[0].id, quotationId: q.id, quotationLineId: q.lines[0].id }];
+
+      // Submit pending -> quote locked 409 -> withdraw 200 -> resubmit & reject -> delete blocked 409 -> edit/verify -> approve preserves rejected
+      const pending1 = (await (
+        await ownerClient.request(`/api/rfqs/${rfq.id}/award`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ isSplitAward: false, allocations: allocs }),
+        })
+      ).json()) as { id: string };
+
+      assert.equal(
+        (
+          await ownerClient.request(`/api/quotations/${q.id}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ freightCharges: 250 }),
+          })
+        ).status,
+        409
+      );
+
+      assert.equal(
+        (await ownerClient.request(`/api/awards/${pending1.id}/withdraw`, { method: 'POST' })).status,
+        200
+      );
+
+      const pending2 = (await (
+        await ownerClient.request(`/api/rfqs/${rfq.id}/award`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ isSplitAward: false, allocations: allocs }),
+        })
+      ).json()) as { id: string };
+
+      assert.equal(
+        (
+          await ownerClient.request(`/api/awards/${pending2.id}/decide`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ decision: 'rejected', approverNotes: 'Reconfirm freight' }),
+          })
+        ).status,
+        200
+      );
+
+      assert.equal(
+        (await ownerClient.request(`/api/quotations/${q.id}`, { method: 'DELETE' })).status,
+        409
+      );
+
+      assert.equal(
+        (
+          await ownerClient.request(`/api/quotations/${q.id}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ freightCharges: 50 }),
+          })
+        ).status,
+        200
+      );
+      assert.equal(
+        (await ownerClient.request(`/api/quotations/${q.id}/verify`, { method: 'POST' })).status,
+        200
+      );
+
+      const pending3 = (await (
+        await ownerClient.request(`/api/rfqs/${rfq.id}/award`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ isSplitAward: false, allocations: allocs }),
+        })
+      ).json()) as { id: string };
+
+      assert.equal(
+        (
+          await ownerClient.request(`/api/awards/${pending3.id}/decide`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ decision: 'approved', approverNotes: 'Approved revised award' }),
+          })
+        ).status,
+        200
+      );
+
+      const ws = (await (await ownerClient.request('/api/workspace')).json()) as WorkspaceState;
+      const rfqAwards = ws.awards.filter((a) => a.rfqId === rfq.id);
+      assert.equal(rfqAwards.some((a) => a.id === pending2.id && a.approvalStatus === 'rejected'), true);
+      assert.equal(rfqAwards.some((a) => a.id === pending3.id && a.approvalStatus === 'approved'), true);
+    } finally {
+      await srv.close();
+    }
+  }
+);

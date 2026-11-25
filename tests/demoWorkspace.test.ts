@@ -711,4 +711,185 @@ describe('Task 006/007: Temporary No-Login Demo Workspace & Security Isolation',
       fs.rmSync(tempDemoDir, { recursive: true, force: true });
     }
   });
+
+  it('Task 007.2: enforces award withdrawal, pending/rejected quote immutability, historical rejection preservation, and quantity shortfall 422 over HTTP', async () => {
+    const srv = await startIntegratedTestServer({ demoMode: true });
+    cleanups.push(() => srv.close());
+
+    const sessId = `test-0072-http-${uniqueRunTag()}`;
+    const headers = { 'X-Demo-Session': sessId, 'Content-Type': 'application/json' };
+
+    const wsRes = await fetch(`${srv.baseUrl}/api/demo-workspace`, { headers: { 'X-Demo-Session': sessId } });
+    assert.equal(wsRes.status, 200);
+    const ws = (await wsRes.json()) as {
+      rfqs: Rfq[];
+      quotations: Quotation[];
+    };
+    const rfq = ws.rfqs.find((r) => r.id === 'demo-rfq-2026-101')!;
+    const q1 = ws.quotations.find((q) => q.id === 'demo-rfq-2026-101-q1')!;
+    const q1Allocs = rfq.items.map((it) => ({
+      rfqItemId: it.id,
+      quotationId: q1.id,
+      quotationLineId: q1.lines.find((l) => l.rfqItemId === it.id)!.id,
+    }));
+
+    // 1. Short-quantity quote cannot be awarded (422)
+    const shortLinePatch = await fetch(
+      `${srv.baseUrl}/api/demo-workspace/quotations/${q1.id}/lines/${q1.lines[0].id}`,
+      {
+        method: 'PATCH',
+        headers,
+        body: JSON.stringify({ quotedQty: 5, lineTotalQuoted: 5 * (q1.lines[0].quotedUnitRate || 0) }),
+      }
+    );
+    assert.equal(shortLinePatch.status, 200);
+    assert.equal(
+      (
+        await fetch(`${srv.baseUrl}/api/demo-workspace/quotations/${q1.id}/verify`, {
+          method: 'POST',
+          headers: { 'X-Demo-Session': sessId },
+        })
+      ).status,
+      200
+    );
+    const shortAwardRes = await fetch(`${srv.baseUrl}/api/demo-workspace/rfqs/${rfq.id}/award`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ isSplitAward: false, allocations: q1Allocs }),
+    });
+    assert.equal(shortAwardRes.status, 422);
+
+    // Restore full quantity and verify
+    await fetch(
+      `${srv.baseUrl}/api/demo-workspace/quotations/${q1.id}/lines/${q1.lines[0].id}`,
+      {
+        method: 'PATCH',
+        headers,
+        body: JSON.stringify({
+          quotedQty: q1.lines[0].quotedQty,
+          lineTotalQuoted: q1.lines[0].lineTotalQuoted,
+        }),
+      }
+    );
+    assert.equal(
+      (
+        await fetch(`${srv.baseUrl}/api/demo-workspace/quotations/${q1.id}/verify`, {
+          method: 'POST',
+          headers: { 'X-Demo-Session': sessId },
+        })
+      ).status,
+      200
+    );
+
+    // 2. Submit pending award -> editing/deleting quote blocked (409) -> withdraw (200) -> unblocked
+    const pendingRes = await fetch(`${srv.baseUrl}/api/demo-workspace/rfqs/${rfq.id}/award`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ isSplitAward: false, allocations: q1Allocs }),
+    });
+    assert.equal(pendingRes.status, 201);
+    const pendingAward = (await pendingRes.json()) as { id: string };
+
+    assert.equal(
+      (
+        await fetch(`${srv.baseUrl}/api/demo-workspace/quotations/${q1.id}`, {
+          method: 'PATCH',
+          headers,
+          body: JSON.stringify({ freightCharges: 100 }),
+        })
+      ).status,
+      409
+    );
+    assert.equal(
+      (
+        await fetch(`${srv.baseUrl}/api/demo-workspace/quotations/${q1.id}`, {
+          method: 'DELETE',
+          headers: { 'X-Demo-Session': sessId },
+        })
+      ).status,
+      409
+    );
+
+    const withdrawRes = await fetch(
+      `${srv.baseUrl}/api/demo-workspace/awards/${pendingAward.id}/withdraw`,
+      { method: 'POST', headers: { 'X-Demo-Session': sessId } }
+    );
+    assert.equal(withdrawRes.status, 200);
+    const withdrawBody = (await withdrawRes.json()) as { withdrawnAwardId: string; rfq: Rfq };
+    assert.equal(withdrawBody.withdrawnAwardId, pendingAward.id);
+    assert.equal(withdrawBody.rfq.status, 'in_review');
+
+    // 3. Resubmit -> reject -> historical snapshot blocks quote DELETE (409) -> resubmit revised & approve
+    const pending2 = (await (
+      await fetch(`${srv.baseUrl}/api/demo-workspace/rfqs/${rfq.id}/award`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ isSplitAward: false, allocations: q1Allocs }),
+      })
+    ).json()) as { id: string };
+
+    const rejectRes = await fetch(`${srv.baseUrl}/api/demo-workspace/awards/${pending2.id}/decide`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ decision: 'rejected', approverNotes: 'Update terms first' }),
+    });
+    assert.equal(rejectRes.status, 200);
+
+    // Deleting quote referenced by historical rejected award -> 409
+    assert.equal(
+      (
+        await fetch(`${srv.baseUrl}/api/demo-workspace/quotations/${q1.id}`, {
+          method: 'DELETE',
+          headers: { 'X-Demo-Session': sessId },
+        })
+      ).status,
+      409
+    );
+
+    // Revise & re-verify quote -> resubmit -> approve
+    assert.equal(
+      (
+        await fetch(`${srv.baseUrl}/api/demo-workspace/quotations/${q1.id}`, {
+          method: 'PATCH',
+          headers,
+          body: JSON.stringify({ paymentTerms: 'Net 45 Revised' }),
+        })
+      ).status,
+      200
+    );
+    assert.equal(
+      (
+        await fetch(`${srv.baseUrl}/api/demo-workspace/quotations/${q1.id}/verify`, {
+          method: 'POST',
+          headers: { 'X-Demo-Session': sessId },
+        })
+      ).status,
+      200
+    );
+
+    const pending3 = (await (
+      await fetch(`${srv.baseUrl}/api/demo-workspace/rfqs/${rfq.id}/award`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ isSplitAward: false, allocations: q1Allocs }),
+      })
+    ).json()) as { id: string };
+    assert.equal(
+      (
+        await fetch(`${srv.baseUrl}/api/demo-workspace/awards/${pending3.id}/decide`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ decision: 'approved', approverNotes: 'Final PO approved' }),
+        })
+      ).status,
+      200
+    );
+
+    const wsAfter = (await (
+      await fetch(`${srv.baseUrl}/api/demo-workspace`, { headers: { 'X-Demo-Session': sessId } })
+    ).json()) as { awards: AwardDecision[] };
+    const rfqAwards = wsAfter.awards.filter((a) => a.rfqId === rfq.id);
+    assert.equal(rfqAwards.some((a) => a.id === pending2.id && a.approvalStatus === 'rejected'), true);
+    assert.equal(rfqAwards.some((a) => a.id === pending3.id && a.approvalStatus === 'approved'), true);
+  });
 });

@@ -40,7 +40,7 @@ export function buildComparativeStatementPdfDoc(params: {
   const { rfq, quotes, suppliers, settings, basis, award } = params;
   const doc = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
 
-  const rankedQuotes = rankQuotations(quotes, basis);
+  const rankedQuotes = rankQuotations(quotes, basis, rfq);
 
   doc.setFontSize(14);
   doc.setTextColor(15, 23, 42);
@@ -235,7 +235,7 @@ export function buildComparativeStatementWorkbook(params: {
   award?: AwardDecision;
 }): XLSX.WorkBook {
   const { rfq, quotes, suppliers, settings, auditLogs, award } = params;
-  const rankedQuotes = rankQuotations(quotes, 'landed');
+  const rankedQuotes = rankQuotations(quotes, 'landed', rfq);
 
   const wb = XLSX.utils.book_new();
 

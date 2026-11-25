@@ -17,6 +17,7 @@ import {
   Supplier,
 } from '../types.ts';
 import { formatMoney, formatPct } from '../lib/format.ts';
+import { isExceedingL1Total, isLineQuantitySufficient } from '../lib/awardValidation.ts';
 import { rankQuotations } from '../lib/ranking.ts';
 
 interface ComparisonMatrixPaneProps {
@@ -75,7 +76,7 @@ export function ComparisonMatrixPane({
     return line.normalizedUnitLanded;
   };
 
-  const rankedQuotes = rankQuotations(quotes, basis);
+  const rankedQuotes = rankQuotations(quotes, basis, rfq);
   const sortedQuotes = rankedQuotes.map((r) => r.quotation);
   const l1Eligible = rankedQuotes.find((r) => r.rankIndex === 1) || null;
   const baselineTotal = l1Eligible ? l1Eligible.totalForBasis : rankedQuotes[0].totalForBasis;
@@ -94,12 +95,18 @@ export function ComparisonMatrixPane({
 
   const getEffectiveSplitQuoteForItem = (rfqItemId: string): string => {
     if (splitSelection[rfqItemId]) return splitSelection[rfqItemId];
+    const rfqItem = rfq.items.find((it) => it.id === rfqItemId);
     let bestQuoteId = sortedQuotes[0].id;
     let bestUnit = Infinity;
     for (const q of sortedQuotes) {
       const line = q.lines.find((l) => l.rfqItemId === rfqItemId);
+      const qtyOk = rfqItem && line ? isLineQuantitySufficient(line, rfqItem).ok : true;
       const u =
-        line && line.matchStatus !== 'not_quoted' && line.mathValid
+        line &&
+        line.matchStatus !== 'not_quoted' &&
+        line.matchStatus !== 'unmapped' &&
+        line.mathValid &&
+        qtyOk
           ? getLineUnitForBasis(line)
           : null;
       if (u !== null && u < bestUnit) {
@@ -119,7 +126,8 @@ export function ComparisonMatrixPane({
         !line.mathValid ||
         line.matchStatus === 'not_quoted' ||
         line.matchStatus === 'alternate_spec' ||
-        line.uomConversionFactor !== 1
+        line.uomConversionFactor !== 1 ||
+        !isLineQuantitySufficient(line, item).ok
       );
     });
   });
@@ -128,6 +136,7 @@ export function ComparisonMatrixPane({
   const splitAllocations: AwardAllocation[] = [];
   let splitTotalLanded = 0;
   let splitHasInvalidSelection = false;
+  let splitHasInsufficientQty = false;
   let splitHasUnverifiedSelection = false;
 
   for (const item of rfq.items) {
@@ -145,6 +154,8 @@ export function ComparisonMatrixPane({
       line.normalizedUnitLanded === null
     ) {
       splitHasInvalidSelection = true;
+    } else if (!isLineQuantitySufficient(line, item).ok) {
+      splitHasInsufficientQty = true;
     } else {
       splitTotalLanded += line.normalizedUnitLanded * item.quantity;
       splitAllocations.push({
@@ -160,6 +171,7 @@ export function ComparisonMatrixPane({
 
   const activePackageQuote =
     sortedQuotes.find((q) => q.id === activePackageId) || sortedQuotes[0];
+  let packageHasInsufficientQty = false;
   const activePackageAllocations: AwardAllocation[] = rfq.items
     .map((item) => {
       const line = activePackageQuote.lines.find((l) => l.rfqItemId === item.id);
@@ -170,6 +182,10 @@ export function ComparisonMatrixPane({
         !line.mathValid ||
         line.normalizedUnitLanded === null
       ) {
+        return null;
+      }
+      if (!isLineQuantitySufficient(line, item).ok) {
+        packageHasInsufficientQty = true;
         return null;
       }
       return {
@@ -185,12 +201,16 @@ export function ComparisonMatrixPane({
 
   const packageBlockReason = !activePackageQuote.isVerified
     ? `Verify quotation ${activePackageQuote.quoteReference} before recommending award`
+    : packageHasInsufficientQty
+    ? `Quotation ${activePackageQuote.quoteReference} has insufficient quoted quantity on one or more RFQ lines`
     : activePackageQuote.completenessRatio < 1 || activePackageAllocations.length !== rfq.items.length
     ? `Quotation ${activePackageQuote.quoteReference} must cover 100% of RFQ lines for a package award`
     : null;
 
   const splitBlockReason = splitHasInvalidSelection
     ? 'Select valid, quoted lines for all items before recommending a split award'
+    : splitHasInsufficientQty
+    ? 'Selected split lines must cover 100% of required RFQ quantities before recommending a split award'
     : splitHasUnverifiedSelection
     ? 'Verify all selected quotations before recommending a split award'
     : null;
@@ -207,7 +227,7 @@ export function ComparisonMatrixPane({
         isSplitAward: false,
         allocations: activePackageAllocations,
         totalAwardedLanded: chosen.totalLandedCost,
-        isNonL1: l1Eligible ? chosen.totalLandedCost > l1Landed + 1 : false,
+        isNonL1: l1Eligible ? isExceedingL1Total(chosen.totalLandedCost, l1Landed) : false,
       });
     } else {
       const l1LandedTotal = l1Eligible ? l1Eligible.quotation.totalLandedCost : splitTotalLanded;
@@ -215,7 +235,7 @@ export function ComparisonMatrixPane({
         isSplitAward: true,
         allocations: splitAllocations,
         totalAwardedLanded: Math.round(splitTotalLanded * 100) / 100,
-        isNonL1: l1Eligible ? splitTotalLanded > l1LandedTotal + 1 : false,
+        isNonL1: l1Eligible ? isExceedingL1Total(splitTotalLanded, l1LandedTotal) : false,
       });
     }
   };
@@ -320,7 +340,7 @@ export function ComparisonMatrixPane({
         <div className="p-3 bg-[#FFFBEB] border border-[#FDE68A] text-[#92400E] text-xs rounded-md flex items-center gap-2">
           <AlertTriangle className="w-4 h-4 text-[#D97706] shrink-0" />
           <span>
-            No quotation is currently complete, commercially confirmed, and verified. Incomplete, unconfirmed-freight, or unverified quotes are excluded from L1 ranking until audited.
+            No quotation is currently complete, quantity-sufficient, commercially confirmed, and verified. Incomplete, short-quantity, unconfirmed-freight, or unverified quotes are excluded from L1 ranking until audited.
           </span>
         </div>
       )}
@@ -441,8 +461,9 @@ export function ComparisonMatrixPane({
                 let minRowUnit = Infinity;
                 for (const q of sortedQuotes) {
                   const l = q.lines.find((ql) => ql.rfqItemId === item.id);
+                  const qtyOk = l ? isLineQuantitySufficient(l, item).ok : false;
                   const val =
-                    l && l.matchStatus !== 'not_quoted' && l.mathValid
+                    l && l.matchStatus !== 'not_quoted' && l.matchStatus !== 'unmapped' && l.mathValid && qtyOk
                       ? getLineUnitForBasis(l)
                       : null;
                   if (val !== null && val < minRowUnit) minRowUnit = val;
@@ -491,8 +512,13 @@ export function ComparisonMatrixPane({
                       }
 
                       const unitVal = getLineUnitForBasis(line);
+                      const qtyCheck = isLineQuantitySufficient(line, item);
+                      const lineSelectable =
+                        line.mathValid && line.matchStatus !== 'unmapped' && qtyCheck.ok;
                       const isRowBest =
-                        line.mathValid && unitVal !== null && Math.abs(unitVal - minRowUnit) < 0.01;
+                        lineSelectable &&
+                        unitVal !== null &&
+                        Math.abs(unitVal - minRowUnit) < 0.01;
                       const vsLastPaid =
                         lastPaid && unitVal ? ((unitVal - lastPaid) / lastPaid) * 100 : null;
                       const isSplitChosen = awardMode === 'split' && splitSelectedQid === q.id;
@@ -501,12 +527,12 @@ export function ComparisonMatrixPane({
                         <td
                           key={q.id}
                           onClick={() => {
-                            if (awardMode === 'split' && line.mathValid) {
+                            if (awardMode === 'split' && lineSelectable) {
                               setSplitSelection((prev) => ({ ...prev, [item.id]: q.id }));
                             }
                           }}
                           className={`py-3 px-4 border-r border-[#E2E8F0] last:border-r-0 align-top transition-colors ${
-                            awardMode === 'split' && line.mathValid ? 'cursor-pointer' : ''
+                            awardMode === 'split' && lineSelectable ? 'cursor-pointer' : ''
                           } ${
                             isSplitChosen
                               ? 'bg-[#0F4C81]/10 ring-1 ring-inset ring-[#0F4C81]'
@@ -514,6 +540,8 @@ export function ComparisonMatrixPane({
                               ? 'bg-[#ECFDF5]/60'
                               : !line.mathValid
                               ? 'bg-[#FEF2F2]/60'
+                              : !qtyCheck.ok
+                              ? 'bg-[#FFFBEB]/60'
                               : ''
                           }`}
                         >
@@ -537,7 +565,7 @@ export function ComparisonMatrixPane({
                               <input
                                 type="radio"
                                 name={`split-${item.id}`}
-                                disabled={!line.mathValid}
+                                disabled={!lineSelectable}
                                 checked={isSplitChosen}
                                 onChange={() =>
                                   setSplitSelection((prev) => ({ ...prev, [item.id]: q.id }))
@@ -551,6 +579,12 @@ export function ComparisonMatrixPane({
                             <div>
                               Line: {formatMoney((unitVal ?? 0) * item.quantity, rfq.currency)}
                             </div>
+
+                            {!qtyCheck.ok && (
+                              <div className="text-[#D97706] font-semibold">
+                                Short Qty: {qtyCheck.convertedQty} / {item.quantity} {item.uom}
+                              </div>
+                            )}
 
                             {line.uomConversionFactor !== 1 && (
                               <div className="text-[#0F4C81]">
@@ -576,6 +610,10 @@ export function ComparisonMatrixPane({
                               {!line.mathValid ? (
                                 <span className="text-[#DC2626] font-sans font-semibold">
                                   Math Mismatch
+                                </span>
+                              ) : !qtyCheck.ok ? (
+                                <span className="text-[#D97706] font-sans font-semibold">
+                                  Insufficient Qty
                                 </span>
                               ) : line.matchStatus === 'alternate_spec' ? (
                                 <span className="text-[#D97706] font-sans font-medium">

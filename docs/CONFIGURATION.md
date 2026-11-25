@@ -9,7 +9,12 @@
 | `SQL_DB_NAME` | Yes (runtime) | *(unset)* | PostgreSQL database name |
 | `SQL_USER` | Yes (runtime) | *(unset)* | PostgreSQL application user |
 | `SQL_PASSWORD` | Yes (runtime) | *(unset)* | PostgreSQL application password |
-| `SQL_SSL` | No | `false` | Set `'true'` for TLS PostgreSQL connections |
+| `SQL_SSL` | No | `false` | Set `'true'` for TCP TLS PostgreSQL connections (`rejectUnauthorized: true` enforced by default; bypassed on Cloud SQL Unix socket `/...`) |
+| `SQL_SSL_CA` | No | *(unset)* | Optional PostgreSQL TLS CA certificate (inline PEM content or local `.pem` file path) passed to `pg.Pool` when `SQL_SSL=true` |
+| `SQL_SSL_ALLOW_SELF_SIGNED` | No | `false` | Set `'true'` only when connecting to a private non-CA self-signed PostgreSQL endpoint (`rejectUnauthorized: false`) |
+| `COOKIE_SAMESITE` | No | `None` over HTTPS; `Lax` over HTTP | Explicit cookie `SameSite` policy (`lax` \| `strict` \| `none`); `'none'` requires `Secure` HTTPS context for cross-site iframe previews |
+| `CSP_MODE` | No | `report-only` (in prod) | Controls server CSP emission (`report-only` sets `Content-Security-Policy-Report-Only`; `enforce` sets enforcing `Content-Security-Policy`) |
+| `TRUST_PROXY_HOPS` | No | `1` | Express `trust proxy` hop count (`0` disables proxy trusting, integers set hop depth) used by `req.ip` and rate limiters |
 | `SESSION_SECRET` | **Yes in prod** | Dev ephemeral key | **>= 32-char** HMAC/token secret (`server/security.ts` fails closed in production if missing or `< 32` chars) |
 | `GEMINI_API_KEY` | For live AI extraction | *(unset)* | Server-side API key for `@google/genai` (`gemini-4-hydrogen`). Never prefix with `VITE_` |
 | `STORAGE_PROVIDER` | No | `local` | `'local'` (private filesystem `data/private-storage/`) or `'s3'` (AWS SigV4 object storage) |
@@ -26,11 +31,11 @@
 | `MAINTENANCE_INTERVAL_MINUTES` | No | `360` | Background interval in minutes (`0` disables in-process timer if using external Cloud Scheduler) |
 | `ERROR_WEBHOOK_URL` | No | *(unset)* | Optional HTTPS webhook notified asynchronously on unhandled `500` server errors (payloads redacted) |
 | `PORT` | No | `3000` | HTTP port listened on by Express (`server.ts`) |
-| `NODE_ENV` | No | `development` | Enforces fail-closed `SESSION_SECRET`/`SQL_*` checks, `Secure` cookies, HSTS, and static `dist/` serving |
+| `NODE_ENV` | No | `development` | Enforces fail-closed `SESSION_SECRET`/`SQL_*` checks, `Secure` cookies, HSTS, production CSP, and static `dist/` serving |
 | `QUOTEFLOW_DB_PATH` | No | `data/quoteflow-db.json` | Legacy JSON source file path read by `scripts/migrate-json-to-postgres.ts` |
 | `FIREBASE_CHECK_REVOKED` | No | `false` | Set `'true'` only when running with an IAM-authorized Firebase service account to query Identity Toolkit revocation status during `verifyIdToken` |
 | `DEMO_MODE` | No (`false` in prod) | `true` in dev/test; **`false` in prod** | Controls the isolated synthetic no-login sandbox (`/api/demo-workspace*`). In `development`/`test`, unset/`true` enables demo mode and `false` restores full login (`AuthView`/`OrganizationView`). In `NODE_ENV=production`, demo mode is strictly **OFF by default**, and setting `DEMO_MODE="true"` **fails closed on boot** |
-| `TEST_DATABASE_URL` / `TEST_SQL_*` | For PG integration tests | *(unset)* | Disposable PostgreSQL target (`TEST_SQL_HOST`, `TEST_SQL_PORT`, `TEST_SQL_DB_NAME`, `TEST_SQL_USER`, `TEST_SQL_PASSWORD`, `TEST_SQL_SSL`) used by `tests/_helpers.ts`. Explicitly rejects `cloud_sql_development_database`, `prod`, `production`, `staging`, and `postgres`; when unset, live PG tests skip safely |
+| `TEST_DATABASE_URL` / `TEST_SQL_*` | For PG integration tests | *(unset)* | Disposable PostgreSQL target (`TEST_SQL_HOST`, `TEST_SQL_PORT`, `TEST_SQL_DB_NAME`, `TEST_SQL_USER`, `TEST_SQL_PASSWORD`, `TEST_SQL_SSL`, `TEST_SQL_SSL_CA`, `TEST_SQL_SSL_ALLOW_SELF_SIGNED`) used by `tests/_helpers.ts`. Rejects Unix socket/`/cloudsql/` hosts, `cloud_sql_development_database`/`prod`/`production`/`staging`/`postgres`, and live `SQL_HOST`+`SQL_DB_NAME` overlap (except `NODE_ENV=test` local CI loopback `127.0.0.1`/`localhost`/`::1`/`postgres` with `*_test`/`*-test` DB names) |
 | `RUN_LIVE_GEMINI_TESTS` | No | `'false'` | Set `'true'` alongside a valid `GEMINI_API_KEY` to execute live Gemini API smoke tests in `tests/extractionValidation.test.ts` |
 
 ## Key NPM Scripts (`package.json`)
