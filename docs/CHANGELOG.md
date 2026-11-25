@@ -1,5 +1,18 @@
 # Changelog
 
+## Task 010 — Independent Security Audit, CI Validation & Production-Risk Closure
+
+### Fixed & Hardened
+- **ZIP Container & Native Delimited Parser Hardening (`server/spreadsheetWorker.mjs`, `tests/extractionValidation.test.ts`):**
+  - Hardened `inspectXlsxZipContainer` to reject encrypted ZIP entries (`flags & 0x0001`), unsupported compression methods (allowing only `0` and `8`), Local File Header vs. Central Directory filename/size mismatches, `0`-compressed-byte deflate entries, overlapping LFH payload spans, and Windows backslash (`\`), drive-prefix, and NUL (`\0`) entry paths.
+  - Added delimiter detection (`.tsv` / tab-delimited text `.xls`) and a `65,536`-character per-cell raw buffer limit (`422`) to `parseDelimitedTextToRows`.
+- **PostgreSQL Parent Lock Consistency (`server/pgStore.ts`):**
+  - Added `.for('update')` locking on the target `rfqs` row inside `saveExtractedQuotation` so quotation ingestion strictly obeys the `rfqs -> quotations -> awards` lock order and cannot revert concurrent `'pending_approval'`/`'awarded'` status transitions.
+- **Kahan Split-Award Monetary Totals (`src/lib/awardValidation.ts`, `src/components/ComparisonMatrixPane.tsx`, `tests/stabilizationUnit.test.ts`):**
+  - Replaced raw float `+=` accumulation of split landed line totals with `sumExactQuantities` Kahan summation in both `validateAwardSubmission` and `ComparisonMatrixPane`.
+- **CI Workflow & Stale Doc Hygiene (`.github/workflows/ci.yml`, `docs/`):**
+  - Added workflow-level `permissions: contents: read` and fail-fast `kill -0` + `--max-time 5` readiness checks in `browser-e2e`; removed outdated `--legacy-peer-deps` guidance in `docs/CONFIGURATION.md` and added a Remaining-Risk Register in `docs/PROJECT_STATUS.md`.
+
 ## Task 009 — Dependency Security, Decimal Precision, Concurrency Hardening & CI Readiness
 
 ### Fixed & Hardened

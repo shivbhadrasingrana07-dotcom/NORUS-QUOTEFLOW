@@ -40,7 +40,7 @@
 
 ## Key NPM Scripts (`package.json`)
 
-> Note: Because `package.json` pins `"esbuild": "^0.25.0"` while `vite@8.3.x` declares an optional peer range `esbuild@^0.27.0 || ^0.28.0`, clean lockfile installs in CI use `npm ci --legacy-peer-deps`.
+> `esbuild` devDependency is aligned with Vite 8 (`^0.28.2`), so clean lockfile installs via `npm ci` succeed without `--legacy-peer-deps`.
 
 | Script | Command | Purpose |
 | :--- | :--- | :--- |

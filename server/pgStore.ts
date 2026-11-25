@@ -2641,6 +2641,7 @@ export class PgDataStore {
           .select()
           .from(rfqs)
           .where(and(eq(rfqs.id, params.rfqId), eq(rfqs.organizationId, params.organizationId)))
+          .for('update')
           .limit(1);
 
         if (!targetRfq) {

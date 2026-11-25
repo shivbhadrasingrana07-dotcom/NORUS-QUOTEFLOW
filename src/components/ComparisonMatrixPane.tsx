@@ -17,7 +17,7 @@ import {
   Supplier,
 } from '../types.ts';
 import { formatMoney, formatPct } from '../lib/format.ts';
-import { isExceedingL1Total, isLineQuantitySufficient } from '../lib/awardValidation.ts';
+import { isExceedingL1Total, isLineQuantitySufficient, sumExactQuantities } from '../lib/awardValidation.ts';
 import { rankQuotations } from '../lib/ranking.ts';
 
 interface ComparisonMatrixPaneProps {
@@ -134,7 +134,7 @@ export function ComparisonMatrixPane({
 
   // Compute Split Award Blended Total (in Landed basis for award submission)
   const splitAllocations: AwardAllocation[] = [];
-  let splitTotalLanded = 0;
+  const splitLineTotals: number[] = [];
   let splitHasInvalidSelection = false;
   let splitHasInsufficientQty = false;
   let splitHasUnverifiedSelection = false;
@@ -157,7 +157,7 @@ export function ComparisonMatrixPane({
     } else if (!isLineQuantitySufficient(line, item).ok) {
       splitHasInsufficientQty = true;
     } else {
-      splitTotalLanded += line.normalizedUnitLanded * item.quantity;
+      splitLineTotals.push(line.normalizedUnitLanded * item.quantity);
       splitAllocations.push({
         rfqItemId: item.id,
         quotationId: quote.id,
@@ -168,6 +168,7 @@ export function ComparisonMatrixPane({
       });
     }
   }
+  const splitTotalLanded = Math.round(sumExactQuantities(splitLineTotals) * 100) / 100;
 
   const activePackageQuote =
     sortedQuotes.find((q) => q.id === activePackageId) || sortedQuotes[0];

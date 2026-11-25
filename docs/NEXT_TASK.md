@@ -1,10 +1,9 @@
 # Next Task — CI Execution, Cloud SQL Migration Window & Commercial Pilot Rollout
 
-## Completed Through Task 009
-- **Supply-Chain & Isolated Spreadsheet Hardening:** Replaced `xlsx` CSV/TSV parsing with native RFC-4180 `parseDelimitedTextToRows`; added ZIP container pre-scan (ZIP64, ZIP bomb `422`, path traversal, `vbaProject.bin` `415`); isolated `.xlsx`/`.xls` parsing inside ephemeral `128 MB` / `5s` secret-stripped `server/spreadsheetWorker.mjs` subprocesses with strict sheet/row/col/cell ceilings; upgraded `esbuild` to `^0.28.2` and regenerated `package-lock.json` (`npm ci` clean without `--legacy-peer-deps`).
-- **Precision & Multi-Supplier Split Allocations:** Tightened award allocation tolerance to `1e-6` (`getAllocationTolerance`) with Kahan `sumExactQuantities`, `1e-9` quantity normalization preserving sub-`1e-6` precision, and full validation/UI support for multi-supplier split allocations on one RFQ line item.
-- **PostgreSQL Deadlock-Free Hierarchical Locking:** Enforced strict `rfqs -> quotations -> awards` `FOR UPDATE` locking across `submitAward`, `withdrawAward`, `decideAward`, quotation edits, verification, and deletion (`server/pgStore.ts`), plus concurrent PG test coverage in `tests/apiAndDb.test.ts`.
-- **CI Pipeline & Browser E2E Script:** Updated `.github/workflows/ci.yml` to run strict `npm ci`, full `0000` -> `0001` preflight/apply/rollback/re-apply SQL verification against PostgreSQL 16, and an isolated `browser-e2e` headless Chromium job executing `tests/browserE2E.mjs` against `DEMO_MODE=true`.
+## Completed Through Task 010
+- **Independent Audit & Supply-Chain/Spreadsheet Closure (`server/spreadsheetWorker.mjs`, `tests/extractionValidation.test.ts`):** Closed ZIP container pre-scan edge cases (encrypted bit flag `0x0001`, unsupported compression methods, LFH-vs-CD filename/size mismatches, overlapping payload byte spans, `0`-compressed-byte deflate spoof, and Windows backslash/NUL/drive-prefix traversal); added delimiter detection (`\t` for `.tsv`/text `.xls`) and a `65,536`-character raw cell cap to the native RFC-4180 delimited parser. Verified `npm ci --dry-run` cleanly without `--legacy-peer-deps` and documented `npm audit --json` reachability in [Project Status](PROJECT_STATUS.md#remaining-risk-register).
+- **Monetary Split-Award Precision & Parent-First Extraction Lock (`src/lib/awardValidation.ts`, `src/components/ComparisonMatrixPane.tsx`, `server/pgStore.ts`):** Applied Kahan `sumExactQuantities` to split-award monetary landed totals (`validateAwardSubmission` & `ComparisonMatrixPane.tsx`) and added `.for('update')` parent `rfqs` locking to `saveExtractedQuotation` in `server/pgStore.ts` so extraction serializes cleanly under the strict `rfqs -> quotations -> awards` lock hierarchy.
+- **CI Workflow Hardening (`.github/workflows/ci.yml`):** Added top-level `permissions: contents: read` and fail-fast server PID + `--max-time 5` readiness checks in the `browser-e2e` job.
 
 ## Remaining Actions Before Public Launch
 
@@ -13,8 +12,8 @@
      1. Full `psql` migration lifecycle (`0000_illegal_major_mapleleaf.sql`, `0001_tenant_integrity_preflight.sql`, `0001_tenant_integrity.sql`, `0001_tenant_integrity_rollback.sql`, and re-apply `0001_tenant_integrity.sql`).
      2. All `12` PostgreSQL integration & Task 009 concurrency tests (`npm test` with `TEST_SQL_*` / `TEST_DATABASE_URL`), plus optional `RUN_LIVE_GEMINI_TESTS=true`.
      3. Isolated `node tests/browserE2E.mjs` Playwright headless Chromium E2E pass under `DEMO_MODE=true`.
-1. **Monitor Upstream Dependency Advisories (`npm audit`):**
-   - Upstream `xlsx@0.18.5` (no upstream fix published — contained on server by worker isolation, evaluate `exceljs` replacement when scheduling client exporter replacement), `@grpc/grpc-js` (`firebase` SDK chain), and `drizzle-kit` nested `esbuild@0.25.12` remain in `npm audit`.
+1. **Schedule `xlsx@0.18.5` Replacement & Track Upstream Advisories (`npm audit`):**
+   - Replace `xlsx@0.18.5` with a maintained spreadsheet parser/writer (e.g., `exceljs`) when scheduling the dependency upgrade milestone; track non-breaking `firebase` / `drizzle-kit` updates and Node 24 alignment.
 2. **Exit Demo Mode & Restore Full Authentication:**
    - In `NODE_ENV=production`, demo mode is **OFF by default** (and setting `DEMO_MODE=true` fails closed on boot). Set `DEMO_MODE="false"` in non-production environments to disable `/api/demo-workspace*` (`410 Gone`) and activate `AuthView` and `OrganizationView`.
 3. **Apply Tenant Integrity Migration to Cloud SQL (Maintenance Window):**

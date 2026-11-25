@@ -130,6 +130,7 @@ export function inspectXlsxZipContainer(buffer) {
 
   let cursor = cdOffset;
   let totalUncompressed = 0;
+  const entrySpans = [];
 
   for (let idx = 0; idx < totalEntries; idx += 1) {
     if (cursor + 46 > cdOffset + cdSize) {
@@ -140,6 +141,8 @@ export function inspectXlsxZipContainer(buffer) {
       throw new SpreadsheetSecurityError('Invalid OOXML central directory signature.', 422);
     }
 
+    const cdFlags = buffer.readUInt16LE(cursor + 8);
+    const cdMethod = buffer.readUInt16LE(cursor + 10);
     const compressedSize = buffer.readUInt32LE(cursor + 20);
     const uncompressedSize = buffer.readUInt32LE(cursor + 24);
     const fileNameLen = buffer.readUInt16LE(cursor + 28);
@@ -152,8 +155,15 @@ export function inspectXlsxZipContainer(buffer) {
       throw new SpreadsheetSecurityError('Corrupt OOXML central directory record length.', 422);
     }
 
-    const entryName = buffer.subarray(cursor + 46, cursor + 46 + fileNameLen).toString('utf8');
-    if (entryName.includes('..') || entryName.startsWith('/')) {
+    const rawNameBuf = buffer.subarray(cursor + 46, cursor + 46 + fileNameLen);
+    const entryName = rawNameBuf.toString('utf8');
+    if (
+      entryName.includes('..') ||
+      entryName.startsWith('/') ||
+      entryName.includes('\\') ||
+      entryName.includes('\0') ||
+      /^[a-zA-Z]:/.test(entryName)
+    ) {
       throw new SpreadsheetSecurityError('Spreadsheet archive contains unsafe entry paths.', 422);
     }
     if (
@@ -173,6 +183,45 @@ export function inspectXlsxZipContainer(buffer) {
       throw new SpreadsheetSecurityError('Corrupt OOXML local file header.', 422);
     }
 
+    const lfhFlags = buffer.readUInt16LE(localHeaderOffset + 6);
+    const lfhMethod = buffer.readUInt16LE(localHeaderOffset + 8);
+    const lfhCompressedSize = buffer.readUInt32LE(localHeaderOffset + 18);
+    const lfhUncompressedSize = buffer.readUInt32LE(localHeaderOffset + 22);
+    const lfhFileNameLen = buffer.readUInt16LE(localHeaderOffset + 26);
+    const lfhExtraLen = buffer.readUInt16LE(localHeaderOffset + 28);
+
+    if ((cdFlags & 0x0001) !== 0 || (lfhFlags & 0x0001) !== 0) {
+      throw new SpreadsheetSecurityError('Encrypted OOXML spreadsheets are not permitted.', 422);
+    }
+    if ((cdMethod !== 0 && cdMethod !== 8) || cdMethod !== lfhMethod) {
+      throw new SpreadsheetSecurityError('Unsupported or mismatched OOXML ZIP compression method.', 422);
+    }
+    if (cdMethod === 0 && compressedSize !== uncompressedSize) {
+      throw new SpreadsheetSecurityError('Malformed uncompressed OOXML ZIP entry size.', 422);
+    }
+
+    const lfhHeaderEnd = localHeaderOffset + 30 + lfhFileNameLen + lfhExtraLen;
+    if (lfhHeaderEnd > cdOffset) {
+      throw new SpreadsheetSecurityError('Corrupt OOXML local file header length.', 422);
+    }
+    if (
+      lfhFileNameLen !== fileNameLen ||
+      !buffer.subarray(localHeaderOffset + 30, localHeaderOffset + 30 + lfhFileNameLen).equals(rawNameBuf)
+    ) {
+      throw new SpreadsheetSecurityError('Mismatched OOXML local and central directory filenames.', 422);
+    }
+
+    const usesDataDescriptor = (lfhFlags & 0x0008) !== 0 || (cdFlags & 0x0008) !== 0;
+    if (!usesDataDescriptor && (lfhCompressedSize !== compressedSize || lfhUncompressedSize !== uncompressedSize)) {
+      throw new SpreadsheetSecurityError('Mismatched OOXML local and central directory sizes.', 422);
+    }
+
+    const payloadEnd = lfhHeaderEnd + compressedSize;
+    if (payloadEnd > cdOffset) {
+      throw new SpreadsheetSecurityError('Corrupt OOXML ZIP entry payload extends past central directory.', 422);
+    }
+    entrySpans.push([localHeaderOffset, payloadEnd]);
+
     totalUncompressed += uncompressedSize;
     if (uncompressedSize > MAX_ZIP_UNCOMPRESSED_BYTES || totalUncompressed > MAX_ZIP_UNCOMPRESSED_BYTES) {
       throw new SpreadsheetSecurityError(
@@ -184,8 +233,8 @@ export function inspectXlsxZipContainer(buffer) {
     }
 
     if (
-      uncompressedSize > 64 * 1024 &&
-      (compressedSize === 0 || uncompressedSize / compressedSize > MAX_ZIP_COMPRESSION_RATIO)
+      (compressedSize === 0 && uncompressedSize > 0) ||
+      (uncompressedSize > 64 * 1024 && uncompressedSize / compressedSize > MAX_ZIP_COMPRESSION_RATIO)
     ) {
       throw new SpreadsheetSecurityError(
         'Spreadsheet archive rejected due to excessive compression ratio (ZIP bomb protection).',
@@ -196,11 +245,35 @@ export function inspectXlsxZipContainer(buffer) {
     cursor = recordEnd;
   }
 
+  entrySpans.sort((a, b) => a[0] - b[0]);
+  for (let i = 1; i < entrySpans.length; i += 1) {
+    if (entrySpans[i][0] < entrySpans[i - 1][1]) {
+      throw new SpreadsheetSecurityError('Overlapping OOXML ZIP entries detected.', 422);
+    }
+  }
+
   return { entryCount: totalEntries, totalUncompressedBytes: totalUncompressed };
 }
 
-export function parseDelimitedTextToRows(rawText) {
+const MAX_RAW_CELL_BUFFER_CHARS = 65536;
+
+function detectDelimitedSeparator(cleaned, hintExtOrMime = '') {
+  if (/\.tsv$/i.test(hintExtOrMime) || hintExtOrMime.includes('tab-separated-values')) {
+    return '\t';
+  }
+  const firstLine = cleaned.split(/\r?\n/, 1)[0] || '';
+  if (firstLine.includes('\t') && !firstLine.includes(',')) {
+    return '\t';
+  }
+  return ',';
+}
+
+export function parseDelimitedTextToRows(rawText, options = {}) {
   const cleaned = rawText.replace(/^\uFEFF/, '');
+  const delimiter =
+    options.delimiter === '\t' || options.delimiter === ','
+      ? options.delimiter
+      : detectDelimitedSeparator(cleaned, options.hint || '');
   const rows = [];
   let currentRow = [];
   let field = '';
@@ -237,25 +310,35 @@ export function parseDelimitedTextToRows(rawText) {
     currentRow = [];
   };
 
+  const appendFieldChar = (ch) => {
+    if (field.length >= MAX_RAW_CELL_BUFFER_CHARS) {
+      throw new SpreadsheetSecurityError(
+        `Delimited cell exceeds maximum ${MAX_RAW_CELL_BUFFER_CHARS} character safety bound.`,
+        422
+      );
+    }
+    field += ch;
+  };
+
   for (let i = 0; i < cleaned.length; i += 1) {
     const ch = cleaned[i];
     if (inQuotes) {
       if (ch === '"') {
         if (cleaned[i + 1] === '"') {
-          field += '"';
+          appendFieldChar('"');
           i += 1;
         } else {
           inQuotes = false;
         }
       } else {
-        field += ch;
+        appendFieldChar(ch);
       }
       continue;
     }
 
     if (ch === '"' && field === '') {
       inQuotes = true;
-    } else if (ch === ',') {
+    } else if (ch === delimiter) {
       pushCell(field);
       field = '';
     } else if (ch === '\r') {
@@ -268,7 +351,7 @@ export function parseDelimitedTextToRows(rawText) {
       field = '';
       pushRow();
     } else {
-      field += ch;
+      appendFieldChar(ch);
     }
   }
 
@@ -323,7 +406,10 @@ export function parseSpreadsheetHardened(buffer, options = {}) {
   const docName = typeof options.documentName === 'string' ? options.documentName : '';
   const mimeType = typeof options.mimeType === 'string' ? options.mimeType.toLowerCase() : '';
   const looksCsv =
-    (mimeType === 'text/csv' || /\.csv$/i.test(docName) || (!isZipBuffer(buffer) && !isOle2Buffer(buffer) && mimeType.includes('csv'))) &&
+    (mimeType === 'text/csv' ||
+      mimeType.includes('tab-separated-values') ||
+      /\.(csv|tsv)$/i.test(docName) ||
+      (!isZipBuffer(buffer) && !isOle2Buffer(buffer) && mimeType.includes('csv'))) &&
     !isZipBuffer(buffer) &&
     !isOle2Buffer(buffer);
 
@@ -332,7 +418,7 @@ export function parseSpreadsheetHardened(buffer, options = {}) {
     if (text.includes('\u0000')) {
       throw new SpreadsheetSecurityError('CSV file contains binary NUL bytes.', 415);
     }
-    const rows = parseDelimitedTextToRows(text);
+    const rows = parseDelimitedTextToRows(text, { hint: `${docName} ${mimeType}` });
     if (rows.length === 0) {
       return { structuredText: '', sheetPreview: [] };
     }
@@ -356,12 +442,12 @@ export function parseSpreadsheetHardened(buffer, options = {}) {
   if (isZipBuffer(buffer)) {
     inspectXlsxZipContainer(buffer);
   } else if (!isOle2Buffer(buffer)) {
-    // Plain UTF-8 text without CSV filename extension (e.g. direct Buffer invocation on raw CSV)
+    // Plain UTF-8 text without CSV filename extension (e.g. text-table .xls export)
     const sample = buffer.subarray(0, Math.min(buffer.length, 4096));
     if (sample.includes(0)) {
       throw new SpreadsheetSecurityError('Unsupported or corrupt binary spreadsheet format.', 422);
     }
-    const rows = parseDelimitedTextToRows(buffer.toString('utf8'));
+    const rows = parseDelimitedTextToRows(buffer.toString('utf8'), { hint: `${docName} ${mimeType}` });
     if (rows.length === 0) {
       return { structuredText: '', sheetPreview: [] };
     }

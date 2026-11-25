@@ -1350,5 +1350,45 @@ describe('Task 007 Stabilization Unit Suite', () => {
         }),
       (err: unknown) => err instanceof AwardValidationError && err.statusCode === 422
     );
+
+    // 5. Split-award monetary Kahan summation preserves exact cent total across fractional decimal shares
+    const kahanSplit = validateAwardSubmission({
+      rfq: unitRfq,
+      rfqQuotes: [
+        {
+          ...unitQ1,
+          totalLandedCost: 2010,
+          lines: [
+            { ...unitQ1.lines[0], normalizedUnitLanded: 10 },
+            { ...unitQ1.lines[1], normalizedUnitLanded: 100 },
+          ],
+        },
+        {
+          ...q2,
+          totalLandedCost: 2010,
+          lines: [
+            { ...q2.lines[0], quotedQty: 1, normalizedUnitLanded: 10 },
+            { ...q2.lines[1], normalizedUnitLanded: 100 },
+          ],
+        },
+        {
+          ...q3,
+          totalLandedCost: 2010,
+          lines: [
+            { ...q3.lines[0], normalizedUnitLanded: 10 },
+            { ...q3.lines[1], normalizedUnitLanded: 100 },
+          ],
+        },
+      ],
+      isSplitAward: true,
+      allocations: [
+        { rfqItemId: 'item-1', quotationId: unitQ1.id, quotationLineId: unitQ1.lines[0].id, awardedQty: 0.1 },
+        { rfqItemId: 'item-1', quotationId: q2.id, quotationLineId: q2.lines[0].id, awardedQty: 0.2 },
+        { rfqItemId: 'item-1', quotationId: q3.id, quotationLineId: q3.lines[0].id, awardedQty: 0.7 },
+        { rfqItemId: 'item-2', quotationId: unitQ1.id, quotationLineId: unitQ1.lines[1].id, awardedQty: 20 },
+      ],
+    });
+    assert.equal(kahanSplit.totalAwardedLanded, 2010);
+    assert.equal(kahanSplit.isNonL1, false);
   });
 });

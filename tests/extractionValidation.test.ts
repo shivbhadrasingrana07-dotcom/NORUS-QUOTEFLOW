@@ -292,7 +292,21 @@ test(
   }
 );
 
-function buildSyntheticZip(entries: Array<{ name: string; compressedSize: number; uncompressedSize: number; content?: Buffer }>): Buffer {
+function buildSyntheticZip(
+  entries: Array<{
+    name: string;
+    compressedSize: number;
+    uncompressedSize: number;
+    content?: Buffer;
+    flags?: number;
+    lfhFlags?: number;
+    method?: number;
+    lfhMethod?: number;
+    lfhCompressedSize?: number;
+    lfhUncompressedSize?: number;
+    overrideLocalOffset?: number;
+  }>
+): Buffer {
   const localChunks: Buffer[] = [];
   const centralChunks: Buffer[] = [];
   let offset = 0;
@@ -303,8 +317,10 @@ function buildSyntheticZip(entries: Array<{ name: string; compressedSize: number
     const localHeader = Buffer.alloc(30 + nameBuf.length + dataBuf.length);
     localHeader.writeUInt32LE(0x04034b50, 0);
     localHeader.writeUInt16LE(20, 4);
-    localHeader.writeUInt32LE(e.compressedSize, 18);
-    localHeader.writeUInt32LE(e.uncompressedSize, 22);
+    localHeader.writeUInt16LE(e.lfhFlags ?? e.flags ?? 0, 6);
+    localHeader.writeUInt16LE(e.lfhMethod ?? e.method ?? 0, 8);
+    localHeader.writeUInt32LE(e.lfhCompressedSize ?? e.compressedSize, 18);
+    localHeader.writeUInt32LE(e.lfhUncompressedSize ?? e.uncompressedSize, 22);
     localHeader.writeUInt16LE(nameBuf.length, 26);
     nameBuf.copy(localHeader, 30);
     dataBuf.copy(localHeader, 30 + nameBuf.length);
@@ -314,10 +330,12 @@ function buildSyntheticZip(entries: Array<{ name: string; compressedSize: number
     central.writeUInt32LE(0x02014b50, 0);
     central.writeUInt16LE(20, 4);
     central.writeUInt16LE(20, 6);
+    central.writeUInt16LE(e.flags ?? 0, 8);
+    central.writeUInt16LE(e.method ?? 0, 10);
     central.writeUInt32LE(e.compressedSize, 20);
     central.writeUInt32LE(e.uncompressedSize, 24);
     central.writeUInt16LE(nameBuf.length, 28);
-    central.writeUInt32LE(offset, 42);
+    central.writeUInt32LE(e.overrideLocalOffset ?? offset, 42);
     nameBuf.copy(central, 46);
     centralChunks.push(central);
 
@@ -411,7 +429,7 @@ test('Task 009: enforces worksheet, row, column limits, ZIP bomb compression rat
     ]),
     'Quote'
   );
-  const validBuf = XLSX.write(validWb, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
+  const validBuf = XLSX.write(validWb, { type: 'buffer', bookType: 'xlsx', compression: true }) as Buffer;
   const isoRes = await parseSpreadsheetBufferIsolated(validBuf, { documentName: 'ok.xlsx' });
   assert.equal(isoRes.sheetPreview[0].sheetName, 'Quote');
   assert.ok(isoRes.structuredText.includes('B2: 10'));
@@ -422,4 +440,90 @@ test('Task 009: enforces worksheet, row, column limits, ZIP bomb compression rat
     (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 422
   );
   assert.equal(({} as Record<string, unknown>).pollutedTest, undefined);
+});
+
+test('Task 010: hardens ZIP container LFH/CD parity, encrypted entry rejection, backslash traversal, TSV parsing, and oversized delimited fields', async () => {
+  const samplePayload = Buffer.from('<xml/>', 'utf8');
+
+  // Encrypted ZIP bit flag -> 422
+  const encryptedZip = buildSyntheticZip([
+    {
+      name: 'xl/worksheets/sheet1.xml',
+      compressedSize: samplePayload.length,
+      uncompressedSize: samplePayload.length,
+      content: samplePayload,
+      flags: 0x0001,
+    },
+  ]);
+  assert.throws(
+    () => parseSpreadsheetBuffer(encryptedZip, { documentName: 'enc.xlsx' }),
+    (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 422
+  );
+
+  // Windows backslash smuggling -> 422
+  const backslashZip = buildSyntheticZip([
+    {
+      name: 'xl\\vbaProject.bin',
+      compressedSize: samplePayload.length,
+      uncompressedSize: samplePayload.length,
+      content: samplePayload,
+    },
+  ]);
+  assert.throws(
+    () => parseSpreadsheetBuffer(backslashZip, { documentName: 'winpath.xlsx' }),
+    (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 422
+  );
+
+  // Mismatched LFH vs CD sizes -> 422
+  const mismatchSizeZip = buildSyntheticZip([
+    {
+      name: 'xl/worksheets/sheet1.xml',
+      compressedSize: samplePayload.length,
+      uncompressedSize: samplePayload.length,
+      lfhUncompressedSize: 999999,
+      content: samplePayload,
+    },
+  ]);
+  assert.throws(
+    () => parseSpreadsheetBuffer(mismatchSizeZip, { documentName: 'mismatch.xlsx' }),
+    (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 422
+  );
+
+  // Overlapping LFH offsets -> 422
+  const overlapZip = buildSyntheticZip([
+    {
+      name: 'xl/a.xml',
+      compressedSize: samplePayload.length,
+      uncompressedSize: samplePayload.length,
+      content: samplePayload,
+    },
+    {
+      name: 'xl/b.xml',
+      compressedSize: samplePayload.length,
+      uncompressedSize: samplePayload.length,
+      content: samplePayload,
+      overrideLocalOffset: 0,
+    },
+  ]);
+  assert.throws(
+    () => parseSpreadsheetBuffer(overlapZip, { documentName: 'overlap.xlsx' }),
+    (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 422
+  );
+
+  // Native TSV parsing via tab delimiter detection without touching xlsx
+  const tsvBuf = Buffer.from('Item\tQty\tRate\nSS316 Valve\t25\t1800\n', 'utf8');
+  const parsedTsv = await parseSpreadsheetBufferIsolated(tsvBuf, {
+    documentName: 'quote.xls',
+    mimeType: 'application/vnd.ms-excel',
+  });
+  assert.equal(parsedTsv.sheetPreview[0].rows[1][0], 'SS316 Valve');
+  assert.equal(parsedTsv.sheetPreview[0].rows[1][1], '25');
+  assert.equal(parsedTsv.sheetPreview[0].rows[1][2], '1800');
+
+  // Oversized single delimited cell (> 65536 chars) -> 422
+  const hugeCsv = Buffer.from(`Item,Qty\n"${'A'.repeat(70000)}",1\n`, 'utf8');
+  await assert.rejects(
+    () => parseSpreadsheetBufferIsolated(hugeCsv, { documentName: 'huge.csv', mimeType: 'text/csv' }),
+    (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 422
+  );
 });

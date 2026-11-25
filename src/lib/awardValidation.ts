@@ -161,7 +161,7 @@ export function validateAwardSubmission(params: AwardValidationInput): Validated
   const validatedAllocations: AwardAllocation[] = [];
   const referencedQuotesMap = new Map<string, Quotation>();
   const referencedLines: QuotationLine[] = [];
-  let computedTotalLanded = 0;
+  const lineLandedTotals: number[] = [];
 
   for (const rfqItem of rfq.items) {
     const group = entriesByRfqItem.get(rfqItem.id)!;
@@ -242,7 +242,7 @@ export function validateAwardSubmission(params: AwardValidationInput): Validated
       referencedLines.push(line);
 
       const unitLanded = line.normalizedUnitLanded;
-      computedTotalLanded += unitLanded * allocQty;
+      lineLandedTotals.push(unitLanded * allocQty);
       validatedAllocations.push({
         rfqItemId: rfqItem.id,
         quotationId: quote.id,
@@ -253,6 +253,8 @@ export function validateAwardSubmission(params: AwardValidationInput): Validated
       });
     }
   }
+
+  let computedTotalLanded = sumExactQuantities(lineLandedTotals);
 
   const distinctQuoteIds = new Set(validatedAllocations.map((a) => a.quotationId));
   if (!isSplitAward) {
