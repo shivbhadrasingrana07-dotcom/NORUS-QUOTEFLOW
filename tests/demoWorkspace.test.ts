@@ -892,4 +892,208 @@ describe('Task 006/007: Temporary No-Login Demo Workspace & Security Isolation',
     assert.equal(rfqAwards.some((a) => a.id === pending2.id && a.approvalStatus === 'rejected'), true);
     assert.equal(rfqAwards.some((a) => a.id === pending3.id && a.approvalStatus === 'approved'), true);
   });
+
+  it('Task 009: enforces isolated macro-enabled workbook rejection (415) and tight split-item precision boundaries over HTTP', async () => {
+    const srv = await startIntegratedTestServer({ demoMode: true });
+    cleanups.push(() => srv.close());
+
+    const sessId = `test-009-http-${uniqueRunTag()}`;
+    const headers = { 'X-Demo-Session': sessId };
+    const jsonHeaders = { 'X-Demo-Session': sessId, 'Content-Type': 'application/json' };
+
+    // 1. Upload an XLSX container smuggling xl/vbaProject.bin -> rejected 415 by isolated spreadsheet worker
+    const cleanBook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(
+      cleanBook,
+      XLSX.utils.aoa_to_sheet([
+        ['Item', 'Qty', 'Rate', 'Amount'],
+        ['CNC Valve', '10', '100', '1000'],
+      ]),
+      'Offer'
+    );
+    const cleanBuf = XLSX.write(cleanBook, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
+
+    // Append synthetic xl/vbaProject.bin local + central directory entry or craft minimal Stored ZIP with xl/vbaProject.bin
+    const crcTable = new Uint32Array(256);
+    for (let i = 0; i < 256; i += 1) {
+      let c = i;
+      for (let k = 0; k < 8; k += 1) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      crcTable[i] = c >>> 0;
+    }
+    const crc32 = (b: Buffer) => {
+      let c = 0xffffffff;
+      for (let i = 0; i < b.length; i += 1) c = crcTable[(c ^ b[i]) & 0xff] ^ (c >>> 8);
+      return (c ^ 0xffffffff) >>> 0;
+    };
+    const buildZip = (entries: Array<{ name: string; data: Buffer }>) => {
+      const locals: Buffer[] = [];
+      const centrals: Buffer[] = [];
+      let offset = 0;
+      for (const e of entries) {
+        const nameBuf = Buffer.from(e.name, 'utf8');
+        const crc = crc32(e.data);
+        const lh = Buffer.alloc(30 + nameBuf.length);
+        lh.writeUInt32LE(0x04034b50, 0);
+        lh.writeUInt16LE(20, 4);
+        lh.writeUInt32LE(crc, 14);
+        lh.writeUInt32LE(e.data.length, 18);
+        lh.writeUInt32LE(e.data.length, 22);
+        lh.writeUInt16LE(nameBuf.length, 26);
+        nameBuf.copy(lh, 30);
+        locals.push(lh, e.data);
+
+        const ch = Buffer.alloc(46 + nameBuf.length);
+        ch.writeUInt32LE(0x02014b50, 0);
+        ch.writeUInt16LE(20, 4);
+        ch.writeUInt16LE(20, 6);
+        ch.writeUInt32LE(crc, 16);
+        ch.writeUInt32LE(e.data.length, 20);
+        ch.writeUInt32LE(e.data.length, 24);
+        ch.writeUInt16LE(nameBuf.length, 28);
+        ch.writeUInt32LE(offset, 42);
+        nameBuf.copy(ch, 46);
+        centrals.push(ch);
+        offset += lh.length + e.data.length;
+      }
+      const cd = Buffer.concat(centrals);
+      const eocd = Buffer.alloc(22);
+      eocd.writeUInt32LE(0x06054b50, 0);
+      eocd.writeUInt16LE(entries.length, 8);
+      eocd.writeUInt16LE(entries.length, 10);
+      eocd.writeUInt32LE(cd.length, 12);
+      eocd.writeUInt32LE(offset, 16);
+      return Buffer.concat([...locals, cd, eocd]);
+    };
+
+    assert.equal(cleanBuf.subarray(0, 2).toString('ascii'), 'PK');
+    const macroZip = buildZip([
+      { name: '[Content_Types].xml', data: Buffer.from('<Types/>') },
+      { name: 'xl/vbaProject.bin', data: Buffer.from('FAKE-VBA-MACRO') },
+    ]);
+    const macroForm = new FormData();
+    macroForm.append('supplierId', 'sup-demo-1');
+    macroForm.append(
+      'file',
+      new Blob([new Uint8Array(macroZip)], {
+        type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      }),
+      'smuggled-macro.xlsx'
+    );
+    const macroRes = await fetch(
+      `${srv.baseUrl}/api/demo-workspace/rfqs/demo-rfq-2026-101/quotes/extract`,
+      { method: 'POST', headers, body: macroForm }
+    );
+    assert.equal(macroRes.status, 415);
+
+    // 2. Verify precision boundary (0.1% drift rejected 400) & multi-supplier split on one item (201)
+    const rfqRes = await fetch(`${srv.baseUrl}/api/demo-workspace/rfqs`, {
+      method: 'POST',
+      headers: jsonHeaders,
+      body: JSON.stringify({
+        title: 'Task 009 Split Precision RFQ',
+        currency: 'INR',
+        invitedSupplierIds: ['sup-demo-1', 'sup-demo-2'],
+        items: [
+          {
+            skuCode: 'T09-SPLIT-1',
+            description: 'Precision Alloy Strip Coil (10.000 kg)',
+            quantity: 10,
+            uom: 'kg',
+            targetUnitPrice: 500,
+          },
+        ],
+      }),
+    });
+    assert.equal(rfqRes.status, 201);
+    const rfq = (await rfqRes.json()) as Rfq;
+
+    const extractQuote = async (supplierId: string, text: string) => {
+      const f = new FormData();
+      f.append('supplierId', supplierId);
+      f.append('rawEmailText', text);
+      const r = await fetch(`${srv.baseUrl}/api/demo-workspace/rfqs/${rfq.id}/quotes/extract`, {
+        method: 'POST',
+        headers,
+        body: f,
+      });
+      assert.equal(r.status, 201);
+      const q = (await r.json()) as Quotation;
+      // Normalize extracted line & verify
+      const patchLine = await fetch(
+        `${srv.baseUrl}/api/demo-workspace/quotations/${q.id}/lines/${q.lines[0].id}`,
+        {
+          method: 'PATCH',
+          headers: jsonHeaders,
+          body: JSON.stringify({
+            rfqItemId: rfq.items[0].id,
+            quotedQty: 10,
+            quotedUnitRate: 500,
+            uomConversionFactor: 1,
+            taxRatePct: 0,
+            lineTotalQuoted: 5000,
+            matchStatus: 'matched',
+          }),
+        }
+      );
+      assert.equal(patchLine.status, 200);
+      assert.equal(
+        (
+          await fetch(`${srv.baseUrl}/api/demo-workspace/quotations/${q.id}/verify`, {
+            method: 'POST',
+            headers,
+          })
+        ).status,
+        200
+      );
+      return q;
+    };
+
+    const qa = await extractQuote('sup-demo-1', 'Precision Alloy Strip Coil 10 kg @ 500 = 5000');
+    const qb = await extractQuote('sup-demo-2', 'Precision Alloy Strip Coil 10 kg @ 500 = 5000');
+
+    // Old 0.1% drift (9.99 vs 10) must fail with 400
+    const badPrecisionRes = await fetch(`${srv.baseUrl}/api/demo-workspace/rfqs/${rfq.id}/award`, {
+      method: 'POST',
+      headers: jsonHeaders,
+      body: JSON.stringify({
+        isSplitAward: false,
+        allocations: [
+          {
+            rfqItemId: rfq.items[0].id,
+            quotationId: qa.id,
+            quotationLineId: qa.lines[0].id,
+            awardedQty: 9.99,
+          },
+        ],
+      }),
+    });
+    assert.equal(badPrecisionRes.status, 400);
+
+    // Repeating-decimal multi-supplier split (3.333333 + 6.666667 = 10) must succeed (201) & preserve allocations
+    const splitRes = await fetch(`${srv.baseUrl}/api/demo-workspace/rfqs/${rfq.id}/award`, {
+      method: 'POST',
+      headers: jsonHeaders,
+      body: JSON.stringify({
+        isSplitAward: true,
+        allocations: [
+          {
+            rfqItemId: rfq.items[0].id,
+            quotationId: qa.id,
+            quotationLineId: qa.lines[0].id,
+            awardedQty: 3.333333,
+          },
+          {
+            rfqItemId: rfq.items[0].id,
+            quotationId: qb.id,
+            quotationLineId: qb.lines[0].id,
+            awardedQty: 6.666667,
+          },
+        ],
+      }),
+    });
+    assert.equal(splitRes.status, 201);
+    const createdSplitAward = (await splitRes.json()) as AwardDecision;
+    assert.equal(createdSplitAward.allocations.length, 2);
+  });
 });
+

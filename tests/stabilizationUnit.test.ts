@@ -24,9 +24,13 @@ import {
 import { getClientIp } from '../server/rateLimiter.ts';
 import { resolveCookieSameSite } from '../server/security.ts';
 import {
+  ALLOCATION_QTY_EPSILON,
   AwardValidationError,
+  getAllocationTolerance,
+  getConvertedQuotedQuantity,
   isExceedingL1Total,
   isLineQuantitySufficient,
+  sumExactQuantities,
   validateAwardSubmission,
 } from '../src/lib/awardValidation.ts';
 import { computeEvaluatedSavings, rankQuotations } from '../src/lib/ranking.ts';
@@ -1117,5 +1121,234 @@ describe('Task 007 Stabilization Unit Suite', () => {
       ],
     });
     assert.equal(microAwardOk.allocations[0].awardedQty, 0.001);
+  });
+
+  it('Task 009: tightens award allocation precision to 1e-6, preserves exact decimals, and validates multi-supplier split allocations', () => {
+    const { rfq, q1, q2 } = makeSampleRfqAndQuotes();
+    assert.equal(ALLOCATION_QTY_EPSILON, 1e-6);
+    assert.equal(getAllocationTolerance(1), 1e-6);
+    assert.equal(getAllocationTolerance(10), 1e-6);
+
+    // Sub-1e-6 quantities are never truncated to zero by getConvertedQuotedQuantity
+    const tinyQty = getConvertedQuotedQuantity({
+      ...q1.lines[0],
+      quotedQty: 0.0000005,
+      uomConversionFactor: 1,
+    });
+    assert.equal(tinyQty, 0.0000005);
+
+    // Repeating float artifact like 0.1 * 3 normalizes cleanly to 0.3 at 1e-9 precision
+    assert.equal(
+      getConvertedQuotedQuantity({
+        ...q1.lines[0],
+        quotedQty: 0.1,
+        uomConversionFactor: 3,
+      }),
+      0.3
+    );
+
+    // Kahan exact decimal sum keeps 0.1 + 0.2 + 0.7 within floating-point epsilon of 1
+    assert.ok(Math.abs(sumExactQuantities([0.1, 0.2, 0.7]) - 1) <= 1e-12);
+
+    // 1. Previously accepted 0.1% drift (0.999 vs 1, 9.999 vs 10, 10.001 vs 10) must FAIL with 400
+    const unitRfq: Rfq = {
+      ...rfq,
+      items: [{ ...rfq.items[0], quantity: 1 }, rfq.items[1]],
+    };
+    const unitQ1: Quotation = {
+      ...q1,
+      totalLandedCost: 5000,
+      lines: [
+        { ...q1.lines[0], quotedQty: 1, lineTotalQuoted: 1000, expectedLineTotal: 1000 },
+        q1.lines[1],
+      ],
+    };
+
+    for (const driftedQty of [0.999, 1.001]) {
+      assert.throws(
+        () =>
+          validateAwardSubmission({
+            rfq: unitRfq,
+            rfqQuotes: [unitQ1, q2],
+            isSplitAward: false,
+            allocations: [
+              { rfqItemId: 'item-1', quotationId: unitQ1.id, quotationLineId: unitQ1.lines[0].id, awardedQty: driftedQty },
+              { rfqItemId: 'item-2', quotationId: unitQ1.id, quotationLineId: unitQ1.lines[1].id, awardedQty: 20 },
+            ],
+          }),
+        (err: unknown) => err instanceof AwardValidationError && err.statusCode === 400
+      );
+    }
+
+    for (const driftedTen of [9.999, 10.001]) {
+      assert.throws(
+        () =>
+          validateAwardSubmission({
+            rfq,
+            rfqQuotes: [q1, q2],
+            isSplitAward: false,
+            allocations: [
+              { rfqItemId: 'item-1', quotationId: q1.id, quotationLineId: q1.lines[0].id, awardedQty: driftedTen },
+              { rfqItemId: 'item-2', quotationId: q1.id, quotationLineId: q1.lines[1].id, awardedQty: 20 },
+            ],
+          }),
+        (err: unknown) => err instanceof AwardValidationError && err.statusCode === 400
+      );
+    }
+
+    // 2. Multi-supplier split on single RFQ item: 3.333333 + 6.666667 = 10 succeeds & preserves exact awardedQty
+    const splitExactRes = validateAwardSubmission({
+      rfq,
+      rfqQuotes: [q1, q2],
+      isSplitAward: true,
+      nonL1Justification: 'Dual sourcing capacity split on item-1.',
+      allocations: [
+        { rfqItemId: 'item-1', quotationId: q1.id, quotationLineId: q1.lines[0].id, awardedQty: 3.333333 },
+        { rfqItemId: 'item-1', quotationId: q2.id, quotationLineId: q2.lines[0].id, awardedQty: 6.666667 },
+        { rfqItemId: 'item-2', quotationId: q1.id, quotationLineId: q1.lines[1].id, awardedQty: 20 },
+      ],
+    });
+    assert.equal(splitExactRes.allocations.length, 3);
+    assert.equal(splitExactRes.allocations[0].awardedQty, 3.333333);
+    assert.equal(splitExactRes.allocations[1].awardedQty, 6.666667);
+
+    // 3-way micro-precision decimal split: 0.1 + 0.2 + 0.7 = 1 on item-1
+    const q3: Quotation = {
+      ...q2,
+      id: 'q-u-3',
+      supplierId: 'sup-3',
+      quoteReference: 'Q3-REF',
+      totalLandedCost: 17000,
+      lines: [
+        { ...q2.lines[0], id: 'q3-l1', quotationId: 'q-u-3', quotedQty: 1 },
+        { ...q2.lines[1], id: 'q3-l2', quotationId: 'q-u-3' },
+      ],
+    };
+    const splitThreeWay = validateAwardSubmission({
+      rfq: unitRfq,
+      rfqQuotes: [unitQ1, q2, q3],
+      isSplitAward: true,
+      nonL1Justification: 'Three-way qualification split.',
+      allocations: [
+        { rfqItemId: 'item-1', quotationId: unitQ1.id, quotationLineId: unitQ1.lines[0].id, awardedQty: 0.1 },
+        { rfqItemId: 'item-1', quotationId: q2.id, quotationLineId: q2.lines[0].id, awardedQty: 0.2 },
+        { rfqItemId: 'item-1', quotationId: q3.id, quotationLineId: q3.lines[0].id, awardedQty: 0.7 },
+        { rfqItemId: 'item-2', quotationId: unitQ1.id, quotationLineId: unitQ1.lines[1].id, awardedQty: 20 },
+      ],
+    });
+    assert.equal(splitThreeWay.allocations.length, 4);
+    assert.equal(splitThreeWay.allocations[0].awardedQty, 0.1);
+    assert.equal(splitThreeWay.allocations[1].awardedQty, 0.2);
+    assert.equal(splitThreeWay.allocations[2].awardedQty, 0.7);
+
+    // Micro-quantity split: 0.0004 + 0.0006 = 0.001
+    const microSplitRfq: Rfq = { ...rfq, items: [{ ...rfq.items[0], quantity: 0.001 }, rfq.items[1]] };
+    const microSplitQ1: Quotation = {
+      ...q1,
+      lines: [{ ...q1.lines[0], quotedQty: 0.0004, lineTotalQuoted: 0.4, expectedLineTotal: 0.4 }, q1.lines[1]],
+    };
+    const microSplitQ2: Quotation = {
+      ...q2,
+      lines: [{ ...q2.lines[0], quotedQty: 0.0006, lineTotalQuoted: 0.72, expectedLineTotal: 0.72 }, q2.lines[1]],
+    };
+    const microSplitOk = validateAwardSubmission({
+      rfq: microSplitRfq,
+      rfqQuotes: [microSplitQ1, microSplitQ2],
+      isSplitAward: true,
+      nonL1Justification: 'Split micro-lot.',
+      allocations: [
+        { rfqItemId: 'item-1', quotationId: microSplitQ1.id, quotationLineId: microSplitQ1.lines[0].id, awardedQty: 0.0004 },
+        { rfqItemId: 'item-1', quotationId: microSplitQ2.id, quotationLineId: microSplitQ2.lines[0].id, awardedQty: 0.0006 },
+        { rfqItemId: 'item-2', quotationId: microSplitQ1.id, quotationLineId: microSplitQ1.lines[1].id, awardedQty: 20 },
+      ],
+    });
+    assert.equal(microSplitOk.allocations[0].awardedQty, 0.0004);
+    assert.equal(microSplitOk.allocations[1].awardedQty, 0.0006);
+
+    // 3. Reject split shortfall (4 + 5 = 9 vs 10 -> 400), split excess (6 + 5 = 11 vs 10 -> 400), missing split qty (400), duplicate same-quote split (400)
+    assert.throws(
+      () =>
+        validateAwardSubmission({
+          rfq,
+          rfqQuotes: [q1, q2],
+          isSplitAward: true,
+          nonL1Justification: 'Short split',
+          allocations: [
+            { rfqItemId: 'item-1', quotationId: q1.id, quotationLineId: q1.lines[0].id, awardedQty: 4 },
+            { rfqItemId: 'item-1', quotationId: q2.id, quotationLineId: q2.lines[0].id, awardedQty: 5 },
+            { rfqItemId: 'item-2', quotationId: q1.id, quotationLineId: q1.lines[1].id, awardedQty: 20 },
+          ],
+        }),
+      (err: unknown) => err instanceof AwardValidationError && err.statusCode === 400
+    );
+
+    assert.throws(
+      () =>
+        validateAwardSubmission({
+          rfq,
+          rfqQuotes: [q1, q2],
+          isSplitAward: true,
+          nonL1Justification: 'Excess split',
+          allocations: [
+            { rfqItemId: 'item-1', quotationId: q1.id, quotationLineId: q1.lines[0].id, awardedQty: 6 },
+            { rfqItemId: 'item-1', quotationId: q2.id, quotationLineId: q2.lines[0].id, awardedQty: 5 },
+            { rfqItemId: 'item-2', quotationId: q1.id, quotationLineId: q1.lines[1].id, awardedQty: 20 },
+          ],
+        }),
+      (err: unknown) => err instanceof AwardValidationError && err.statusCode === 400
+    );
+
+    assert.throws(
+      () =>
+        validateAwardSubmission({
+          rfq,
+          rfqQuotes: [q1, q2],
+          isSplitAward: true,
+          nonL1Justification: 'Missing split qty',
+          allocations: [
+            { rfqItemId: 'item-1', quotationId: q1.id, quotationLineId: q1.lines[0].id },
+            { rfqItemId: 'item-1', quotationId: q2.id, quotationLineId: q2.lines[0].id, awardedQty: 5 },
+            { rfqItemId: 'item-2', quotationId: q1.id, quotationLineId: q1.lines[1].id, awardedQty: 20 },
+          ],
+        }),
+      (err: unknown) => err instanceof AwardValidationError && err.statusCode === 400
+    );
+
+    assert.throws(
+      () =>
+        validateAwardSubmission({
+          rfq,
+          rfqQuotes: [q1, q2],
+          isSplitAward: true,
+          nonL1Justification: 'Duplicate same supplier on item-1',
+          allocations: [
+            { rfqItemId: 'item-1', quotationId: q1.id, quotationLineId: q1.lines[0].id, awardedQty: 5 },
+            { rfqItemId: 'item-1', quotationId: q1.id, quotationLineId: q1.lines[0].id, awardedQty: 5 },
+            { rfqItemId: 'item-2', quotationId: q1.id, quotationLineId: q1.lines[1].id, awardedQty: 20 },
+          ],
+        }),
+      (err: unknown) => err instanceof AwardValidationError && err.statusCode === 400
+    );
+
+    // 4. Reject split allocation if supplier quoted qty is below their assigned split share (5 quoted vs 6 allocated -> 422)
+    const q1FiveOnly: Quotation = {
+      ...q1,
+      lines: [{ ...q1.lines[0], quotedQty: 5, lineTotalQuoted: 5000, expectedLineTotal: 5000 }, q1.lines[1]],
+    };
+    assert.throws(
+      () =>
+        validateAwardSubmission({
+          rfq,
+          rfqQuotes: [q1FiveOnly, q2],
+          isSplitAward: true,
+          nonL1Justification: 'Supplier Q1 only quoted 5 but assigned 6',
+          allocations: [
+            { rfqItemId: 'item-1', quotationId: q1FiveOnly.id, quotationLineId: q1FiveOnly.lines[0].id, awardedQty: 6 },
+            { rfqItemId: 'item-1', quotationId: q2.id, quotationLineId: q2.lines[0].id, awardedQty: 4 },
+            { rfqItemId: 'item-2', quotationId: q1FiveOnly.id, quotationLineId: q1FiveOnly.lines[1].id, awardedQty: 20 },
+          ],
+        }),
+      (err: unknown) => err instanceof AwardValidationError && err.statusCode === 422
+    );
   });
 });

@@ -42,10 +42,11 @@ Every table below enforces a non-null `organization_id` FK (`ON DELETE CASCADE`)
    - `price_history.rfq_id` and `price_history.supplier_id` are intentionally stored as historical snapshot references without foreign keys to `rfqs` or `suppliers`, preserving historical awarded landed-price memory (`price_history.catalog_item_id` remains scoped via `(organization_id, catalog_item_id)`).
 3. **Audit Logs (`audit_logs`):**
    - Immutability (append-only behavior) is **application-enforced**: `PgDataStore`, `ownerBootstrap.ts`, and `legacyMigration.ts` perform `INSERT`-only writes with no update/delete endpoints or queries (no PostgreSQL trigger/rule is installed at the DB layer).
-4. **Historical Award Snapshot Preservation, Locking & Concurrent RFQ Numbering:**
+4. **Historical Award Snapshot Preservation, Hierarchical Locking & Concurrent RFQ Numbering:**
    - `award_allocations.quotation_id` and `award_allocations.quotation_line_id` use `ON DELETE RESTRICT` by design, and server handlers reject quotation deletion (`409 Conflict`) whenever a quotation is referenced by an `approved`, `pending`, or `rejected` award so historical award snapshots remain intact.
+   - `award_allocations` supports multi-supplier item splits sharing a single `rfq_item_id` when `awards.is_split_award = true`, storing explicit caller `awarded_qty` shares summing to `rfq_items.quantity` within `1e-6` scaled tolerance.
    - Header/line mutations and verification are blocked (`409 Conflict`) when a quotation is referenced by a `pending` or `approved` award.
-   - `submitAward` preserves historical `rejected` award rows instead of deleting them and rejects duplicate `pending`/`approved` awards (`409`). `submitAward`, `decideAward`, and `withdrawAward` hold transaction row locks (`FOR UPDATE`).
+   - **Deadlock-Free Hierarchical Locking (`server/pgStore.ts`):** `updateQuotationHeader`, `updateQuotationLine`, `verifyQuotation`, `deleteQuotation`, `submitAward`, `withdrawAward`, and `decideAward` acquire `FOR UPDATE` row locks strictly in parent-to-child order: parent `rfqs` row (`FOR UPDATE`) -> referenced `quotations` rows (ordered deterministically `ORDER BY id ASC`, `FOR UPDATE`) -> `awards` rows (`FOR UPDATE`), eliminating TOCTOU races and circular lock deadlocks. `submitAward` preserves historical `rejected` award rows instead of deleting them and rejects duplicate `pending`/`approved` awards (`409`).
    - `createRfq` acquires a `FOR UPDATE` row lock on the parent `organizations` row and scans existing yearly `RFQ-YYYY-XXXX` numbers without any `< 9000` upper cutoff.
 5. **Cross-Tenant & Supplier Protection:** Every query filters by `organization_id = req.auth.activeOrganization.id`; duplicate supplier name/Tax ID returns `409 Conflict`.
 

@@ -9,6 +9,7 @@ import {
   extractQuotationWithGemini,
   parseAndValidateAiJson,
   parseSpreadsheetBuffer,
+  parseSpreadsheetBufferIsolated,
 } from '../server/geminiExtractor.ts';
 import { createInitialWorkspaceState } from '../server/seedData.ts';
 
@@ -290,3 +291,135 @@ test(
     assert.ok(extracted.lines.length >= 1);
   }
 );
+
+function buildSyntheticZip(entries: Array<{ name: string; compressedSize: number; uncompressedSize: number; content?: Buffer }>): Buffer {
+  const localChunks: Buffer[] = [];
+  const centralChunks: Buffer[] = [];
+  let offset = 0;
+
+  for (const e of entries) {
+    const nameBuf = Buffer.from(e.name, 'utf8');
+    const dataBuf = e.content ?? Buffer.alloc(0);
+    const localHeader = Buffer.alloc(30 + nameBuf.length + dataBuf.length);
+    localHeader.writeUInt32LE(0x04034b50, 0);
+    localHeader.writeUInt16LE(20, 4);
+    localHeader.writeUInt32LE(e.compressedSize, 18);
+    localHeader.writeUInt32LE(e.uncompressedSize, 22);
+    localHeader.writeUInt16LE(nameBuf.length, 26);
+    nameBuf.copy(localHeader, 30);
+    dataBuf.copy(localHeader, 30 + nameBuf.length);
+    localChunks.push(localHeader);
+
+    const central = Buffer.alloc(46 + nameBuf.length);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt32LE(e.compressedSize, 20);
+    central.writeUInt32LE(e.uncompressedSize, 24);
+    central.writeUInt16LE(nameBuf.length, 28);
+    central.writeUInt32LE(offset, 42);
+    nameBuf.copy(central, 46);
+    centralChunks.push(central);
+
+    offset += localHeader.length;
+  }
+
+  const centralBuf = Buffer.concat(centralChunks);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(entries.length, 8);
+  eocd.writeUInt16LE(entries.length, 10);
+  eocd.writeUInt32LE(centralBuf.length, 12);
+  eocd.writeUInt32LE(offset, 16);
+
+  return Buffer.concat([...localChunks, centralBuf, eocd]);
+}
+
+test('Task 009: parses RFC-4180 CSV natively without evaluating formulas or invoking xlsx binary parser', async () => {
+  const csv = Buffer.from(
+    'Item,Qty,Rate,Note\r\n"Manifold, SS316",60,2400,"=CMD|""calc""!A0"\r\n"=1+1",10,50,"Quoted ""Pack"""\r\n',
+    'utf8'
+  );
+  const parsed = await parseSpreadsheetBufferIsolated(csv, {
+    documentName: 'vendor.csv',
+    mimeType: 'text/csv',
+  });
+  assert.equal(parsed.sheetPreview[0].sheetName, 'CSV_Quote');
+  assert.equal(parsed.sheetPreview[0].rows[1][0], 'Manifold, SS316');
+  assert.equal(parsed.sheetPreview[0].rows[1][3], '=CMD|"calc"!A0');
+  assert.equal(parsed.sheetPreview[0].rows[2][0], '=1+1');
+  assert.equal(parsed.sheetPreview[0].rows[2][3], 'Quoted "Pack"');
+});
+
+test('Task 009: enforces worksheet, row, column limits, ZIP bomb compression ratio, macro rejection, and subprocess isolation', async () => {
+  // 1. Excessive worksheets (> 12) -> 422
+  const manySheetsWb = XLSX.utils.book_new();
+  for (let i = 0; i < 13; i += 1) {
+    XLSX.utils.book_append_sheet(manySheetsWb, XLSX.utils.aoa_to_sheet([['A', i]]), `S${i + 1}`);
+  }
+  const manySheetsBuf = XLSX.write(manySheetsWb, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
+  assert.throws(
+    () => parseSpreadsheetBuffer(manySheetsBuf),
+    (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 422
+  );
+
+  // 2. Excessive rows (> 250) -> 422
+  const tooManyRowsData = Array.from({ length: 260 }, (_, idx) => [`Row ${idx + 1}`, idx + 1]);
+  const tooManyRowsWb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(tooManyRowsWb, XLSX.utils.aoa_to_sheet(tooManyRowsData), 'Sheet1');
+  const tooManyRowsBuf = XLSX.write(tooManyRowsWb, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
+  assert.throws(
+    () => parseSpreadsheetBuffer(tooManyRowsBuf),
+    (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 422
+  );
+
+  // 3. Excessive columns (> 30) -> 422
+  const wideRow = Array.from({ length: 32 }, (_, idx) => `C${idx}`);
+  const wideWb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wideWb, XLSX.utils.aoa_to_sheet([wideRow]), 'Sheet1');
+  const wideBuf = XLSX.write(wideWb, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
+  assert.throws(
+    () => parseSpreadsheetBuffer(wideBuf),
+    (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 422
+  );
+
+  // 4. ZIP bomb (100x+ ratio declaring 20 MB uncompressed in 512 bytes) -> 422 pre-parse rejection
+  const zipBombBuf = buildSyntheticZip([
+    { name: 'xl/worksheets/sheet1.xml', compressedSize: 512, uncompressedSize: 20 * 1024 * 1024 },
+  ]);
+  assert.throws(
+    () => parseSpreadsheetBuffer(zipBombBuf, { documentName: 'bomb.xlsx' }),
+    (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 422
+  );
+
+  // 5. Embedded VBA macro binary inside OOXML -> 415 rejection
+  const macroZipBuf = buildSyntheticZip([
+    { name: 'xl/vbaProject.bin', compressedSize: 128, uncompressedSize: 256 },
+  ]);
+  assert.throws(
+    () => parseSpreadsheetBuffer(macroZipBuf, { documentName: 'macro.xlsx' }),
+    (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 415
+  );
+
+  // 6. Isolated worker parses valid XLSX cleanly without inheriting parent prototype mutation or secrets
+  const validWb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(
+    validWb,
+    XLSX.utils.aoa_to_sheet([
+      ['Description', 'Qty', 'Rate'],
+      ['Hydraulic Valve', 10, 450],
+    ]),
+    'Quote'
+  );
+  const validBuf = XLSX.write(validWb, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
+  const isoRes = await parseSpreadsheetBufferIsolated(validBuf, { documentName: 'ok.xlsx' });
+  assert.equal(isoRes.sheetPreview[0].sheetName, 'Quote');
+  assert.ok(isoRes.structuredText.includes('B2: 10'));
+
+  // 7. Isolated worker rejects malformed/excessive sheets cleanly
+  await assert.rejects(
+    () => parseSpreadsheetBufferIsolated(zipBombBuf, { documentName: 'bomb.xlsx' }),
+    (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 422
+  );
+  assert.equal(({} as Record<string, unknown>).pollutedTest, undefined);
+});

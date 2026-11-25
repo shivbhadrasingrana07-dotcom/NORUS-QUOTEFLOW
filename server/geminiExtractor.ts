@@ -1,5 +1,7 @@
+import { spawn } from 'node:child_process';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { GoogleGenAI, Type } from '@google/genai';
-import * as XLSX from 'xlsx';
 import {
   OrganizationSettings,
   Quotation,
@@ -8,6 +10,16 @@ import {
   SourceTrace,
 } from '../src/types.ts';
 import { recomputeQuotation } from './normalization.ts';
+import {
+  colIndexToLetter,
+  MAX_SPREADSHEET_BYTES,
+  parseSpreadsheetHardened,
+  SPREADSHEET_WORKER_MAX_OLD_SPACE_MB,
+  SPREADSHEET_WORKER_TIMEOUT_MS,
+  SpreadsheetSecurityError,
+} from './spreadsheetWorker.mjs';
+
+export { colIndexToLetter };
 
 export const GEMINI_EXTRACTION_MODEL = 'gemini-4-hydrogen';
 
@@ -64,73 +76,174 @@ function getGeminiClient(): GoogleGenAI {
   });
 }
 
-export function colIndexToLetter(index: number): string {
-  let letter = '';
-  let n = index;
-  while (n >= 0) {
-    letter = String.fromCharCode((n % 26) + 65) + letter;
-    n = Math.floor(n / 26) - 1;
-  }
-  return letter;
-}
-
-export function parseSpreadsheetBuffer(buffer: Buffer): {
+export interface ParsedSpreadsheetResult {
   structuredText: string;
   sheetPreview: { sheetName: string; rows: string[][] }[];
-} {
-  let workbook: XLSX.WorkBook;
+}
+
+export function parseSpreadsheetBuffer(
+  buffer: Buffer,
+  options?: { documentName?: string; mimeType?: string }
+): ParsedSpreadsheetResult {
   try {
-    workbook = XLSX.read(buffer, { type: 'buffer' });
+    return parseSpreadsheetHardened(buffer, options);
   } catch (err) {
+    if (err instanceof SpreadsheetSecurityError) {
+      throw new ExtractionServiceError(err.message, err.statusCode);
+    }
     throw new ExtractionServiceError(
       `Unable to parse spreadsheet file: ${err instanceof Error ? err.message : 'Invalid format'}`,
       422
     );
   }
+}
 
-  const sheetPreview: { sheetName: string; rows: string[][] }[] = [];
-  const textBlocks: string[] = [];
+const WORKER_SCRIPT_PATH = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  'spreadsheetWorker.mjs'
+);
 
-  for (const sheetName of workbook.SheetNames.slice(0, 4)) {
-    const sheet = workbook.Sheets[sheetName];
-    if (!sheet) continue;
-    const rows = XLSX.utils.sheet_to_json<(string | number | boolean | null)[]>(sheet, {
-      header: 1,
-      defval: '',
-    });
-
-    const normalizedRows = rows
-      .slice(0, 120)
-      .map((row) =>
-        (Array.isArray(row) ? row : [])
-          .slice(0, 30)
-          .map((cell) => (cell === null || cell === undefined ? '' : String(cell).trim()))
-      );
-
-    const nonEmptyRows = normalizedRows.filter((r) => r.some((c) => c !== ''));
-    if (nonEmptyRows.length === 0) continue;
-
-    sheetPreview.push({
-      sheetName,
-      rows: nonEmptyRows.slice(0, 60),
-    });
-
-    const cellLines: string[] = [`=== SHEET: ${sheetName} ===`];
-    nonEmptyRows.forEach((row, rIdx) => {
-      const cells = row
-        .map((val, cIdx) => (val ? `${colIndexToLetter(cIdx)}${rIdx + 1}: ${val}` : null))
-        .filter(Boolean);
-      if (cells.length > 0) {
-        cellLines.push(`Row ${rIdx + 1} | ${cells.join(' | ')}`);
-      }
-    });
-    textBlocks.push(cellLines.join('\n'));
+export async function parseSpreadsheetBufferIsolated(
+  buffer: Buffer,
+  options?: { documentName?: string; mimeType?: string; timeoutMs?: number }
+): Promise<ParsedSpreadsheetResult> {
+  if (!Buffer.isBuffer(buffer) || buffer.byteLength === 0) {
+    throw new ExtractionServiceError('Uploaded spreadsheet file is empty.', 400);
+  }
+  if (buffer.byteLength > MAX_SPREADSHEET_BYTES) {
+    throw new ExtractionServiceError(
+      `Spreadsheet file exceeds maximum ${Math.round(MAX_SPREADSHEET_BYTES / (1024 * 1024))} MB limit.`,
+      413
+    );
   }
 
-  return {
-    structuredText: textBlocks.join('\n\n'),
-    sheetPreview,
-  };
+  const timeoutMs = options?.timeoutMs ?? SPREADSHEET_WORKER_TIMEOUT_MS;
+
+  return new Promise<ParsedSpreadsheetResult>((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      [`--max-old-space-size=${SPREADSHEET_WORKER_MAX_OLD_SPACE_MB}`, WORKER_SCRIPT_PATH],
+      {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        // Strip parent environment secrets so untrusted parser never sees GEMINI_API_KEY, SESSION_SECRET, SQL_PASSWORD, etc.
+        env: { NODE_OPTIONS: '' },
+      }
+    );
+
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let settled = false;
+    let totalStdoutBytes = 0;
+
+    const finishError = (err: ExtractionServiceError) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    };
+
+    const timer = setTimeout(() => {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // Ignore already-exited worker
+      }
+      finishError(
+        new ExtractionServiceError(
+          'Spreadsheet parsing timed out inside isolated worker.',
+          422
+        )
+      );
+    }, timeoutMs);
+
+    child.stdout.on('data', (chunk: Buffer) => {
+      totalStdoutBytes += chunk.byteLength;
+      if (totalStdoutBytes > 6 * 1024 * 1024) {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          // Ignore
+        }
+        finishError(
+          new ExtractionServiceError('Parsed spreadsheet output exceeded safety cap.', 422)
+        );
+        return;
+      }
+      stdoutChunks.push(chunk);
+    });
+
+    child.stderr.on('data', (chunk: Buffer) => {
+      if (stderrChunks.reduce((n, b) => n + b.byteLength, 0) < 16384) {
+        stderrChunks.push(chunk);
+      }
+    });
+
+    child.on('error', () => {
+      finishError(new ExtractionServiceError('Failed to launch isolated spreadsheet parser.', 500));
+    });
+
+    child.on('close', (code, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+
+      if (signal === 'SIGKILL' || signal === 'SIGTERM') {
+        reject(
+          new ExtractionServiceError(
+            'Spreadsheet parsing aborted after exceeding sandbox limits.',
+            422
+          )
+        );
+        return;
+      }
+
+      const rawOut = Buffer.concat(stdoutChunks).toString('utf8').trim();
+      if (!rawOut) {
+        reject(
+          new ExtractionServiceError(
+            code === 0
+              ? 'Spreadsheet parser returned empty output.'
+              : 'Spreadsheet parsing failed inside isolated sandbox.',
+            422
+          )
+        );
+        return;
+      }
+
+      try {
+        const parsed = JSON.parse(rawOut) as
+          | { ok: true; result: ParsedSpreadsheetResult }
+          | { ok: false; statusCode?: number; message?: string };
+        if (parsed.ok) {
+          resolve(parsed.result);
+        } else {
+          reject(
+            new ExtractionServiceError(
+              parsed.message || 'Unable to parse spreadsheet file.',
+              typeof parsed.statusCode === 'number' ? parsed.statusCode : 422
+            )
+          );
+        }
+      } catch {
+        reject(
+          new ExtractionServiceError(
+            'Isolated spreadsheet parser returned malformed output.',
+            422
+          )
+        );
+      }
+    });
+
+    const inputPayload = JSON.stringify({
+      base64: buffer.toString('base64'),
+      documentName: options?.documentName || '',
+      mimeType: options?.mimeType || '',
+    });
+    child.stdin.on('error', () => {
+      // Handled via close/error
+    });
+    child.stdin.end(inputPayload);
+  });
 }
 
 export interface GeminiExtractedLine {
@@ -546,7 +659,10 @@ export async function extractQuotationWithGemini(input: ExtractQuoteInput): Prom
   let spreadsheetText = '';
 
   if (isSpreadsheet && fileBuffer) {
-    const parsed = parseSpreadsheetBuffer(fileBuffer);
+    const parsed = await parseSpreadsheetBufferIsolated(fileBuffer, {
+      documentName,
+      mimeType,
+    });
     sheetPreview = parsed.sheetPreview;
     spreadsheetText = parsed.structuredText;
     if (!spreadsheetText.trim()) {

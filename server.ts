@@ -713,7 +713,7 @@ export async function createApp(options: AppOptions = {}) {
               skipInlineDataUrl: true,
               generateContentOverride,
             })
-          : extractDemoQuotationOffline({
+          : await extractDemoQuotationOffline({
               rfq,
               supplierId: supplierId.trim(),
               settings,

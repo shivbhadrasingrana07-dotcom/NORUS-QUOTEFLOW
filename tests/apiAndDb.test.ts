@@ -683,3 +683,224 @@ test(
     }
   }
 );
+
+test(
+  'Task 009 PG concurrency: serializes submitAward against quotation mutations, concurrent submitAward, and withdrawAward without TOCTOU corruption',
+  { skip: isSafeTestDbConfigured() ? false : TEST_DB_SKIP_REASON },
+  async () => {
+    const srv = await startIntegratedTestServer();
+    const tag = uniqueRunTag();
+
+    try {
+      const ownerClient = new TestCookieClient(srv.baseUrl);
+      const regRes = await ownerClient.request('/api/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: `conc-009-${tag}@example.com`,
+          password: 'StrongPassword#2026',
+          fullName: 'Task009 Concurrency Owner',
+          organizationName: `Task009 Conc Org ${tag}`,
+        }),
+      });
+      assert.equal(regRes.status, 201);
+      const regBody = (await regRes.json()) as {
+        user: { id: string };
+        activeOrganization: { id: string };
+      };
+      createdUserIds.push(regBody.user.id);
+      createdOrgIds.push(regBody.activeOrganization.id);
+
+      const sup = (await (
+        await ownerClient.request('/api/suppliers', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: 'Concurrent Valve Co',
+            taxId: `27CNC${tag.slice(0, 6).toUpperCase()}Z1`,
+          }),
+        })
+      ).json()) as { id: string };
+
+      const rfq = (await (
+        await ownerClient.request('/api/rfqs', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            title: 'Concurrency Stress Valve',
+            currency: 'INR',
+            items: [{ skuCode: 'CNC-1', description: 'Solenoid Valve', quantity: 10, uom: 'pcs' }],
+          }),
+        })
+      ).json()) as { id: string; items: Array<{ id: string }> };
+
+      const form = new FormData();
+      form.append('supplierId', sup.id);
+      form.append('rawEmailText', 'Solenoid Valve 10 pcs @ 500');
+      const quote = (await (
+        await ownerClient.request(`/api/rfqs/${rfq.id}/quotes/extract`, {
+          method: 'POST',
+          body: form,
+        })
+      ).json()) as { id: string; lines: Array<{ id: string }> };
+
+      assert.equal(
+        (await ownerClient.request(`/api/quotations/${quote.id}/verify`, { method: 'POST' })).status,
+        200
+      );
+
+      const allocs = [
+        { rfqItemId: rfq.items[0].id, quotationId: quote.id, quotationLineId: quote.lines[0].id },
+      ];
+
+      // 1. Race: submitAward vs updateQuotationHeader (repeated rounds)
+      for (let round = 0; round < 3; round += 1) {
+        const [awardRes, patchRes] = await Promise.all([
+          ownerClient.request(`/api/rfqs/${rfq.id}/award`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ isSplitAward: false, allocations: allocs }),
+          }),
+          ownerClient.request(`/api/quotations/${quote.id}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ freightCharges: 100 + round * 10 }),
+          }),
+        ]);
+
+        const validOutcomeA = awardRes.status === 201 && patchRes.status === 409;
+        const validOutcomeB = awardRes.status === 422 && patchRes.status === 200;
+        assert.equal(
+          validOutcomeA || validOutcomeB,
+          true,
+          `Unexpected header race outcome: award=${awardRes.status}, patch=${patchRes.status}`
+        );
+
+        const wsMid = (await (await ownerClient.request('/api/workspace')).json()) as WorkspaceState;
+        const qMid = wsMid.quotations.find((q) => q.id === quote.id)!;
+        const pendingMid = wsMid.awards.filter(
+          (a) => a.rfqId === rfq.id && a.approvalStatus === 'pending'
+        );
+
+        if (validOutcomeA) {
+          assert.equal(pendingMid.length, 1);
+          assert.equal(qMid.isVerified, true);
+          // Clean up pending award for next round
+          const wRes = await ownerClient.request(`/api/awards/${pendingMid[0].id}/withdraw`, {
+            method: 'POST',
+          });
+          assert.equal(wRes.status, 200);
+        } else {
+          assert.equal(pendingMid.length, 0);
+          assert.equal(qMid.isVerified, false);
+          assert.equal(
+            (await ownerClient.request(`/api/quotations/${quote.id}/verify`, { method: 'POST' }))
+              .status,
+            200
+          );
+        }
+      }
+
+      // 2. Race: submitAward vs updateQuotationLine
+      const [lineAwardRes, patchLineRes] = await Promise.all([
+        ownerClient.request(`/api/rfqs/${rfq.id}/award`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ isSplitAward: false, allocations: allocs }),
+        }),
+        ownerClient.request(`/api/quotations/${quote.id}/lines/${quote.lines[0].id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ quotedUnitRate: 510, lineTotalQuoted: 5100 }),
+        }),
+      ]);
+      const lineOutcomeA = lineAwardRes.status === 201 && patchLineRes.status === 409;
+      const lineOutcomeB = lineAwardRes.status === 422 && patchLineRes.status === 200;
+      assert.equal(
+        lineOutcomeA || lineOutcomeB,
+        true,
+        `Unexpected line race outcome: award=${lineAwardRes.status}, patch=${patchLineRes.status}`
+      );
+      if (lineOutcomeA) {
+        const aw = (await lineAwardRes.json()) as { id: string };
+        await ownerClient.request(`/api/awards/${aw.id}/withdraw`, { method: 'POST' });
+      } else {
+        await ownerClient.request(`/api/quotations/${quote.id}/verify`, { method: 'POST' });
+      }
+
+      // 3. Race: verifyQuotation vs submitAward after un-verifying via header edit
+      assert.equal(
+        (
+          await ownerClient.request(`/api/quotations/${quote.id}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ freightCharges: 222 }),
+          })
+        ).status,
+        200
+      );
+      const [verifyRes, submitAfterUnverifyRes] = await Promise.all([
+        ownerClient.request(`/api/quotations/${quote.id}/verify`, { method: 'POST' }),
+        ownerClient.request(`/api/rfqs/${rfq.id}/award`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ isSplitAward: false, allocations: allocs }),
+        }),
+      ]);
+      assert.equal(verifyRes.status, 200);
+      assert.equal(
+        submitAfterUnverifyRes.status === 201 || submitAfterUnverifyRes.status === 422,
+        true
+      );
+      if (submitAfterUnverifyRes.status === 201) {
+        const aw = (await submitAfterUnverifyRes.json()) as { id: string };
+        await ownerClient.request(`/api/awards/${aw.id}/withdraw`, { method: 'POST' });
+      }
+
+      // 4. Race: Two simultaneous submitAward calls -> strictly one 201 and one 409
+      const [s1, s2] = await Promise.all([
+        ownerClient.request(`/api/rfqs/${rfq.id}/award`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ isSplitAward: false, allocations: allocs }),
+        }),
+        ownerClient.request(`/api/rfqs/${rfq.id}/award`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ isSplitAward: false, allocations: allocs }),
+        }),
+      ]);
+      const statuses = [s1.status, s2.status].sort((a, b) => a - b);
+      assert.deepEqual(statuses, [201, 409]);
+
+      const winnerPayload = (s1.status === 201 ? await s1.json() : await s2.json()) as {
+        id: string;
+      };
+
+      // 5. Race: withdrawAward vs updateQuotationHeader
+      const [withdrawRaceRes, headerAfterWithdrawRes] = await Promise.all([
+        ownerClient.request(`/api/awards/${winnerPayload.id}/withdraw`, { method: 'POST' }),
+        ownerClient.request(`/api/quotations/${quote.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ freightCharges: 333 }),
+        }),
+      ]);
+      assert.equal(withdrawRaceRes.status, 200);
+      assert.equal(
+        headerAfterWithdrawRes.status === 200 || headerAfterWithdrawRes.status === 409,
+        true
+      );
+
+      const wsFinal = (await (await ownerClient.request('/api/workspace')).json()) as WorkspaceState;
+      const rfqFinal = wsFinal.rfqs.find((r) => r.id === rfq.id)!;
+      assert.equal(rfqFinal.status, 'in_review');
+      assert.equal(
+        wsFinal.awards.filter((a) => a.rfqId === rfq.id && a.approvalStatus === 'pending').length,
+        0
+      );
+    } finally {
+      await srv.close();
+    }
+  }
+);

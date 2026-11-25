@@ -25,7 +25,8 @@ NORUS QUOTEFLOW is a multi-tenant TypeScript full-stack SaaS web application ser
 |  - 5-Role RBAC & CSRF Guards (server/rbac.ts, server/security.ts)      |
 |  - PostgreSQL Atomic Rate Limiter (server/rateLimiter.ts)              |
 |  - File Magic-Byte Inspection (server/fileSecurity.ts)                 |
-|  - Gemini Extraction & XLSX Parser (server/geminiExtractor.ts)         |
+|  - Isolated Spreadsheet Worker (server/spreadsheetWorker.mjs, 128 MB)  |
+|  - Gemini Extraction (server/geminiExtractor.ts)                        |
 |  - Normalization & Arithmetic Audit (server/normalization.ts)          |
 |  - Transactional Store (server/pgStore.ts) & Maintenance Job           |
 +---------------------+-------------------------------+------------------+
@@ -53,8 +54,10 @@ NORUS QUOTEFLOW is a multi-tenant TypeScript full-stack SaaS web application ser
    - `S3CompatibleStorageProvider` enforces `AbortController` timeouts (`15s` object ops / `5s` readiness probe).
    - Unhandled `500` errors emit redacted `unhandled_server_error` events and trigger `ErrorTrackerHook` / `ERROR_WEBHOOK_URL` while returning `{ error: 'Internal server error.', requestId }` to clients.
    - `runScheduledMaintenance` uses a dedicated-connection PostgreSQL advisory lock (`pg_try_advisory_lock`) to prevent concurrent overlap, runs bounded batches (`500` rows/run), and deletes unreferenced `stored_documents` DB rows **only after** `storageProvider.deleteObject` succeeds (retaining DB rows on storage error for retry).
-4. **Award Revision & Historical Integrity (`src/components/RfqWorkspace.tsx`, `server/pgStore.ts`, `server/demoWorkspace.ts`):**
-   - Preserves historical `rejected` award rows (and their `award_allocations` quotation snapshots) when buyers revise or resubmit new recommendations, blocks duplicate `pending` or `approved` awards (`409`), provides explicit `withdrawAward` (`POST .../awards/:awardId/withdraw`) cancellation for `pending` recommendations, and locks referenced quotations against mutations/deletions.
+4. **Isolated Spreadsheet Ingestion (`server/spreadsheetWorker.mjs`, `server/geminiExtractor.ts`):**
+   - CSV/TSV uploads bypass `xlsx` completely via a native RFC-4180 parser; `.xlsx`/`.xls` files undergo ZIP container inspection (ZIP bomb, path traversal, and `vbaProject.bin` rejection) and bounded extraction inside an ephemeral child process (`--max-old-space-size=128`, `5s` timeout, secret-stripped `env`) invoked by both authenticated Gemini extraction and offline demo parsing.
+5. **Award Revision, Split-Item Precision & Lock Ordering (`src/lib/ranking.ts`, `src/lib/awardValidation.ts`, `server/pgStore.ts`, `server/demoWorkspace.ts`):**
+   - `getAllocationTolerance(targetQty)` enforces `1e-6` allocation precision (using Kahan summation via `sumExactQuantities`) and supports multi-supplier splits on a single RFQ item while preserving historical `rejected` award rows, providing explicit `withdrawAward`, and serializing award vs. quotation mutations in PostgreSQL using strict `rfqs -> quotations -> awards` `FOR UPDATE` hierarchy.
 
 ## Private Object Storage Strategy & Cost Comparison
 

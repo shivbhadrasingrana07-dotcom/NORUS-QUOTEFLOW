@@ -7,6 +7,7 @@ import { CostBasis, Quotation, QuotationLine, Rfq, RfqItem } from '../types.ts';
  * so tiny lines cannot pass with large percentage shortfalls.
  */
 export const QUANTITY_EPSILON = 1e-4;
+export const ALLOCATION_QTY_EPSILON = 1e-6;
 
 export function getQuantityTolerance(requiredQty: number): number {
   if (!Number.isFinite(requiredQty) || requiredQty <= 0) {
@@ -15,6 +16,28 @@ export function getQuantityTolerance(requiredQty: number): number {
   return requiredQty < 1
     ? Math.max(requiredQty * QUANTITY_EPSILON, Number.EPSILON * 16)
     : QUANTITY_EPSILON;
+}
+
+export function getAllocationTolerance(targetQty: number): number {
+  if (!Number.isFinite(targetQty) || targetQty <= 0) {
+    return ALLOCATION_QTY_EPSILON;
+  }
+  return Math.max(
+    Math.min(ALLOCATION_QTY_EPSILON, targetQty * ALLOCATION_QTY_EPSILON),
+    Number.EPSILON * 16
+  );
+}
+
+export function sumExactQuantities(values: number[]): number {
+  let sum = 0;
+  let compensation = 0;
+  for (const v of values) {
+    const y = v - compensation;
+    const t = sum + y;
+    compensation = t - sum - y;
+    sum = t;
+  }
+  return sum;
 }
 
 export interface RankedQuotation {
@@ -36,7 +59,8 @@ export function getConvertedQuotedQuantity(line: QuotationLine): number | null {
   ) {
     return null;
   }
-  return Math.round(line.quotedQty * line.uomConversionFactor * 1_000_000) / 1_000_000;
+  const raw = line.quotedQty * line.uomConversionFactor;
+  return raw >= 1e-6 ? Math.round(raw * 1_000_000_000) / 1_000_000_000 : raw;
 }
 
 export function isLineQuantitySufficient(

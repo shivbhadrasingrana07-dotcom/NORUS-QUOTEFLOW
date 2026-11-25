@@ -2770,19 +2770,29 @@ export class PgDataStore {
     organizationId: string,
     quoteId: string
   ): Promise<{ quote: Quotation; rfq: Rfq }> {
+    const [qLookup] = await tx
+      .select({ id: quotations.id, rfqId: quotations.rfqId })
+      .from(quotations)
+      .where(and(eq(quotations.id, quoteId), eq(quotations.organizationId, organizationId)))
+      .limit(1);
+    if (!qLookup) throw new StoreError(404, 'Quotation not found.');
+
+    // Lock parent rfqs row FIRST so quotation edits/verifications serialize with submitAward/withdrawAward/decideAward
+    const [rfqRow] = await tx
+      .select()
+      .from(rfqs)
+      .where(and(eq(rfqs.id, qLookup.rfqId), eq(rfqs.organizationId, organizationId)))
+      .for('update')
+      .limit(1);
+    if (!rfqRow) throw new StoreError(404, 'Parent RFQ not found.');
+
     const [qRow] = await tx
       .select()
       .from(quotations)
       .where(and(eq(quotations.id, quoteId), eq(quotations.organizationId, organizationId)))
+      .for('update')
       .limit(1);
     if (!qRow) throw new StoreError(404, 'Quotation not found.');
-
-    const [rfqRow] = await tx
-      .select()
-      .from(rfqs)
-      .where(and(eq(rfqs.id, qRow.rfqId), eq(rfqs.organizationId, organizationId)))
-      .limit(1);
-    if (!rfqRow) throw new StoreError(404, 'Parent RFQ not found.');
 
     const rItems = await tx
       .select()
@@ -3312,12 +3322,34 @@ export class PgDataStore {
   }): Promise<{ deletedDocument?: { id: string; storageKey: string } }> {
     try {
       return await this.db.transaction(async (tx) => {
+        const [targetLookup] = await tx
+          .select({ id: quotations.id, rfqId: quotations.rfqId })
+          .from(quotations)
+          .where(
+            and(eq(quotations.id, params.quoteId), eq(quotations.organizationId, params.organizationId))
+          )
+          .limit(1);
+
+        if (!targetLookup) throw new StoreError(404, 'Quotation not found.');
+
+        // Lock parent rfqs row FIRST, then quotations row, matching submitAward lock hierarchy
+        const [rfqRow] = await tx
+          .select({ id: rfqs.id })
+          .from(rfqs)
+          .where(
+            and(eq(rfqs.id, targetLookup.rfqId), eq(rfqs.organizationId, params.organizationId))
+          )
+          .for('update')
+          .limit(1);
+        if (!rfqRow) throw new StoreError(404, 'Parent RFQ not found.');
+
         const [target] = await tx
           .select()
           .from(quotations)
           .where(
             and(eq(quotations.id, params.quoteId), eq(quotations.organizationId, params.organizationId))
           )
+          .for('update')
           .limit(1);
 
         if (!target) throw new StoreError(404, 'Quotation not found.');
@@ -3461,7 +3493,9 @@ export class PgDataStore {
           .from(quotations)
           .where(
             and(eq(quotations.rfqId, rfqRow.id), eq(quotations.organizationId, params.organizationId))
-          );
+          )
+          .orderBy(asc(quotations.id))
+          .for('update');
 
         const qLineRows =
           qRows.length > 0
@@ -3669,11 +3703,36 @@ export class PgDataStore {
   }): Promise<{ withdrawnAwardId: string; rfq: Rfq }> {
     try {
       return await this.db.transaction(async (tx) => {
+        const [awardLookup] = await tx
+          .select({ id: awards.id, rfqId: awards.rfqId })
+          .from(awards)
+          .where(
+            and(eq(awards.id, params.awardId), eq(awards.organizationId, params.organizationId))
+          )
+          .limit(1);
+
+        if (!awardLookup) throw new StoreError(404, 'Award recommendation not found.');
+
+        // Acquire rfqs FOR UPDATE BEFORE awards FOR UPDATE (matches submitAward lock order)
+        const [rfqRow] = await tx
+          .select()
+          .from(rfqs)
+          .where(
+            and(eq(rfqs.id, awardLookup.rfqId), eq(rfqs.organizationId, params.organizationId))
+          )
+          .for('update')
+          .limit(1);
+        if (!rfqRow) throw new StoreError(404, 'Parent RFQ not found.');
+
         const [awardRow] = await tx
           .select()
           .from(awards)
           .where(
-            and(eq(awards.id, params.awardId), eq(awards.organizationId, params.organizationId))
+            and(
+              eq(awards.id, params.awardId),
+              eq(awards.organizationId, params.organizationId),
+              eq(awards.rfqId, rfqRow.id)
+            )
           )
           .for('update')
           .limit(1);
@@ -3685,16 +3744,6 @@ export class PgDataStore {
             'Only pending award recommendations can be withdrawn; finalized decisions are preserved for audit.'
           );
         }
-
-        const [rfqRow] = await tx
-          .select()
-          .from(rfqs)
-          .where(
-            and(eq(rfqs.id, awardRow.rfqId), eq(rfqs.organizationId, params.organizationId))
-          )
-          .for('update')
-          .limit(1);
-        if (!rfqRow) throw new StoreError(404, 'Parent RFQ not found.');
 
         const rItems = await tx
           .select()
@@ -3782,11 +3831,36 @@ export class PgDataStore {
       }
 
       return await this.db.transaction(async (tx) => {
+        const [awardLookup] = await tx
+          .select({ id: awards.id, rfqId: awards.rfqId })
+          .from(awards)
+          .where(
+            and(eq(awards.id, params.awardId), eq(awards.organizationId, params.organizationId))
+          )
+          .limit(1);
+
+        if (!awardLookup) throw new StoreError(404, 'Award decision not found.');
+
+        // Acquire rfqs FOR UPDATE BEFORE awards FOR UPDATE (matches submitAward lock order)
+        const [rfqRow] = await tx
+          .select()
+          .from(rfqs)
+          .where(
+            and(eq(rfqs.id, awardLookup.rfqId), eq(rfqs.organizationId, params.organizationId))
+          )
+          .for('update')
+          .limit(1);
+        if (!rfqRow) throw new StoreError(404, 'Parent RFQ not found.');
+
         const [awardRow] = await tx
           .select()
           .from(awards)
           .where(
-            and(eq(awards.id, params.awardId), eq(awards.organizationId, params.organizationId))
+            and(
+              eq(awards.id, params.awardId),
+              eq(awards.organizationId, params.organizationId),
+              eq(awards.rfqId, rfqRow.id)
+            )
           )
           .for('update')
           .limit(1);
@@ -3795,16 +3869,6 @@ export class PgDataStore {
         if (awardRow.approvalStatus !== 'pending') {
           throw new StoreError(409, 'This award decision has already been finalized.');
         }
-
-        const [rfqRow] = await tx
-          .select()
-          .from(rfqs)
-          .where(
-            and(eq(rfqs.id, awardRow.rfqId), eq(rfqs.organizationId, params.organizationId))
-          )
-          .for('update')
-          .limit(1);
-        if (!rfqRow) throw new StoreError(404, 'Parent RFQ not found.');
 
         const rItems = await tx
           .select()

@@ -51,22 +51,76 @@ jobs:
           node-version: '22'
           cache: 'npm'
 
-      - name: Install dependencies
-        # package.json pins esbuild@^0.25.0 while vite@8.3.x declares optional peer esbuild@^0.27.0||^0.28.0
-        run: npm ci --legacy-peer-deps
+      - name: Install dependencies (strict lockfile validation)
+        run: npm ci
 
-      - name: Apply PostgreSQL schema and tenant integrity migrations
+      - name: Apply, rollback, and re-apply PostgreSQL migrations
         env:
           PGPASSWORD: ci_test_password
         run: |
           psql -h 127.0.0.1 -U postgres -d quoteflow_test -v ON_ERROR_STOP=1 -f drizzle/0000_illegal_major_mapleleaf.sql
+          psql -h 127.0.0.1 -U postgres -d quoteflow_test -v ON_ERROR_STOP=1 -f drizzle/0001_tenant_integrity_preflight.sql
+          psql -h 127.0.0.1 -U postgres -d quoteflow_test -v ON_ERROR_STOP=1 -f drizzle/0001_tenant_integrity.sql
+          psql -h 127.0.0.1 -U postgres -d quoteflow_test -v ON_ERROR_STOP=1 -f drizzle/0001_tenant_integrity_rollback.sql
           psql -h 127.0.0.1 -U postgres -d quoteflow_test -v ON_ERROR_STOP=1 -f drizzle/0001_tenant_integrity.sql
 
       - name: TypeScript check
         run: npm run lint
 
-      - name: Run unit, demo, and PostgreSQL integration tests
+      - name: Run unit, demo, and PostgreSQL integration/concurrency tests
         run: npm test
 
       - name: Production frontend build
         run: npm run build
+
+  browser-e2e:
+    runs-on: ubuntu-latest
+    needs: verify
+
+    env:
+      NODE_ENV: development
+      DEMO_MODE: 'true'
+      PORT: '3000'
+      SESSION_SECRET: ci-e2e-demo-session-secret-0123456789abcdef0123456789abcdef
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright Chromium for headless browser E2E
+        run: |
+          npm install --no-save playwright
+          npx playwright install --with-deps chromium
+
+      - name: Run isolated DEMO_MODE browser E2E workflow
+        run: |
+          npx tsx server.ts > /tmp/norus-e2e-server.log 2>&1 &
+          SERVER_PID=$!
+          cleanup() {
+            kill "$SERVER_PID" 2>/dev/null || true
+            wait "$SERVER_PID" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          for i in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:3000/api/health > /dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          curl -fsS http://127.0.0.1:3000/api/auth/me | grep -q '"demoMode":true'
+          node tests/browserE2E.mjs
+
+      - name: Upload E2E server logs on failure
+        if: failure()
+        run: cat /tmp/norus-e2e-server.log || true

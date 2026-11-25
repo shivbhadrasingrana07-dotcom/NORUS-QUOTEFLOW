@@ -1,5 +1,21 @@
 # Changelog
 
+## Task 009 — Dependency Security, Decimal Precision, Concurrency Hardening & CI Readiness
+
+### Fixed & Hardened
+- **Isolated Spreadsheet Ingestion (`server/spreadsheetWorker.mjs`, `server/geminiExtractor.ts`, `server/demoWorkspace.ts`, `server.ts`, `tests/extractionValidation.test.ts`, `tests/demoWorkspace.test.ts`):**
+  - Replaced `xlsx` CSV/TSV parsing with a native RFC-4180 `parseDelimitedTextToRows` parser with formula evaluation disabled.
+  - Added pre-parse OOXML ZIP container inspection (`inspectXlsxZipContainer`) rejecting path traversal, ZIP64, ZIP bombs (`>120` entries, `>32 MB` uncompressed, `>100x` ratio -> `422`), and macro streams (`xl/vbaProject.bin` -> `415`).
+  - Executed `parseSpreadsheetBufferIsolated` in an ephemeral Node subprocess (`--max-old-space-size=128`, `5000ms` SIGKILL timeout, stripped `env` omitting `SESSION_SECRET`/`GEMINI_API_KEY`/DB credentials) enforcing `MAX_SPREADSHEET_BYTES = 10 MB`, `12` sheets, `250` rows/sheet, `30` cols, `5,000` cells/sheet, and `15,000` total cells (`cellFormula: false`, `cellHTML: false`, `bookVBA: false`). Propagated HTTP status errors cleanly through offline demo extraction.
+- **Award Allocation Precision & Multi-Supplier Splits (`src/lib/ranking.ts`, `src/lib/awardValidation.ts`, `src/components/RfqWorkspace.tsx`, `tests/stabilizationUnit.test.ts`, `tests/demoWorkspace.test.ts`):**
+  - Tightened allocation tolerance via `getAllocationTolerance(targetQty)` (`ALLOCATION_QTY_EPSILON = 1e-6`), added Kahan `sumExactQuantities`, and normalized converted quantities (`1e-9` noise rounding preserving sub-`1e-6` micro-quantities without zero truncation).
+  - Supported multi-supplier split allocations across a single RFQ line item (`isSplitAward: true`) requiring explicit positive `awardedQty` shares while rejecting duplicate `(rfqItemId, quotationId)`/`(rfqItemId, quotationLineId)` entries, single-vendor duplicate item allocations, and >`1e-6` drifts (`400`). Updated `RfqWorkspace.tsx` draft coverage and table row keys for split items.
+- **PostgreSQL Hierarchical Transaction Locking (`server/pgStore.ts`, `tests/apiAndDb.test.ts`):**
+  - Enforced strict parent-to-child lock acquisition order (`rfqs FOR UPDATE` -> `quotations FOR UPDATE` ordered deterministically by `id` -> `awards FOR UPDATE`) across `submitAward`, `withdrawAward`, `decideAward`, `updateQuotationHeader`, `updateQuotationLine`, `verifyQuotation`, and `deleteQuotation`, eliminating TOCTOU races and circular deadlocks. Added concurrent PostgreSQL `submitAward` vs. mutation/withdraw test (awaiting CI PG runner).
+- **npm `ci` & CI Readiness (`package.json`, `package-lock.json`, `.github/workflows/ci.yml`, `tests/browserE2E.mjs`):**
+  - Upgraded `esbuild` devDependency to `^0.28.2` and regenerated `package-lock.json` so `npm ci` passes cleanly without `--legacy-peer-deps`.
+  - Updated `.github/workflows/ci.yml` to run strict `npm ci`, full `0000` -> `0001_tenant_integrity_preflight.sql` -> `0001_tenant_integrity.sql` -> `0001_tenant_integrity_rollback.sql` -> re-apply `0001_tenant_integrity.sql` migration lifecycle, and an isolated `browser-e2e` job running headless Chromium `tests/browserE2E.mjs` against `DEMO_MODE=true`.
+
 ## Task 008 — Independent Verification, Procurement Precision & Stabilization
 
 ### Fixed & Hardened

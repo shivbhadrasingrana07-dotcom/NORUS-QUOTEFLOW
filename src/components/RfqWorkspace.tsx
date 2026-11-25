@@ -288,8 +288,9 @@ export function RfqWorkspace({
         .filter((x): x is { lineId: string; description: string; supplierName: string } => Boolean(x))
     : [];
   const draftHasUnverifiedQuote = selectedQuotesInDraft.some((q) => !q.isVerified);
+  const coveredDraftItemIds = new Set(effectiveDraft?.allocations.map((a) => a.rfqItemId) ?? []);
   const draftIncompleteBom = Boolean(
-    effectiveDraft && effectiveDraft.allocations.length !== rfq.items.length
+    effectiveDraft && rfq.items.some((it) => !coveredDraftItemIds.has(it.id))
   );
   const draftRequiresJustification = Boolean(
     effectiveDraft &&
@@ -910,7 +911,7 @@ export function RfqWorkspace({
                       {activeAward.allocations.map((al) => {
                         const item = rfq.items.find((i) => i.id === al.rfqItemId);
                         return (
-                          <tr key={al.rfqItemId}>
+                          <tr key={`${al.rfqItemId}:${al.quotationId}:${al.quotationLineId}`}>
                             <td className="py-2 px-3 font-medium text-[#0F172A]">
                               {item?.description || al.rfqItemId}
                             </td>

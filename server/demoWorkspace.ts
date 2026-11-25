@@ -20,7 +20,8 @@ import type {
 } from '../src/types.ts';
 import {
   buildQuotationFromExtraction,
-  parseSpreadsheetBuffer,
+  ExtractionServiceError,
+  parseSpreadsheetBufferIsolated,
 } from './geminiExtractor.ts';
 import { recomputeQuotation } from './normalization.ts';
 import { AwardValidationError, validateAwardSubmission } from '../src/lib/awardValidation.ts';
@@ -1404,7 +1405,7 @@ function normalizeNameKey(v: string): string {
     .trim();
 }
 
-export function extractDemoQuotationOffline(params: {
+export async function extractDemoQuotationOffline(params: {
   rfq: Rfq;
   supplierId: string;
   settings: OrganizationSettings;
@@ -1412,7 +1413,7 @@ export function extractDemoQuotationOffline(params: {
   mimeType: string;
   fileBuffer?: Buffer;
   rawEmailText?: string;
-}): Quotation {
+}): Promise<Quotation> {
   const { rfq, supplierId, settings, documentName, mimeType, fileBuffer, rawEmailText } = params;
   const isSpreadsheet =
     mimeType.includes('spreadsheet') ||
@@ -1430,10 +1431,16 @@ export function extractDemoQuotationOffline(params: {
   let sheetPreview: { sheetName: string; rows: string[][] }[] | undefined;
   if (isSpreadsheet && fileBuffer) {
     try {
-      const parsedSheet = parseSpreadsheetBuffer(fileBuffer);
+      const parsedSheet = await parseSpreadsheetBufferIsolated(fileBuffer, {
+        documentName,
+        mimeType,
+      });
       sheetPreview = parsedSheet.sheetPreview;
-    } catch {
-      // Fall back gracefully in offline demo mode
+    } catch (err) {
+      if (err instanceof ExtractionServiceError) {
+        throw err;
+      }
+      throw new ExtractionServiceError('Unable to parse uploaded demo spreadsheet.', 422);
     }
   }
 
