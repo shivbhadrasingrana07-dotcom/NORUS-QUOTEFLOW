@@ -1,10 +1,21 @@
 import { CostBasis, Quotation, QuotationLine, Rfq, RfqItem } from '../types.ts';
 
 /**
- * Tolerance in RFQ base-UOM units for floating-point UOM conversion rounding
- * (e.g. fractional pack/weight conversions such as 3 * 0.333333 kg).
+ * Base tolerance in RFQ base-UOM units for floating-point UOM conversion rounding
+ * (e.g. fractional pack/weight conversions such as 3 * 0.333333 kg = 0.999999 kg).
+ * For micro-quantities (< 1 unit), tolerance scales proportionally with requiredQty
+ * so tiny lines cannot pass with large percentage shortfalls.
  */
 export const QUANTITY_EPSILON = 1e-4;
+
+export function getQuantityTolerance(requiredQty: number): number {
+  if (!Number.isFinite(requiredQty) || requiredQty <= 0) {
+    return QUANTITY_EPSILON;
+  }
+  return requiredQty < 1
+    ? Math.max(requiredQty * QUANTITY_EPSILON, Number.EPSILON * 16)
+    : QUANTITY_EPSILON;
+}
 
 export interface RankedQuotation {
   quotation: Quotation;
@@ -38,7 +49,7 @@ export function isLineQuantitySufficient(
     return { ok: false, convertedQty, requiredQty };
   }
   return {
-    ok: convertedQty + QUANTITY_EPSILON >= requiredQty,
+    ok: convertedQty + getQuantityTolerance(requiredQty) >= requiredQty,
     convertedQty,
     requiredQty,
   };

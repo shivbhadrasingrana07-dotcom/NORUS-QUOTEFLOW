@@ -39,7 +39,7 @@
 
 ## Operational Requirements for Public Internet Deployment
 
-1. **Secrets Required in Production (`NODE_ENV=production`):** Set a cryptographically random `SESSION_SECRET` (>= 32 characters), `GEMINI_API_KEY`, and `ALLOWED_ORIGINS` / `APP_URL`.
+1. **Secrets & Canonical URL Required in Production (`NODE_ENV=production`):** Set a cryptographically random `SESSION_SECRET` (>= 32 characters), `GEMINI_API_KEY`, `APP_URL` (ensuring verification/reset/invitation email links never fall back to `req.headers.host`), `ALLOWED_ORIGINS`, and switch `CSP_MODE=enforce` after verifying staging `Content-Security-Policy-Report-Only` logs.
 2. **Firebase Authorized Domains:** Add every production/staging hostname (Cloud Run `*.run.app` and custom domains) under Firebase Auth → Settings → Authorized Domains so Google Sign-In popups succeed in end-user browsers.
 3. **Multi-Replica Object Storage:** Configure `STORAGE_PROVIDER=s3` (`S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`) rather than local container filesystem storage if running multiple backend instances.
 4. **Outbound Transactional Email:** Configure `RESEND_API_KEY` and a domain-verified `EMAIL_FROM` (`SPF`/`DKIM`) so verification, password reset, and organization invitation links deliver externally instead of queuing in `DevOutboxEmailProvider`.

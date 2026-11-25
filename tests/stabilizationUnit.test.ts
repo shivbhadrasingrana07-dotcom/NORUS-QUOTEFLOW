@@ -1013,4 +1013,109 @@ describe('Task 007 Stabilization Unit Suite', () => {
     assert.equal(rfqAwards.some((a) => a.id === rejected.id && a.approvalStatus === 'rejected'), true);
     assert.equal(rfqAwards.some((a) => a.id === approved.id && a.approvalStatus === 'approved'), true);
   });
+
+  it('Task 008: scales quantity tolerance for micro-quantities while preserving 1e-4 UOM conversion precision at standard and large scales', () => {
+    const { rfq, q1, q2 } = makeSampleRfqAndQuotes();
+    const baseItem = rfq.items[0];
+    const baseLine = q1.lines[0];
+
+    // Standard >= 1 quantities retain 1e-4 absolute epsilon for UOM rounding (e.g. 3 * 0.3333 = 0.9999)
+    assert.equal(
+      isLineQuantitySufficient({ ...baseLine, quotedQty: 3.3333, uomConversionFactor: 3 }, { ...baseItem, quantity: 10 }).ok,
+      true
+    );
+    assert.equal(
+      isLineQuantitySufficient({ ...baseLine, quotedQty: 0.3333, uomConversionFactor: 3 }, { ...baseItem, quantity: 1 }).ok,
+      true
+    );
+    assert.equal(
+      isLineQuantitySufficient({ ...baseLine, quotedQty: 0.999, uomConversionFactor: 1 }, { ...baseItem, quantity: 1 }).ok,
+      false
+    );
+
+    // Fractional < 1 micro-quantities scale proportionally so 10% and 99% shortfalls cannot pass
+    assert.equal(
+      isLineQuantitySufficient({ ...baseLine, quotedQty: 0.16667, uomConversionFactor: 3 }, { ...baseItem, quantity: 0.5 }).ok,
+      true
+    );
+    assert.equal(
+      isLineQuantitySufficient({ ...baseLine, quotedQty: 0.499, uomConversionFactor: 1 }, { ...baseItem, quantity: 0.5 }).ok,
+      false
+    );
+    assert.equal(
+      isLineQuantitySufficient({ ...baseLine, quotedQty: 0.001, uomConversionFactor: 1 }, { ...baseItem, quantity: 0.001 }).ok,
+      true
+    );
+    assert.equal(
+      isLineQuantitySufficient({ ...baseLine, quotedQty: 0.0009, uomConversionFactor: 1 }, { ...baseItem, quantity: 0.001 }).ok,
+      false
+    );
+    assert.equal(
+      isLineQuantitySufficient({ ...baseLine, quotedQty: 0.0001, uomConversionFactor: 1 }, { ...baseItem, quantity: 0.0001 }).ok,
+      true
+    );
+    assert.equal(
+      isLineQuantitySufficient({ ...baseLine, quotedQty: 0.000001, uomConversionFactor: 1 }, { ...baseItem, quantity: 0.0001 }).ok,
+      false
+    );
+    assert.equal(
+      isLineQuantitySufficient({ ...baseLine, quotedQty: 0.000099, uomConversionFactor: 1 }, { ...baseItem, quantity: 0.0001 }).ok,
+      false
+    );
+
+    // Large quantities stay tight at 1e-4 absolute units
+    assert.equal(
+      isLineQuantitySufficient({ ...baseLine, quotedQty: 999_999.9999, uomConversionFactor: 1 }, { ...baseItem, quantity: 1_000_000 }).ok,
+      true
+    );
+    assert.equal(
+      isLineQuantitySufficient({ ...baseLine, quotedQty: 999_999.99, uomConversionFactor: 1 }, { ...baseItem, quantity: 1_000_000 }).ok,
+      false
+    );
+
+    // Micro-quantity awardedQty mismatch (0.0001 vs 0.001) must fail with 400
+    const microRfq: Rfq = {
+      ...rfq,
+      items: [{ ...rfq.items[0], quantity: 0.001 }, rfq.items[1]],
+    };
+    const microQ1: Quotation = {
+      ...q1,
+      totalLandedCost: 4001,
+      lines: [
+        { ...q1.lines[0], quotedQty: 0.001, lineTotalQuoted: 1, expectedLineTotal: 1 },
+        q1.lines[1],
+      ],
+    };
+    const microQ2: Quotation = {
+      ...q2,
+      totalLandedCost: 4001.2,
+      lines: [
+        { ...q2.lines[0], quotedQty: 0.001, lineTotalQuoted: 1.2, expectedLineTotal: 1.2 },
+        q2.lines[1],
+      ],
+    };
+    assert.throws(
+      () =>
+        validateAwardSubmission({
+          rfq: microRfq,
+          rfqQuotes: [microQ1, microQ2],
+          isSplitAward: false,
+          allocations: [
+            { rfqItemId: 'item-1', quotationId: microQ1.id, quotationLineId: microQ1.lines[0].id, awardedQty: 0.0001 },
+            { rfqItemId: 'item-2', quotationId: microQ1.id, quotationLineId: microQ1.lines[1].id, awardedQty: 20 },
+          ],
+        }),
+      (err: unknown) => err instanceof AwardValidationError && err.statusCode === 400
+    );
+    const microAwardOk = validateAwardSubmission({
+      rfq: microRfq,
+      rfqQuotes: [microQ1, microQ2],
+      isSplitAward: false,
+      allocations: [
+        { rfqItemId: 'item-1', quotationId: microQ1.id, quotationLineId: microQ1.lines[0].id, awardedQty: 0.001 },
+        { rfqItemId: 'item-2', quotationId: microQ1.id, quotationLineId: microQ1.lines[1].id, awardedQty: 20 },
+      ],
+    });
+    assert.equal(microAwardOk.allocations[0].awardedQty, 0.001);
+  });
 });

@@ -14,6 +14,11 @@ import {
 } from 'lucide-react';
 import { Quotation, QuotationLine, Rfq, Supplier } from '../types.ts';
 import { formatMoney } from '../lib/format.ts';
+import {
+  getConvertedQuotedQuantity,
+  getQuantityTolerance,
+  isLineQuantitySufficient,
+} from '../lib/ranking.ts';
 
 interface ExtractionReviewPaneProps {
   rfq: Rfq;
@@ -851,13 +856,25 @@ export function ExtractionReviewPane({
                   lineTotalQuoted: '',
                 };
                 const mappedRfqItem = rfq.items.find((it) => it.id === line.rfqItemId);
-                const effectiveQty =
-                  line.quotedQty !== null ? line.quotedQty * line.uomConversionFactor : null;
-                const qtyMismatch =
-                  mappedRfqItem &&
-                  effectiveQty !== null &&
+                const convertedQty = getConvertedQuotedQuantity(line);
+                const activeMappedLine =
+                  Boolean(mappedRfqItem) &&
                   line.matchStatus !== 'not_quoted' &&
-                  Math.abs(effectiveQty - mappedRfqItem.quantity) > 0.01;
+                  line.matchStatus !== 'unmapped';
+                const qtyCheck = mappedRfqItem
+                  ? isLineQuantitySufficient(line, mappedRfqItem)
+                  : null;
+                const isShortQty = Boolean(
+                  activeMappedLine && qtyCheck && !qtyCheck.ok && convertedQty !== null
+                );
+                const isExcessQty = Boolean(
+                  activeMappedLine &&
+                    mappedRfqItem &&
+                    qtyCheck?.ok &&
+                    convertedQty !== null &&
+                    convertedQty - mappedRfqItem.quantity >
+                      getQuantityTolerance(mappedRfqItem.quantity)
+                );
 
                 return (
                   <div
@@ -893,11 +910,18 @@ export function ExtractionReviewPane({
                           ) : (
                             <span className="text-[#059669] font-medium">Math Valid</span>
                           )}
-                          {qtyMismatch && mappedRfqItem && (
+                          {(isShortQty || isExcessQty) && mappedRfqItem && (
                             <>
                               <span aria-hidden="true">·</span>
-                              <span className="text-[#D97706] font-medium">
-                                Qty {effectiveQty} vs RFQ {mappedRfqItem.quantity}
+                              <span
+                                className={
+                                  isShortQty
+                                    ? 'text-[#DC2626] font-semibold'
+                                    : 'text-[#D97706] font-medium'
+                                }
+                              >
+                                {isShortQty ? 'Short Qty' : 'Excess Qty'}: {convertedQty} vs RFQ{' '}
+                                {mappedRfqItem.quantity} {mappedRfqItem.uom}
                               </span>
                             </>
                           )}

@@ -1,5 +1,12 @@
 # Changelog
 
+## Task 008 — Independent Verification, Procurement Precision & Stabilization
+
+### Fixed & Hardened
+- **Micro-Quantity Tolerance Scaling (`src/lib/ranking.ts`, `src/lib/awardValidation.ts`, `tests/stabilizationUnit.test.ts`):** Added `getQuantityTolerance(requiredQty)` so quantities `>= 1` keep `QUANTITY_EPSILON = 1e-4` (preserving repeating-decimal UOM conversions such as `3.3333 * 3` vs `10`) while micro-quantities `< 1` scale proportionally (`Math.max(requiredQty * 1e-4, Number.EPSILON * 16)`), preventing sub-unit lines (`0.001`, `0.0001`) from passing with large percentage shortfalls; aligned `awardedQty` validation tolerance (`Math.max(Math.min(0.001, rfqItem.quantity * 0.001), Number.EPSILON * 16)`).
+- **Extraction Review & Matrix Precision Alignment (`src/components/ExtractionReviewPane.tsx`, `src/components/ComparisonMatrixPane.tsx`):** Updated Extraction Review to use `getConvertedQuotedQuantity`, `getQuantityTolerance`, and `isLineQuantitySufficient` with explicit **Short Qty** vs **Excess Qty** labels; added `Short Qty` and `Alt Spec Unreviewed` counters to Comparison Matrix column headers and excluded `unmapped` lines from cell lookups.
+- **Exporter Exception Parity (`src/lib/exporters.ts`, `tests/exporters.test.ts`):** Added `Insufficient Quantity` rows to Excel `Exceptions` workbook exports, excluded `unmapped` lines in PDF/Excel matrices, and combined PDF cell annotations (`(Nx uom)`, `(Alt Spec)`, `[Math Mismatch]`, `[Short Qty]`) so UOM conversion labels never mask exception flags.
+
 ## Task 007.2 — Critical Procurement Fixes & Database Safety
 
 ### Fixed & Hardened

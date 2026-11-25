@@ -11,7 +11,7 @@ import {
   Supplier,
 } from '../types.ts';
 import { formatDateShort, formatMoney } from './format.ts';
-import { rankQuotations } from './ranking.ts';
+import { isLineQuantitySufficient, rankQuotations } from './ranking.ts';
 
 function getSupplierName(suppliers: Supplier[], id: string): string {
   return suppliers.find((s) => s.id === id)?.name || 'Unknown Supplier';
@@ -134,7 +134,7 @@ export function buildComparativeStatementPdfDoc(params: {
 
     for (const r of rankedQuotes) {
       const q = r.quotation;
-      const line = q.lines.find((l) => l.rfqItemId === item.id);
+      const line = q.lines.find((l) => l.rfqItemId === item.id && l.matchStatus !== 'unmapped');
       if (!line || line.matchStatus === 'not_quoted') {
         row.push('NOT QUOTED');
       } else {
@@ -144,15 +144,21 @@ export function buildComparativeStatementPdfDoc(params: {
             : basis === 'gross'
             ? line.normalizedUnitGross
             : line.normalizedUnitLanded;
-        const note =
-          line.uomConversionFactor !== 1
-            ? ` (${line.uomConversionFactor}x ${line.quotedUom})`
-            : line.matchStatus === 'alternate_spec'
-            ? ' (Alt Spec)'
-            : !line.mathValid
-            ? ' [Math Mismatch]'
-            : '';
-        row.push(`${formatMoney(unitVal, rfq.currency)}${note}`);
+        const notes: string[] = [];
+        if (line.uomConversionFactor !== 1) {
+          notes.push(`(${line.uomConversionFactor}x ${line.quotedUom})`);
+        }
+        if (line.matchStatus === 'alternate_spec') {
+          notes.push('(Alt Spec)');
+        }
+        if (!line.mathValid) {
+          notes.push('[Math Mismatch]');
+        }
+        if (!isLineQuantitySufficient(line, item).ok) {
+          notes.push('[Short Qty]');
+        }
+        const noteSuffix = notes.length > 0 ? ` ${notes.join(' ')}` : '';
+        row.push(`${formatMoney(unitVal, rfq.currency)}${noteSuffix}`);
       }
     }
     return row;
@@ -338,7 +344,9 @@ export function buildComparativeStatementWorkbook(params: {
   rfq.items.forEach((item, idx) => {
     const rowIdx = idx + 2;
     const unitCols = rankedQuotes.map((rk) => {
-      const l = rk.quotation.lines.find((ql) => ql.rfqItemId === item.id);
+      const l = rk.quotation.lines.find(
+        (ql) => ql.rfqItemId === item.id && ql.matchStatus !== 'unmapped'
+      );
       if (!l || l.matchStatus === 'not_quoted' || l.normalizedUnitLanded === null) {
         return 'NOT QUOTED';
       }
@@ -429,6 +437,23 @@ export function buildComparativeStatementWorkbook(params: {
           sanitizeSpreadsheetCell(l.rawDescription),
           sanitizeSpreadsheetCell(l.sourceTrace.snippet),
         ]);
+      }
+      if (l.rfqItemId && l.matchStatus !== 'not_quoted' && l.matchStatus !== 'unmapped') {
+        const mappedItem = rfq.items.find((it) => it.id === l.rfqItemId);
+        if (mappedItem) {
+          const qtyCheck = isLineQuantitySufficient(l, mappedItem);
+          if (!qtyCheck.ok) {
+            exceptionRows.push([
+              supName,
+              String(l.vendorLineNo),
+              'Insufficient Quantity',
+              sanitizeSpreadsheetCell(
+                `Converted qty ${qtyCheck.convertedQty ?? 'missing'} < RFQ required ${mappedItem.quantity} ${mappedItem.uom}`
+              ),
+              sanitizeSpreadsheetCell(l.sourceTrace.snippet),
+            ]);
+          }
+        }
       }
     }
   }

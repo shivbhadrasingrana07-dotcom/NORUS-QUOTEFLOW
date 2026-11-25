@@ -7,6 +7,7 @@ import {
 
 export {
   QUANTITY_EPSILON,
+  getQuantityTolerance,
   getConvertedQuotedQuantity,
   isExceedingL1Total,
   isLineQuantitySufficient,
@@ -113,10 +114,14 @@ export function validateAwardSubmission(params: AwardValidationInput): Validated
 
     if (r.awardedQty !== undefined && r.awardedQty !== null) {
       const providedQty = Number(r.awardedQty);
+      const allocTolerance = Math.max(
+        Math.min(0.001, rfqItem.quantity * 0.001),
+        Number.EPSILON * 16
+      );
       if (
         !Number.isFinite(providedQty) ||
         providedQty <= 0 ||
-        Math.abs(providedQty - rfqItem.quantity) > 0.001
+        Math.abs(providedQty - rfqItem.quantity) > allocTolerance
       ) {
         throw new AwardValidationError(
           400,

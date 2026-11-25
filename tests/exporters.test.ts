@@ -116,3 +116,61 @@ test('buildComparativeStatementPdfDoc produces valid landscape PDF bytes includi
   assert.equal(buf.subarray(0, 5).toString('ascii'), '%PDF-');
   assert.ok(buf.byteLength > 1500);
 });
+
+test('Task 008: Excel Exceptions logs Insufficient Quantity and PDF includes [Short Qty] alongside UOM conversion', () => {
+  const ws = createInitialWorkspaceState();
+  const rfq = ws.rfqs[0];
+  const baseQuotes = ws.quotations.filter((q) => q.rfqId === rfq.id);
+  const shortQuote = {
+    ...baseQuotes[0],
+    lines: baseQuotes[0].lines.map((l, idx) =>
+      idx === 0
+        ? {
+            ...l,
+            quotedQty: 1,
+            uomConversionFactor: 2,
+            quotedUom: 'pack',
+            mathValid: false,
+            matchStatus: 'alternate_spec' as const,
+          }
+        : l
+    ),
+  };
+
+  const wb = buildComparativeStatementWorkbook({
+    rfq,
+    quotes: [shortQuote, ...baseQuotes.slice(1)],
+    suppliers: ws.suppliers,
+    settings: ws.settings,
+    auditLogs: ws.auditLogs,
+  });
+  const exceptionsAoA = XLSX.utils.sheet_to_json<string[]>(wb.Sheets['Exceptions'], { header: 1 });
+  assert.ok(
+    exceptionsAoA.some((row) => row[2] === 'Insufficient Quantity' && /Converted qty 2 < RFQ required/.test(row[3])),
+    'Expected Insufficient Quantity row in Excel Exceptions sheet'
+  );
+
+  const doc = buildComparativeStatementPdfDoc({
+    rfq,
+    quotes: [shortQuote, ...baseQuotes.slice(1)],
+    suppliers: ws.suppliers,
+    settings: ws.settings,
+    basis: 'landed',
+  });
+  const pdfBuf = Buffer.from(doc.output('arraybuffer'));
+  assert.equal(pdfBuf.subarray(0, 5).toString('ascii'), '%PDF-');
+  const pagesText = (doc as unknown as { internal: { pages: string[][] } }).internal.pages
+    .map((p) =>
+      Array.isArray(p)
+        ? p
+            .join('\n')
+            .replace(/\u0000/g, '')
+            .replace(/\\([()])/g, '$1')
+        : ''
+    )
+    .join('\n');
+  assert.ok(pagesText.includes('[Short Qty]'));
+  assert.ok(pagesText.includes('[Math Mismatch]'));
+  assert.ok(pagesText.includes('(Alt Spec)'));
+  assert.ok(pagesText.includes('(2x pack)'));
+});

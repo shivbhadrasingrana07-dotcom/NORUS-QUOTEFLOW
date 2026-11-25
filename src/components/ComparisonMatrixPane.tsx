@@ -370,6 +370,18 @@ export function ComparisonMatrixPane({
                   const isSelectedPkg = awardMode === 'package' && activePackageId === q.id;
                   const mathErrCount = q.lines.filter((l) => !l.mathValid).length;
                   const unmappedCount = q.lines.filter((l) => l.matchStatus === 'unmapped').length;
+                  const unreviewedAltCount = q.lines.filter(
+                    (l) => l.matchStatus === 'alternate_spec' && !l.verifiedField
+                  ).length;
+                  const shortQtyCount = rfq.items.filter((item) => {
+                    const l = q.lines.find(
+                      (ql) =>
+                        ql.rfqItemId === item.id &&
+                        ql.matchStatus !== 'not_quoted' &&
+                        ql.matchStatus !== 'unmapped'
+                    );
+                    return Boolean(l && !isLineQuantitySufficient(l, item).ok);
+                  }).length;
 
                   return (
                     <th
@@ -440,6 +452,16 @@ export function ComparisonMatrixPane({
                               · {mathErrCount} Math Mismatch
                             </span>
                           )}
+                          {shortQtyCount > 0 && (
+                            <span className="text-[#DC2626] font-semibold">
+                              · {shortQtyCount} Short Qty
+                            </span>
+                          )}
+                          {unreviewedAltCount > 0 && (
+                            <span className="text-[#D97706] font-semibold">
+                              · {unreviewedAltCount} Alt Spec Unreviewed
+                            </span>
+                          )}
                           {unmappedCount > 0 && (
                             <span className="text-[#D97706]">· {unmappedCount} Unmapped</span>
                           )}
@@ -491,7 +513,9 @@ export function ComparisonMatrixPane({
                     </td>
 
                     {sortedQuotes.map((q) => {
-                      const line = q.lines.find((l) => l.rfqItemId === item.id);
+                      const line = q.lines.find(
+                        (l) => l.rfqItemId === item.id && l.matchStatus !== 'unmapped'
+                      );
                       const sup = getSupplier(q.supplierId);
 
                       if (!line || line.matchStatus === 'not_quoted' || line.quotedUnitRate === null) {
