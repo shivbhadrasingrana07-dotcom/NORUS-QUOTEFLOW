@@ -1,5 +1,12 @@
 # Changelog
 
+## Task 011 — CI Verification, Security Dependency Remediation & Remaining Blocker Closure
+
+### Verified & Hardened
+- **Task 010.1 CI Run `#6` Verification:** Verified `main` (`87a93ae69093e8e775bb59b096f75b31ed5b2351`) and GitHub Actions Run `#6` (`45562869618`) via live GitHub REST API, confirming `verify` and `browser-e2e` jobs both completed with `conclusion: "success"` *(raw job logs returned `HTTP 403` unauthenticated and are explicitly marked inaccessible)*.
+- **Spreadsheet Worker, OLE2 Container & IPC Hardening (`server/spreadsheetWorker.mjs`, `server/geminiExtractor.ts`, `tests/extractionValidation.test.ts`):** Added `inspectOle2Container()` (CFBF `512`-byte header/`0xfffe`/sector-shift check -> `422`, UTF-16LE `_VBA_PROJECT_CUR`/`_VBA_PROJECT` macro marker rejection -> `415`), pure-JS `decodeCellAddress()`, `Object.hasOwn` guards for workbook sheet/cell lookups, worker stdout JSON IPC payload structure validation (`structuredText` + `sheetPreview`), and Task 011 regression tests (`47` offline passing tests, `0` failing, `13` skipped).
+- **Dependency Audit & Phased `xlsx@0.18.5` Migration Plan (`docs/SECURITY.md`, `docs/PROJECT_STATUS.md`, `docs/NEXT_TASK.md`, `docs/TESTING.md`):** Audited every `xlsx@0.18.5` import/usage and evaluated `exceljs@4.4.0` (pulls `tmp@^0.2.0` advisory and lacks binary `.xls` reading) vs. `read-excel-file@9.3.20` + `write-excel-file@4.1.1` (clean for `.xlsx` read/formula-write, lacks binary `.xls`); documented the safe two-phase replacement plan and confirmed transitive `firebase -> @grpc/grpc-js` and `drizzle-kit -> esbuild` chains are unreachable in production runtime without semver-major downgrades.
+
 ## Task 010.1 — Browser E2E Failure Diagnosis & Repair
 
 ### Fixed

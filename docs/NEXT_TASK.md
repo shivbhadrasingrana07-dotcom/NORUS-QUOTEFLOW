@@ -1,20 +1,20 @@
-# Next Task — CI Execution, Cloud SQL Migration Window & Commercial Pilot Rollout
+# Next Task — `xlsx` Removal Decision, Cloud SQL Migration Window & Commercial Pilot Rollout
 
-## Completed Through Task 010.1
-- **Browser E2E Diagnosis & Repair (`tests/browserE2E.mjs`, `server.ts`, `.github/workflows/ci.yml`, `tests/demoWorkspace.test.ts`):** Diagnosed CI Run #5 failure: (1) `createViteServer` startup (~6s before `app.listen`) caused transient `curl -fsS` `Connection refused` noise before ready (`-sf` + `DISABLE_HMR=true` + server startup/listen `.catch`/`.on('error')` handling added), and (2) `page.getByText('DEMO-RFQ-2026-101').first().click()` clicked an inert `<span>` inside Dashboard "Needs Your Attention" instead of the clickable RFQ table row, falsely passing the title wait on the Dashboard `<td>` and timing out on `getByText(/Freight To-Pay/i)` because `ComparisonMatrixPane` never opened. Fixed `tests/browserE2E.mjs` to click `tbody tr` and wait for the workspace `<h1>` + `Compare Matrix` button, added direct `tsx server.ts` startup regression tests, and verified `DEMO_MODE=true` boot + endpoints locally.
-- **Independent Audit & Supply-Chain/Spreadsheet Closure (`server/spreadsheetWorker.mjs`, `tests/extractionValidation.test.ts`):** Closed ZIP container pre-scan edge cases and added delimiter detection + `65,536`-character raw cell cap to the native RFC-4180 parser.
-- **Monetary Split-Award Precision & Parent-First Extraction Lock (`src/lib/awardValidation.ts`, `src/components/ComparisonMatrixPane.tsx`, `server/pgStore.ts`):** Applied Kahan `sumExactQuantities` to split-award landed totals and added `.for('update')` parent `rfqs` locking to `saveExtractedQuotation`.
-- **CI Workflow Hardening (`.github/workflows/ci.yml`):** Added top-level `permissions: contents: read`, `DISABLE_HMR: 'true'`, fail-fast PID/log diagnostics, and `--max-time 5` readiness checks in `browser-e2e`.
+## Completed Through Task 011
+- **CI Verification of Task 010.1 (`NORUS-QUOTEFLOW` Run `#45562869618` on `87a93ae69093e8e775bb59b096f75b31ed5b2351`):** Verified via GitHub REST API that both `verify` (Node 22 `npm ci`, PG `0000`/`0001` preflight/apply/rollback/re-apply, `lint`, `test`, `build`) and `browser-e2e` (Playwright Chromium install + `DEMO_MODE=true` `tests/browserE2E.mjs`) completed with **`conclusion: "success"`**. Raw CI job log zip download remains `HTTP 403` unauthenticated (`BLOCKED` for console line inspection).
+- **`xlsx@0.18.5` Security Audit & OLE2 Defense-in-Depth (`server/spreadsheetWorker.mjs`, `tests/extractionValidation.test.ts`, `docs/SECURITY.md`):** Evaluated `read-excel-file@9.3.20` + `write-excel-file@4.1.1` and `exceljs@4.4.0`; confirmed neither supports legacy binary OLE2 `.xls` (BIFF5/BIFF8) workbooks. Kept `xlsx@0.18.5` quarantined inside `spreadsheetWorker.mjs` rather than silently dropping `.xls`, and hardened `spreadsheetWorker.mjs` with `inspectOle2Container()` (CFBF header check + UTF-16LE `_VBA_PROJECT_CUR`/`_VBA_PROJECT` macro rejection `415`), prototype-safe `Object.hasOwn()` lookups, and pure-JS `decodeCellAddress()`.
+- **Supply-Chain & Runtime Security Audit (`package-lock.json`, `server.ts`, `server/security.ts`, `server/rbac.ts`, `server/pgStore.ts`):** Verified clean isolated `npm ci` (`exit 0`, `13` non-fatal `@firebase/*` Node 24 `EBADENGINE` warnings on `v22.23.5`), confirmed Firestore/`@grpc/grpc-js` is unused (`src/lib/firebase.ts` imports `firebase/app` + `firebase/auth` only), and confirmed `drizzle-kit`'s nested `esbuild@0.18.20` is CLI-only while root Vite uses `esbuild@0.28.2`.
 
 ## Remaining Actions Before Public Launch
 
-0. **Run CI / Local PostgreSQL 15+ & Headless Chromium E2E Verification (Immediate Next Step):**
-   - Trigger `.github/workflows/ci.yml` (or run locally with PostgreSQL 15+ and Playwright Chromium) to execute:
-     1. Full `psql` migration lifecycle (`0000_illegal_major_mapleleaf.sql`, `0001_tenant_integrity_preflight.sql`, `0001_tenant_integrity.sql`, `0001_tenant_integrity_rollback.sql`, and re-apply `0001_tenant_integrity.sql`).
-     2. All `12` PostgreSQL integration & Task 009 concurrency tests (`npm test` with `TEST_SQL_*` / `TEST_DATABASE_URL`), plus optional `RUN_LIVE_GEMINI_TESTS=true`.
-     3. Isolated `node tests/browserE2E.mjs` Playwright headless Chromium E2E pass under `DEMO_MODE=true`.
-1. **Schedule `xlsx@0.18.5` Replacement & Track Upstream Advisories (`npm audit`):**
-   - Replace `xlsx@0.18.5` with a maintained spreadsheet parser/writer (e.g., `exceljs`) when scheduling the dependency upgrade milestone; track non-breaking `firebase` / `drizzle-kit` updates and Node 24 alignment.
+0. **Product Decision & Implementation to Remove `xlsx@0.18.5`:**
+   - Choose either:
+     1. **Deprecate binary OLE2 `.xls` uploads (`415`)** asking suppliers for `.xlsx` or `.csv` (while preserving native UTF-8 text-table `.xls` via `parseDelimitedTextToRows`), OR
+     2. **Add an isolated native/WASM `.xls`-to-`.xlsx` converter** prior to OOXML parsing.
+   - Then migrate `server/spreadsheetWorker.mjs` `.xlsx` parsing to `read-excel-file@9.3.20` (`read-excel-file/node`), migrate `src/lib/exporters.ts` and `server/demoWorkspace.ts` exports to `write-excel-file@4.1.1` (with `{ type: 'Formula', value }` formulas), and uninstall `xlsx@0.18.5`.
+1. **Archive Authenticated CI Logs & Re-Verify Post-Task-011 Commit:**
+   - Trigger/inspect authenticated `.github/workflows/ci.yml` logs after pushing Task 011 so exact PG test counts (`12` PG integration/concurrency tests + `47` unit/demo tests) and `browser-e2e` console output are recorded from raw CI logs (`HTTP 403` prevents unauthenticated log download).
+   - Optionally run `RUN_LIVE_GEMINI_TESTS=true GEMINI_API_KEY="..." npm test` in staging.
 2. **Exit Demo Mode & Restore Full Authentication:**
    - In `NODE_ENV=production`, demo mode is **OFF by default** (and setting `DEMO_MODE=true` fails closed on boot). Set `DEMO_MODE="false"` in non-production environments to disable `/api/demo-workspace*` (`410 Gone`) and activate `AuthView` and `OrganizationView`.
 3. **Apply Tenant Integrity Migration to Cloud SQL (Maintenance Window):**
@@ -22,3 +22,4 @@
 4. **Link Founder Account & Provision Production Runtime Secrets:**
    - Run `npm run org:bootstrap-owner -- --org-id=org-kalyani-hydraulics --issue-token --email="<founder-email>"` (or `--claim-direct`).
    - Configure `SESSION_SECRET` (>= 32 random chars), live `GEMINI_API_KEY`, `RESEND_API_KEY` + verified `EMAIL_FROM` (`SPF`/`DKIM`), `STORAGE_PROVIDER=s3` credentials, `SQL_SSL_CA` (if using TCP TLS), `APP_URL`, `ALLOWED_ORIGINS`, Firebase Authorized Domains, Cloud SQL PITR + Enterprise tier backups, and `CSP_MODE=enforce`.
+

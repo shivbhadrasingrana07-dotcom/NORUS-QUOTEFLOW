@@ -33,11 +33,18 @@ One test in `tests/extractionValidation.test.ts` (`Live Gemini API extraction sm
 RUN_LIVE_GEMINI_TESTS=true GEMINI_API_KEY="your-key" npm test
 ```
 
-## Latest Verification Scope (Task 010.1)
-- **VERIFIED (Local Sandbox):** Direct `npx tsx server.ts` live process boot in `DEMO_MODE=true` (`NODE_ENV=development`, `DISABLE_HMR=true`, HTTP `200` on `/api/health`, `/api/auth/me`, `/api/demo-workspace`, signed PDF preview `/api/demo-workspace/documents/.../content`, `PATCH` line mismatch fix, `POST /verify`, and `/`), fail-closed `exit 1` on `NODE_ENV=production DEMO_MODE=true`, `npm run lint` (`tsc --noEmit`), `npm run build` (`vite build`), and `46` offline passing tests (`0` failing, `13` skipped) including the new direct-server startup regression test in `tests/demoWorkspace.test.ts`.
-- **IMPLEMENTED — NOT VERIFIED in Current Sandbox:** `.github/workflows/ci.yml` (`browser-e2e` job with `DISABLE_HMR=true`, silent readiness polling, fail-fast PID + server log diagnostics, and `verify` PG migration/rollback cycle) and `tests/browserE2E.mjs` require GitHub Actions / Chromium / Playwright runtime (`playwright` and Chromium are verified absent in this container).
-- **BLOCKED in Current Container (Requires External PostgreSQL 15+ / API Key):**
-  - Disposable PostgreSQL integration & concurrency suites (`12` skipped tests across `tests/apiAndDb.test.ts`, `tests/authAndMultiTenancy.test.ts`, `tests/e2eWorkflow.test.ts`, `tests/opsAndMonitoring.test.ts`, and `tests/objectStorageAndRateLimit.test.ts`) and live `psql` execution of `0001_tenant_integrity*.sql` / rollback require `TEST_DATABASE_URL` or `TEST_SQL_*` against PostgreSQL 15+ (`docker` and `psql` are absent in this sandbox).
+## Latest Verification Scope (Task 011)
+- **VERIFIED (Local Sandbox Execution):**
+  - `npm ci`: Installed `422` packages cleanly with zero flags (`EBADENGINE` warnings only for `@firebase/*` `>=24.12.0` on Node `v22.23.5`).
+  - `npm audit --json`: Reported `9` vulnerabilities (`5` high, `4` moderate, `0` critical) across `xlsx`, `firebase -> @grpc/grpc-js`, and `drizzle-kit -> esbuild` chains (all audited in `docs/SECURITY.md`).
+  - `npm run lint` (`tsc --noEmit`): Passed with `0` errors.
+  - `npm run build` (`vite build`): Succeeded (`1889` modules transformed in `3.00s`).
+  - `npm test`: `47` passing tests (`0` failing, `13` skipped, `73.4s`), including Task 011 prototype-sheet/coordinate safety and OLE2 `.xls` macro/truncation regression coverage in `tests/extractionValidation.test.ts`.
+- **VERIFIED VIA GITHUB ACTIONS REST API — RAW LOGS INACCESSIBLE (`HTTP 403`):**
+  - GitHub `main` head (`87a93ae69093e8e775bb59b096f75b31ed5b2351`) passed Actions Run `#6` (`https://github.com/shivbhadrasingrana07-dotcom/NORUS-QUOTEFLOW/actions/runs/45562869618`): job `verify` (`139030529454`, PG16 migration/rollback/re-apply + `npm test` + `tsc` + `vite build`) and job `browser-e2e` (`139030852293`, Playwright Chromium `tests/browserE2E.mjs`) both finished with `conclusion: "success"`. Unauthenticated log archive downloads return `HTTP 403`, so exact CI test/skip numbers remain inaccessible without GitHub authentication.
+- **BLOCKED in Current Container (Requires External PostgreSQL 15+ / Chromium / API Key):**
+  - Disposable PostgreSQL integration & concurrency suites (`12` skipped tests across `tests/apiAndDb.test.ts`, `tests/authAndMultiTenancy.test.ts`, `tests/e2eWorkflow.test.ts`, `tests/opsAndMonitoring.test.ts`, and `tests/objectStorageAndRateLimit.test.ts`) and live `psql` DDL/rollback verification require PostgreSQL 15+ (`psql` and `docker` are absent locally).
+  - Local headless browser E2E (`tests/browserE2E.mjs`) requires `playwright` and Chromium (both verified absent locally).
   - Live Gemini API smoke test (`1` skipped test in `tests/extractionValidation.test.ts`) requires `RUN_LIVE_GEMINI_TESTS=true` and `GEMINI_API_KEY`.
 
 ## Test Coverage Breakdown

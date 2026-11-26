@@ -60,6 +60,20 @@ function isZipBuffer(buffer) {
   );
 }
 
+export function decodeCellAddress(cellKey) {
+  if (typeof cellKey !== 'string') return null;
+  const match = /^([A-Z]{1,3})([1-9]\d{0,6})$/.exec(cellKey);
+  if (!match) return null;
+  let col = 0;
+  const letters = match[1];
+  for (let i = 0; i < letters.length; i += 1) {
+    col = col * 26 + (letters.charCodeAt(i) - 64);
+  }
+  const row = Number(match[2]) - 1;
+  if (!Number.isSafeInteger(row) || row < 0) return null;
+  return { r: row, c: col - 1 };
+}
+
 function isOle2Buffer(buffer) {
   return (
     buffer.length >= 8 &&
@@ -72,6 +86,30 @@ function isOle2Buffer(buffer) {
     buffer[6] === 0x1a &&
     buffer[7] === 0xe1
   );
+}
+
+const OLE2_VBA_MARKERS = [
+  Buffer.from('_VBA_PROJECT_CUR', 'utf16le'),
+  Buffer.from('_VBA_PROJECT', 'utf16le'),
+];
+
+export function inspectOle2Container(buffer) {
+  if (!isOle2Buffer(buffer) || buffer.length < 512) {
+    throw new SpreadsheetSecurityError('Malformed or truncated OLE2 (.xls) container header.', 422);
+  }
+  const byteOrder = buffer.readUInt16LE(28);
+  const sectorShift = buffer.readUInt16LE(30);
+  if (byteOrder !== 0xfffe || sectorShift < 7 || sectorShift > 16) {
+    throw new SpreadsheetSecurityError('Corrupt OLE2 (.xls) binary compound file header.', 422);
+  }
+  for (const marker of OLE2_VBA_MARKERS) {
+    if (buffer.includes(marker)) {
+      throw new SpreadsheetSecurityError(
+        'Macro-enabled or embedded VBA spreadsheets are not permitted.',
+        415
+      );
+    }
+  }
 }
 
 export function inspectXlsxZipContainer(buffer) {
@@ -441,7 +479,9 @@ export function parseSpreadsheetHardened(buffer, options = {}) {
 
   if (isZipBuffer(buffer)) {
     inspectXlsxZipContainer(buffer);
-  } else if (!isOle2Buffer(buffer)) {
+  } else if (isOle2Buffer(buffer)) {
+    inspectOle2Container(buffer);
+  } else {
     // Plain UTF-8 text without CSV filename extension (e.g. text-table .xls export)
     const sample = buffer.subarray(0, Math.min(buffer.length, 4096));
     if (sample.includes(0)) {
@@ -502,8 +542,9 @@ export function parseSpreadsheetHardened(buffer, options = {}) {
   let totalPopulatedCells = 0;
 
   for (const sheetName of workbook.SheetNames) {
+    if (typeof sheetName !== 'string' || !Object.hasOwn(workbook.Sheets, sheetName)) continue;
     const sheet = workbook.Sheets[sheetName];
-    if (!sheet) continue;
+    if (!sheet || typeof sheet !== 'object') continue;
 
     const cellKeys = Object.keys(sheet).filter((k) => !k.startsWith('!'));
     if (cellKeys.length > MAX_CELLS_PER_SHEET * 2) {
@@ -519,9 +560,13 @@ export function parseSpreadsheetHardened(buffer, options = {}) {
     let sheetPopulatedCells = 0;
 
     for (const key of cellKeys) {
+      if (!Object.hasOwn(sheet, key)) continue;
       const val = formatCellValue(sheet[key]);
       if (!val) continue;
-      const decoded = XLSX.utils.decode_cell(key);
+      const decoded = decodeCellAddress(key);
+      if (!decoded) {
+        continue;
+      }
       if (decoded.r >= MAX_PARSED_ROWS) {
         throw new SpreadsheetSecurityError(
           `Worksheet "${sheetName}" exceeds maximum ${MAX_PARSED_ROWS} rows per sheet.`,

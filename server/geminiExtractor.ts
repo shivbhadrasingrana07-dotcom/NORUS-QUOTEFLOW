@@ -214,13 +214,29 @@ export async function parseSpreadsheetBufferIsolated(
         const parsed = JSON.parse(rawOut) as
           | { ok: true; result: ParsedSpreadsheetResult }
           | { ok: false; statusCode?: number; message?: string };
-        if (parsed.ok) {
+        if (
+          parsed &&
+          typeof parsed === 'object' &&
+          parsed.ok === true &&
+          parsed.result &&
+          typeof parsed.result.structuredText === 'string' &&
+          Array.isArray(parsed.result.sheetPreview)
+        ) {
           resolve(parsed.result);
+        } else if (parsed && typeof parsed === 'object' && parsed.ok === false) {
+          reject(
+            new ExtractionServiceError(
+              typeof parsed.message === 'string' && parsed.message
+                ? parsed.message
+                : 'Unable to parse spreadsheet file.',
+              typeof parsed.statusCode === 'number' ? parsed.statusCode : 422
+            )
+          );
         } else {
           reject(
             new ExtractionServiceError(
-              parsed.message || 'Unable to parse spreadsheet file.',
-              typeof parsed.statusCode === 'number' ? parsed.statusCode : 422
+              'Isolated spreadsheet parser returned unexpected payload shape.',
+              422
             )
           );
         }

@@ -527,3 +527,66 @@ test('Task 010: hardens ZIP container LFH/CD parity, encrypted entry rejection, 
     (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 422
   );
 });
+
+test('Task 011: ignores prototype-named sheets, supports clean OLE2 .xls, and rejects OLE2 VBA macros/corrupt headers', async () => {
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(
+    wb,
+    XLSX.utils.aoa_to_sheet([
+      ['Item', 'Qty'],
+      ['Forged Flange', 12],
+    ]),
+    'Quote'
+  );
+  // Inject a prototype-key entry in SheetNames that does not exist as own property on Sheets
+  wb.SheetNames.push('toString');
+  const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
+  const parsed = await parseSpreadsheetBufferIsolated(buf, { documentName: 'safe.xlsx' });
+  assert.equal(parsed.sheetPreview.length, 1);
+  assert.equal(parsed.sheetPreview[0].sheetName, 'Quote');
+  assert.equal(parsed.sheetPreview[0].rows[1][1], '12');
+
+  // Legacy binary OLE2 .xls support preserved inside isolated worker
+  const cleanXlsWb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(
+    cleanXlsWb,
+    XLSX.utils.aoa_to_sheet([
+      ['Description', 'Qty', 'Rate'],
+      ['Alloy Flange', 8, 920],
+    ]),
+    'LegacyQuote'
+  );
+  const cleanXlsBuf = XLSX.write(cleanXlsWb, { type: 'buffer', bookType: 'xls' }) as Buffer;
+  const parsedXls = await parseSpreadsheetBufferIsolated(cleanXlsBuf, {
+    documentName: 'legacy.xls',
+    mimeType: 'application/vnd.ms-excel',
+  });
+  assert.equal(parsedXls.sheetPreview[0].sheetName, 'LegacyQuote');
+  assert.ok(parsedXls.structuredText.includes('B2: 8'));
+
+  // OLE2 .xls containing UTF-16LE VBA macro storage marker -> 415 rejection
+  const macroXlsBuf = Buffer.alloc(1024);
+  Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]).copy(macroXlsBuf, 0);
+  macroXlsBuf.writeUInt16LE(0xfffe, 28);
+  macroXlsBuf.writeUInt16LE(9, 30);
+  Buffer.from('_VBA_PROJECT_CUR', 'utf16le').copy(macroXlsBuf, 512);
+  await assert.rejects(
+    () =>
+      parseSpreadsheetBufferIsolated(macroXlsBuf, {
+        documentName: 'macro.xls',
+        mimeType: 'application/vnd.ms-excel',
+      }),
+    (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 415
+  );
+
+  // Truncated / malformed OLE2 .xls header -> 422 rejection
+  const truncatedOle2 = Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1, 0x00, 0x00]);
+  await assert.rejects(
+    () =>
+      parseSpreadsheetBufferIsolated(truncatedOle2, {
+        documentName: 'truncated.xls',
+        mimeType: 'application/vnd.ms-excel',
+      }),
+    (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 422
+  );
+});
