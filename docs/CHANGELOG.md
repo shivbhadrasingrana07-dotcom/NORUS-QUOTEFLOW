@@ -1,5 +1,12 @@
 # Changelog
 
+## Task 013.2 — Lockfile Reconciliation & Remote CI Closure
+
+### Reconciled & Verified
+- **GitHub `main` & CI Run `#10` (`e9d1ec2ccb4b1d503a35b04c9d2d2dd3fe97806c`, Run `45869793457`):** Confirmed Task 013.1 documentation updates were committed on `main` and passed CI Run `#10` (`verify` job `140081925307` and `browser-e2e` job `140082297952`, both `conclusion: "success"`; raw logs return `HTTP 403` unauthenticated), while remote `bun.lock` (`c29d02c2`) still carried stale `"xlsx": "^0.18.5"` + SheetJS entries (`adler-32`, `cfb`, `codepage`, `crc-32`, `frac`, `ssf`, `wmf`, `word`).
+- **Lockfile Strategy & Bun Reconciliation (`bun.lock`, `package-lock.json`):** Confirmed `.github/workflows/ci.yml` and `README.md` exclusively execute `npm ci` (Node 22), while `bun.lock` (`lockfileVersion: 2`, `bun v1.4.4`) is tracked from project scaffold for Bun-capable containers. Verified running `bun install --lockfile-only` (`bun v1.4.4`) against remote `bun.lock` + `package.json` reproduces local `bun.lock` (`06ba920b`) byte-for-byte with zero `"xlsx"`/SheetJS entries and `0` version differences across all `31` direct dependencies vs. `package-lock.json`.
+- **Dual Package-Manager, Audit, Test & Build Verification:** Verified `npm ci` (`added 419 packages`, `426` audited, exit `0`), `bun install --frozen-lockfile` (`402 packages installed` in `2.91s`), `npm ls xlsx` (`(empty)`), `npm audit --json` (`8` advisories: `4` high unreachable `firebase -> @grpc/grpc-js`, `4` moderate CLI-only `drizzle-kit -> esbuild`, `0` critical), `npm run lint` (`0` errors), `npm test` (`47` passing, `0` failing, `13` skipped / `60` total), and `npm run build` (`1.84s`, `1967` modules, `dist/` clean). Updated `docs/TESTING.md`, `docs/PROJECT_STATUS.md`, `docs/NEXT_TASK.md`, and `docs/CHANGELOG.md` ready for commit/push alongside reconciled `bun.lock`.
+
 ## Task 013.1 — Remote CI Verification & Spreadsheet Migration Acceptance
 
 ### Verified & Reconciled

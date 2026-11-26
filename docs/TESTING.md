@@ -33,20 +33,22 @@ One test in `tests/extractionValidation.test.ts` (`Live Gemini API extraction sm
 RUN_LIVE_GEMINI_TESTS=true GEMINI_API_KEY="your-key" npm test
 ```
 
-## Latest Verification Scope (Task 013.1 — Remote CI & Commit `8f2f977a`)
+## Latest Verification Scope (Task 013.2 — Lockfile Reconciliation, Runs `#9`–`#10` & Commit `e9d1ec2c`)
 - **VERIFIED VIA GITHUB ACTIONS REST API — RAW LOGS INACCESSIBLE (`HTTP 403`):**
-  - GitHub `main` head (`8f2f977aa222e86de5b2c3ccb9e16f4924d24354`, `"feat: replace xlsx with read/write-excel-file"`) matches `82 / 83` workspace files byte-for-byte *(sole mismatch: remote `bun.lock` still retains `"xlsx": "^0.18.5"` while local `bun.lock`, `package.json`, and `package-lock.json` have removed `xlsx`)* and passed Actions Run `#9` (`https://github.com/shivbhadrasingrana07-dotcom/NORUS-QUOTEFLOW/actions/runs/45776297361`):
-    - Job `verify` (`139760654386`): `conclusion: "success"` (all steps passed: Node 22, `npm ci`, PG16 `0000` + `0001_preflight` + `0001_tenant_integrity` + `0001_rollback` + re-apply `0001`, `npm run lint`, `npm test`, `npm run build`).
-    - Job `browser-e2e` (`139761103718`): `conclusion: "success"` (`npm ci`, Playwright Chromium install, `DEMO_MODE=true` healthcheck + `/api/auth/me` + `tests/browserE2E.mjs`).
-  - Unauthenticated log archive requests (`/actions/runs/45776297361/logs`) return `HTTP 403`, so exact remote CI test/skip stdout numbers and PG concurrency logs cannot be independently inspected without GitHub authentication (`npm audit` is not executed by `.github/workflows/ci.yml`).
-- **VERIFIED (Local Sandbox Execution — Post-`xlsx` Removal):**
-  - `npm ci` (isolated `/tmp/norus-ci-verify`): `added 419 packages`, `426` audited, exited `0` cleanly on Node `v22.23.5` / npm `10.9.9` without `--legacy-peer-deps`; `npm ls xlsx` returned `(empty)`.
+  - GitHub `main` head (`e9d1ec2ccb4b1d503a35b04c9d2d2dd3fe97806c`, `"docs: reconcile project status and verification logs"`, following `8f2f977aa222e86de5b2c3ccb9e16f4924d24354` `"feat: replace xlsx with read/write-excel-file"`) matches `82 / 83` local workspace files byte-for-byte prior to Task 013.2 doc sync *(sole mismatch: remote `bun.lock` `c29d02c2` still retains `"xlsx": "^0.18.5"`, whereas local `bun.lock` `06ba920b` is reconciled and ready for push)*.
+  - Actions **Run `#9`** (`https://github.com/shivbhadrasingrana07-dotcom/NORUS-QUOTEFLOW/actions/runs/45776297361`, commit `8f2f977a`) and **Run `#10`** (`https://github.com/shivbhadrasingrana07-dotcom/NORUS-QUOTEFLOW/actions/runs/45869793457`, commit `e9d1ec2c`) both completed with `conclusion: "success"`:
+    - `verify` (`139760654386` / `140081925307`): `conclusion: "success"` (`Node 22`, `npm ci`, PG16 `0000` + `0001_preflight` + `0001_tenant_integrity` + `0001_rollback` + re-apply `0001`, `npm run lint`, `npm test`, `npm run build`).
+    - `browser-e2e` (`139761103718` / `140082297952`): `conclusion: "success"` (`npm ci`, Playwright Chromium install, `DEMO_MODE=true` healthcheck + `/api/auth/me` + `tests/browserE2E.mjs`).
+  - Unauthenticated log archive requests (`/logs`) return `HTTP 403`, so exact remote CI test/skip stdout numbers and PG concurrency logs cannot be independently inspected without GitHub authentication (`npm audit` and `bun` are not executed by `.github/workflows/ci.yml`).
+- **VERIFIED (Local Sandbox Execution — Lockfile Reconciliation & Post-`xlsx` Verification):**
+  - `npm ci`: `added 419 packages, and audited 426 packages in 45s`, exited `0` cleanly on Node `v22.23.5` / npm `10.9.9` without `--legacy-peer-deps`; `npm ls xlsx` returned `(empty)`.
+  - `bun install --frozen-lockfile` (`bun v1.4.4`, isolated `/tmp/bun-frozen-verify`): `402 packages installed [2.91s]`, exited `0`; `bun install --lockfile-only` starting from remote `bun.lock` (`c29d02c2`) + `package.json` reproduced local `bun.lock` (`06ba920b`) byte-for-byte with zero `"xlsx"` or SheetJS entries (`adler-32`, `cfb`, `codepage`, `crc-32`, `frac`, `ssf`, `wmf`, `word`) and `0` version differences across all `31` direct dependencies vs. `package-lock.json`.
   - `npm audit --json`: Reported `8` transitive/dev advisories (`4` high in `firebase -> @grpc/grpc-js`, `4` moderate in `drizzle-kit -> esbuild`, `0` critical) across `426` packages — **zero `xlsx`, `read-excel-file`, or `write-excel-file` vulnerabilities**.
   - `npm run lint` (`tsc --noEmit`): Passed with `0` errors.
-  - `npm run build` (`vite build`): Succeeded (`1967` modules transformed in `1.78s`); `dist/` scan confirmed zero `SheetJS`, `xlsx`, or `write-excel-file/node` (`node:fs`) references.
-  - `npm test` (Task 013 baseline matching `8f2f977a` source/tests): `47` passing tests (`0` failing, `13` skipped: `12` disposable PG + `1` live Gemini; `46.0s`).
+  - `npm test`: `60` total (`47` passing, `0` failing, `13` skipped: `12` disposable PG + `1` live Gemini; `41.7s`).
+  - `npm run build` (`vite build`): Succeeded (`1967` modules transformed in `1.84s`); `dist/` scan confirmed zero `SheetJS`, `"xlsx"`, `write-excel-file/node`, or `read-excel-file/node` references.
 - **BLOCKED in Current Container (Requires External PostgreSQL 15+ / Chromium / API Key / GitHub Auth):**
-  - Raw GitHub Actions Run `#9` logs (`/logs` returned `HTTP 403` unauthenticated), local disposable PostgreSQL 15+ (`12` skipped tests locally), local Playwright/Chromium (`tests/browserE2E.mjs`), and live Gemini API smoke test (`1` skipped test in `tests/extractionValidation.test.ts`).
+  - Raw GitHub Actions Run `#9`/`#10` logs (`/logs` returned `HTTP 403` unauthenticated), local disposable PostgreSQL 15+ (`12` skipped tests locally), local Playwright/Chromium (`tests/browserE2E.mjs`), and live Gemini API smoke test (`1` skipped test in `tests/extractionValidation.test.ts`).
 
 ### `xlsx@0.18.5` Replacement Regression Gate (Verified in Task 013)
 All four regression gates passed after uninstalling `xlsx@0.18.5`:
