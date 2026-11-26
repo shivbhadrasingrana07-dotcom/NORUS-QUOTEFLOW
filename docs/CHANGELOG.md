@@ -1,5 +1,12 @@
 # Changelog
 
+## Task 013.1 — Remote CI Verification & Spreadsheet Migration Acceptance
+
+### Verified & Reconciled
+- **GitHub `main` Baseline & Parity (`8f2f977aa222e86de5b2c3ccb9e16f4924d24354`):** Verified `82 / 83` repository files match `main` byte-for-byte via GitHub blob SHA-1 checks (`package.json` and `package-lock.json` contain zero `xlsx`, pinning `read-excel-file@9.3.20` + `write-excel-file@4.1.1`). Flagged that remote `bun.lock` (`c29d02c2`) still retains `"xlsx": "^0.18.5"` while local `bun.lock` (`06ba920b`) has `xlsx` removed.
+- **GitHub Actions Run `#9` Metadata (`45776297361`):** Verified via GitHub REST API that both `verify` (`139760654386`: `npm ci`, PG16 `0000` -> `0001_preflight` -> `0001` -> `0001_rollback` -> `0001`, `npm run lint`, `npm test`, `npm run build`) and `browser-e2e` (`139761103718`: `npm ci`, Playwright Chromium install, `DEMO_MODE=true` server readiness, `tests/browserE2E.mjs`) completed with `conclusion: "success"` *(raw CI logs return `HTTP 403` unauthenticated)*.
+- **Dependency, Audit & Local Verification Reconciliation:** Re-verified `npm ls xlsx` (`(empty)`), `npm audit --json` (`8` advisories: `4` high unreachable `firebase -> @grpc/grpc-js`, `4` moderate CLI-only `drizzle-kit -> esbuild`, `0` critical), `npm run lint` (`0` errors), and `npm run build` (`1.78s`, `1967` modules). Updated `docs/TESTING.md`, `docs/PROJECT_STATUS.md`, and `docs/NEXT_TASK.md` to reflect Run `#9` and the remote `bun.lock` discrepancy.
+
 ## Task 013 — Spreadsheet Dependency Remediation & Compatibility
 
 ### Remediated & Verified

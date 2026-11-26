@@ -33,17 +33,20 @@ One test in `tests/extractionValidation.test.ts` (`Live Gemini API extraction sm
 RUN_LIVE_GEMINI_TESTS=true GEMINI_API_KEY="your-key" npm test
 ```
 
-## Latest Verification Scope (Task 013)
+## Latest Verification Scope (Task 013.1 — Remote CI & Commit `8f2f977a`)
+- **VERIFIED VIA GITHUB ACTIONS REST API — RAW LOGS INACCESSIBLE (`HTTP 403`):**
+  - GitHub `main` head (`8f2f977aa222e86de5b2c3ccb9e16f4924d24354`, `"feat: replace xlsx with read/write-excel-file"`) matches `82 / 83` workspace files byte-for-byte *(sole mismatch: remote `bun.lock` still retains `"xlsx": "^0.18.5"` while local `bun.lock`, `package.json`, and `package-lock.json` have removed `xlsx`)* and passed Actions Run `#9` (`https://github.com/shivbhadrasingrana07-dotcom/NORUS-QUOTEFLOW/actions/runs/45776297361`):
+    - Job `verify` (`139760654386`): `conclusion: "success"` (all steps passed: Node 22, `npm ci`, PG16 `0000` + `0001_preflight` + `0001_tenant_integrity` + `0001_rollback` + re-apply `0001`, `npm run lint`, `npm test`, `npm run build`).
+    - Job `browser-e2e` (`139761103718`): `conclusion: "success"` (`npm ci`, Playwright Chromium install, `DEMO_MODE=true` healthcheck + `/api/auth/me` + `tests/browserE2E.mjs`).
+  - Unauthenticated log archive requests (`/actions/runs/45776297361/logs`) return `HTTP 403`, so exact remote CI test/skip stdout numbers and PG concurrency logs cannot be independently inspected without GitHub authentication (`npm audit` is not executed by `.github/workflows/ci.yml`).
 - **VERIFIED (Local Sandbox Execution — Post-`xlsx` Removal):**
-  - `npm ci` (executed in clean isolated `/tmp/norus-ci-verify`): `added 419 packages`, `426` audited, exited `0` cleanly on Node `v22.23.5` / npm `10.9.9` without `--legacy-peer-deps` (`EBADENGINE` warnings only for `@firebase/*` `>=24.12.0`); `npm ls xlsx` returned `(empty)`.
+  - `npm ci` (isolated `/tmp/norus-ci-verify`): `added 419 packages`, `426` audited, exited `0` cleanly on Node `v22.23.5` / npm `10.9.9` without `--legacy-peer-deps`; `npm ls xlsx` returned `(empty)`.
   - `npm audit --json`: Reported `8` transitive/dev advisories (`4` high in `firebase -> @grpc/grpc-js`, `4` moderate in `drizzle-kit -> esbuild`, `0` critical) across `426` packages — **zero `xlsx`, `read-excel-file`, or `write-excel-file` vulnerabilities**.
   - `npm run lint` (`tsc --noEmit`): Passed with `0` errors.
-  - `npm run build` (`vite build`): Succeeded (`1967` modules transformed in `2.45s`); `dist/` scan confirmed zero `SheetJS`, `xlsx`, or `write-excel-file/node` (`node:fs`) references.
-  - `npm test`: `47` passing tests (`0` failing, `13` skipped: `12` disposable PG + `1` live Gemini; `46.0s`). Targeted export + demo signed-URL `.xlsx` runtime smoke check also verified 4-sheet workbook export, Blob download trigger, and `Demo_Offer` round-trip (`3,235` bytes, `PK` signature).
-- **BLOCKED in Current Container (Requires External PostgreSQL 15+ / Chromium / API Key / Remote CI):**
-  - Disposable PostgreSQL integration & concurrency suites (`12` skipped tests across `tests/apiAndDb.test.ts`, `tests/authAndMultiTenancy.test.ts`, `tests/e2eWorkflow.test.ts`, `tests/opsAndMonitoring.test.ts`, and `tests/objectStorageAndRateLimit.test.ts`) and live `psql` DDL/rollback verification require PostgreSQL 15+ (`psql` and `docker` are absent locally).
-  - Local headless browser E2E (`tests/browserE2E.mjs`) requires `playwright` and Chromium (both absent locally). *(Prior GitHub Actions Run `#7` succeeded on commit `66b9367e` before Task 013; Task 013 changes have not been pushed to trigger a fresh CI run.)*
-  - Live Gemini API smoke test (`1` skipped test in `tests/extractionValidation.test.ts`) requires `RUN_LIVE_GEMINI_TESTS=true` and `GEMINI_API_KEY`.
+  - `npm run build` (`vite build`): Succeeded (`1967` modules transformed in `1.78s`); `dist/` scan confirmed zero `SheetJS`, `xlsx`, or `write-excel-file/node` (`node:fs`) references.
+  - `npm test` (Task 013 baseline matching `8f2f977a` source/tests): `47` passing tests (`0` failing, `13` skipped: `12` disposable PG + `1` live Gemini; `46.0s`).
+- **BLOCKED in Current Container (Requires External PostgreSQL 15+ / Chromium / API Key / GitHub Auth):**
+  - Raw GitHub Actions Run `#9` logs (`/logs` returned `HTTP 403` unauthenticated), local disposable PostgreSQL 15+ (`12` skipped tests locally), local Playwright/Chromium (`tests/browserE2E.mjs`), and live Gemini API smoke test (`1` skipped test in `tests/extractionValidation.test.ts`).
 
 ### `xlsx@0.18.5` Replacement Regression Gate (Verified in Task 013)
 All four regression gates passed after uninstalling `xlsx@0.18.5`:
