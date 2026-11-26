@@ -72,12 +72,54 @@
    ```
    Both modes refuse execution (`409`) as soon as at least one active `owner` exists.
 
-## Staging & Production Deployment Checklist (Cloud Run + Cloud SQL)
+## Production Infrastructure Cutover Plan (Task 012 — 12 Requirements)
 
-1. **Secrets & Fail-Closed Guard:** Provision `SESSION_SECRET` (random >= 32 bytes), `SQL_*` (via Cloud SQL Auth Proxy Unix socket `/app/cloudsql/<connection_name>`), `GEMINI_API_KEY`, `RESEND_API_KEY`, `EMAIL_FROM`, and `S3_*` credentials in Secret Manager. `createApp()` fails closed on boot in `NODE_ENV=production` if `SESSION_SECRET` or `SQL_*` are missing.
-2. **Firebase Google Auth Authorized Domains:** Add every staging and production hostname (e.g., `*.run.app` Cloud Run URLs and custom domain `app.norusquoteflow.com`) in **Firebase Console → Authentication → Settings → Authorized Domains**.
-3. **Resend Sender Verification:** Verify the sending domain in Resend (`SPF`, `DKIM`, `DMARC` DNS records) matching `EMAIL_FROM`.
-4. **Private Object Storage Bucket:** Provision a private Cloudflare R2 or AWS S3 bucket with public access blocked, set `STORAGE_PROVIDER=s3`, and verify `GET /api/health/ready` returns `storage.ok: true`.
-5. **Cloud SQL Backups & Readiness Probe:** Enable automated daily backups + 7-day PITR; point Cloud Run startup/readiness probe to `GET /api/health` (liveness) and post-deploy smoke test to `GET /api/health/ready`.
-6. **Scheduled Maintenance:** Either keep `MAINTENANCE_INTERVAL_MINUTES="360"` enabled on single-service deployments or trigger `npm run ops:maintenance` via Cloud Run Job / Cloud Scheduler every 6 hours.
-7. **Rollback Procedure:** Retain previous Cloud Run revision traffic split (`0%` standby) and take a Cloud SQL snapshot before schema migrations so traffic can shift back immediately on regression.
+| # | Area | Exact Requirement & Configuration | Safety / Verification Note |
+| :--- | :--- | :--- | :--- |
+| 1 | **Cloud SQL Backup & Recovery** | Enable automated daily backups + **7-day Point-in-Time Recovery (PITR)**; capture an on-demand pre-migration Cloud SQL snapshot (`gcloud sql backups create`) before executing any DDL | Never modify production/staging Cloud SQL directly without a verified recent snapshot |
+| 2 | **`0001` Tenant-Integrity Migration** | Against backed-up PostgreSQL 15+ Cloud SQL: (a) run `drizzle/0001_tenant_integrity_preflight.sql` (must return `0` cross-org rows); (b) execute `drizzle/0001_tenant_integrity.sql` (`BEGIN;...COMMIT;`); (c) keep `drizzle/0001_tenant_integrity_rollback.sql` ready | Verified in GitHub Actions PG16 (`Run #7`, commit `66b9367e`); not yet run on Cloud SQL |
+| 3 | **Founder Account Bootstrap** | Claim `org-kalyani-hydraulics` (`0` owners) via `npm run org:bootstrap-owner -- --org-id=org-kalyani-hydraulics --issue-token --email="<founder-email>" --ttl-hours=72` (or `--claim-direct`) | Protected by `organizations FOR UPDATE` lock; rejects duplicate owners (`409`) |
+| 4 | **`SESSION_SECRET`** | Generate cryptographically random `>= 32`-character secret (`openssl rand -base64 48`) stored in Secret Manager | `getSigningSecret()` fails closed on boot in `NODE_ENV=production` if unset or `< 32` chars |
+| 5 | **Canonical URL, CORS & Cookies** | Set `APP_URL="https://<prod-domain>"`, `ALLOWED_ORIGINS="https://<prod-domain>"`, `COOKIE_SAMESITE="lax"` (for dedicated custom domain; leave unset/`none` only if embedded in HTTPS iframe), and `TRUST_PROXY_HOPS` matching exact proxy hop depth (`1` Cloud Run LB, `2` CDN+LB) | Prevents `Host`-header link construction fallback in `getAppBaseUrl(req)` and ensures accurate `req.ip` rate limiting |
+| 6 | **Gemini API Configuration** | Store `GEMINI_API_KEY` in Secret Manager (`server/geminiExtractor.ts` only; never `VITE_` prefixed) | Run `RUN_LIVE_GEMINI_TESTS=true` staging smoke check once before opening customer traffic |
+| 7 | **Resend Outbound Email** | Provision `RESEND_API_KEY` and domain-verified `EMAIL_FROM` (`SPF`, `DKIM`, `DMARC` DNS records) | Mandatory: without `RESEND_API_KEY`, `createEmailProvider()` silently falls back to `DevOutboxEmailProvider` (`GET /api/health/ready` shows `email.mode: "dev_outbox"`) |
+| 8 | **Private S3-Compatible Storage** | Provision Cloudflare R2 or AWS S3 private bucket (all public access blocked) with `STORAGE_PROVIDER="s3"`, `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` (+ bucket CORS `GET` rule if browsers fetch signed URLs directly) | Mandatory for stateless/multi-replica Cloud Run; default `'local'` filesystem loses uploads across container restarts/replicas |
+| 9 | **PostgreSQL TLS / Proxy Socket** | Prefer Cloud SQL Auth Proxy Unix socket (`SQL_HOST="/app/cloudsql/<connection_name>"`) **OR** enforce verified TCP TLS (`SQL_SSL="true"` + `SQL_SSL_CA` PEM/path; avoid `SQL_SSL_ALLOW_SELF_SIGNED=true`) | `buildPgSslConfig()` enforces `rejectUnauthorized: true` by default on TCP TLS |
+| 10 | **Firebase Authorized Domains** | Add staging and production hostnames (`*.run.app` and custom domain) to **Firebase Console → Authentication → Settings → Authorized Domains**; optionally set `FIREBASE_CHECK_REVOKED="true"` when deploying with a Cloud IAM service account authorized on project `favorable-emblem-zxq1s` | Unlisted domains trigger `auth/unauthorized-domain` in browser Google popups |
+| 11 | **CSP Enforcement** | Roll out to staging first with `CSP_MODE="report-only"` (prod default), inspect browser console / logs across Google Sign-In, PDF/XLSX download, and AI upload flows, then switch `CSP_MODE="enforce"` before production cutover | `buildProductionCspPolicy()` omits `*` wildcards and `'unsafe-eval'` |
+| 12 | **Monitoring & Maintenance** | Set `ERROR_WEBHOOK_URL` (HTTPS Slack/PagerDuty/alert receiver), attach Cloud Monitoring uptime alerts to `GET /api/health/ready` (`503` alert threshold), and run either `MAINTENANCE_INTERVAL_MINUTES="360"` (single-service) or Cloud Scheduler -> `npm run ops:maintenance` every 6h (`MAINTENANCE_INTERVAL_MINUTES="0"`) | `pg_try_advisory_lock` prevents overlapping cleanup batches across replicas |
+
+## Operational Readiness Checklists (Task 012 — 6 Runbooks)
+
+### 1. Deployment Checklist
+- [ ] Latest commit built and passed CI (`verify` + `browser-e2e`) with `NODE_ENV=production` and `DEMO_MODE` unset (verified `demoMode: false` on `/api/auth/me`).
+- [ ] All Secret Manager entries (`SESSION_SECRET`, `SQL_*`, `GEMINI_API_KEY`, `RESEND_API_KEY`, `S3_*`) mounted and verified non-placeholder.
+- [ ] `APP_URL`, `ALLOWED_ORIGINS`, `EMAIL_FROM`, `COOKIE_SAMESITE`, `TRUST_PROXY_HOPS`, and `CSP_MODE=enforce` verified in Cloud Run env.
+- [ ] Cloud SQL backup + `0001_tenant_integrity_preflight.sql` + `0001_tenant_integrity.sql` completed cleanly.
+- [ ] Deploy new revision at `0%` traffic (`--no-traffic`), run `curl -sf https://<staging-tag>/api/health/ready` (`database.ok: true`, `storage.ok: true`, `email.mode: "resend"`), smoke-test login + Google popup + PDF upload + comparison export, then shift traffic to `100%`.
+
+### 2. Backup & Rollback Checklist
+- [ ] Record current working Cloud Run revision name and on-demand Cloud SQL backup ID prior to change.
+- [ ] **Application-only regression:** Route `100%` Cloud Run traffic back to prior revision (`gcloud run services update-traffic ... --to-revisions=<PREV>=100`); verify `/api/health/ready`.
+- [ ] **Schema rollback (if `0001` triggered post-apply issues):** Pause writes/scale to maintenance if needed, run `drizzle/0001_tenant_integrity_rollback.sql`, then roll traffic back; restore PITR/snapshot only if corrupted data must be rewound.
+
+### 3. Incident Response Checklist
+- [ ] Inspect structured JSON logs using `X-Request-Id` from failing API responses or `ERROR_WEBHOOK_URL` alerts (`GET /api/health/ready` identifies DB vs. S3 vs. config failure).
+- [ ] **Suspected credential / session compromise:** Rotate `SESSION_SECRET` (invalidates HMAC signed URLs immediately), revoke compromised DB `sessions` rows (`DELETE` / `revokedAt`), or rotate `GEMINI_API_KEY` / `RESEND_API_KEY` / `S3_*` keys in Secret Manager + deploy fresh revision.
+- [ ] **Malicious upload / extraction incident:** Confirm container quarantine (`415`/`422`/`413` responses), check `stored_documents` by `organization_id` and audit logs (`DOCUMENT_*`/`QUOTATION_*`), and isolate offending organization membership if compromised.
+
+### 4. First-Owner Bootstrap Checklist (`org-kalyani-hydraulics`)
+- [ ] Confirm `npm run org:bootstrap-owner -- --inspect --org-id=org-kalyani-hydraulics` reports `activeOwners: 0`.
+- [ ] Issue single-use founder claim token (`--issue-token --email="<verified-founder-email>" --ttl-hours=72`) and send claim URL over a verified out-of-band channel.
+- [ ] Confirm founder completed sign-up/Google Sign-In with exact email and inspect `activeOwners: 1` + `FIRST_OWNER_BOOTSTRAPPED` audit entry; verify subsequent bootstrap attempts fail with `409`.
+
+### 5. Pilot Customer Onboarding Checklist
+- [ ] Pilot customer creates workspace via `/api/auth/register` or verified Google Sign-In (`owner` role assigned automatically) and confirms email verification link arrives from verified `EMAIL_FROM` domain.
+- [ ] Owner sets `Settings` (company currency, freight/payment defaults, UOM aliases) and invites internal `buyer`, `approver`, and `viewer` teammates via `Team & Invitations`.
+- [ ] Smoke-test pilot RFQ lifecycle end-to-end: upload 2+ supplier quotes (PDF + XLSX/CSV), verify math audit & alternate spec review, submit award (`buyer`), approve (`approver`), and export 4-sheet Excel + landscape PDF comparative statements.
+
+### 6. Post-Launch Monitoring Checklist
+- [ ] Track `GET /api/health/ready` (`503` alerts < 1 min detection) and `5xx` error rate / `ERROR_WEBHOOK_URL` volume during first 72 hours.
+- [ ] Verify rate-limit `429` spikes vs. auth failures (`authRateLimiter`), Gemini API quota usage/latency, and S3 bucket storage growth.
+- [ ] Confirm `ops:maintenance` (in-process or Cloud Scheduler) completes without `advisory lock` contention and purges expired `sessions` / `rate_limit_buckets` / orphaned `stored_documents` on schedule.
+

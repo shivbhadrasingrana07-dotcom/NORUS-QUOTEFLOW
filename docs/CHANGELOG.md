@@ -1,5 +1,12 @@
 # Changelog
 
+## Task 012 — Production Readiness Assessment & Safe Cutover Planning
+
+### Assessed & Documented
+- **Repository, Parity & CI Run `#7` Audit (`README.md`, `docs/TESTING.md`, `docs/PROJECT_STATUS.md`):** Verified `main` commit `66b9367ee2eb0a29788cd3efd5473e9bd9954250` matches local workspace files byte-for-byte via GitHub SHA-1 checks and confirmed GitHub Actions Run `#7` (`45767730514`) `verify` and `browser-e2e` jobs both completed with `conclusion: "success"` *(raw CI logs return `HTTP 403` unauthenticated)*. Removed remaining stale `--legacy-peer-deps` guidance in `README.md` and re-verified local `npm ci --dry-run` (`0`), `npm run lint` (`0` errors), `npm run build` (`2.02s`), `npm test` (`47` passing, `0` failing, `13` skipped), and `npm audit --json` (`9` entries: `5` high, `4` moderate, `0` critical).
+- **10-Area Production Security Assessment & Staged `.xls`/`xlsx` Plan (`docs/SECURITY.md`):** Completed evidence-backed audit covering Authentication/Sessions, Firebase Google Sign-In, Password Recovery/Email Verification, CSRF/RBAC, Organization Isolation/DB Constraints, Private Object Storage/Signed URLs, Rate Limiting/Upload Validation, Monitoring/Maintenance, CSP/Headers, and Dependency/Node 22 Compatibility; formalized the Stage 1 (`write-excel-file@4.1.1` + `read-excel-file@9.3.20` while keeping native UTF-8 text `.xls`) and Stage 2 (`415` binary `.xls` deprecation vs. isolated LibreOffice converter) roadmap with explicit regression gates.
+- **12-Item Infrastructure Plan, 6 Operational Runbooks & Weighted Score (`docs/CONFIGURATION.md`, `docs/PROJECT_STATUS.md`, `docs/NEXT_TASK.md`):** Documented Cloud SQL backup/`0001`/bootstrap/secret/TLS/S3/Resend/Firebase/CSP/monitoring requirements, Deployment/Rollback/Incident/Bootstrap/Pilot/Post-Launch checklists, explicit cutover sequence, external cost tiers, weighted Readiness Score (`76 / 100 — PARTIALLY READY`), and canonical Remaining-Risk Register.
+
 ## Task 011 — CI Verification, Security Dependency Remediation & Remaining Blocker Closure
 
 ### Verified & Hardened

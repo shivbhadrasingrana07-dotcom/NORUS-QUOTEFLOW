@@ -27,23 +27,25 @@ It ingests non-standard vendor quotations across PDF, Excel (`.xlsx`/`.xls`), CS
 
 ## Tech Stack
 
-- **Frontend:** React 19, TypeScript, Vite 8, Tailwind CSS v4, Lucide Icons, Firebase Client SDK (`GoogleAuthProvider`), `jspdf`, `jspdf-autotable`, `xlsx`
+- **Frontend:** React 19, TypeScript, Vite 8, Tailwind CSS v4, Lucide Icons, Firebase Client SDK (`GoogleAuthProvider`), `jspdf`, `jspdf-autotable`, `xlsx` *(browser exports; staged replacement planned in [Security Posture](docs/SECURITY.md))*
 - **Backend:** Express 4 (`server.ts`), Drizzle ORM + PostgreSQL (`pg`), `firebase-admin`, Multer 2, `@google/genai` (`gemini-4-hydrogen`), `tsx`
 - **Database:** Cloud SQL PostgreSQL 18.6 (`asia-southeast1`) with 17 relational tables (`src/db/schema.ts`), Drizzle migrations (`drizzle/`), and atomic PostgreSQL rate-limiting (`rate_limit_buckets`)
 - **Object Storage:** AWS SigV4 S3-compatible provider (`Cloudflare R2` / `S3` / `MinIO`) or private local filesystem storage (`server/objectStorage.ts`)
-- **Testing:** Node built-in test runner (`node:test` + `node:assert/strict`) executed via `tsx --test`
+- **Testing:** Node built-in test runner (`node:test` + `node:assert/strict`) executed via `tsx --test` + Playwright Chromium E2E (`tests/browserE2E.mjs`)
 
 ## Quick Start
 
-1. **Install dependencies:**
+1. **Install dependencies (Node.js 22 LTS recommended):**
    ```bash
-   npm install # In clean CI / strict lockfile runs, use: npm ci --legacy-peer-deps (esbuild@^0.25.0 vs vite@8.3.x peer range)
+   npm ci
    ```
+   > **Note:** Clean `npm ci` requires no `--legacy-peer-deps` flag (`esbuild` is aligned at `^0.28.2`). On Node `v22.x`, `@firebase/*` subpackages emit non-fatal `EBADENGINE` (`>=24.12.0`) warnings that do not affect runtime execution.
 2. **Configure environment (see [Configuration Reference](docs/CONFIGURATION.md)):**
-   Set PostgreSQL connection variables (`SQL_HOST`, `SQL_USER`, `SQL_PASSWORD`, `SQL_DB_NAME`), `SESSION_SECRET` (>= 32 chars, required in production), and `GEMINI_API_KEY` (required for live AI extraction).
-3. **Apply SQL migrations & inspect/bootstrap migrated organization ownership:**
+   Set PostgreSQL connection variables (`SQL_HOST`, `SQL_USER`, `SQL_PASSWORD`, `SQL_DB_NAME`), `SESSION_SECRET` (`>= 32` chars, required in production), and `GEMINI_API_KEY` (required for live AI extraction).
+3. **Apply SQL migrations (PostgreSQL 15+) & inspect/bootstrap migrated organization ownership:**
    ```bash
    psql ... -v ON_ERROR_STOP=1 -f drizzle/0000_illegal_major_mapleleaf.sql
+   psql ... -v ON_ERROR_STOP=1 -f drizzle/0001_tenant_integrity_preflight.sql
    psql ... -v ON_ERROR_STOP=1 -f drizzle/0001_tenant_integrity.sql
    npm run db:migrate -- --dry-run
    npm run db:migrate -- --apply --confirm
