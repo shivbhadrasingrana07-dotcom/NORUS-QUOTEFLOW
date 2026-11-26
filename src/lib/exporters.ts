@@ -1,6 +1,11 @@
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
-import * as XLSX from 'xlsx';
+import writeXlsxFile, {
+  type Cell,
+  type Row,
+  type Sheet,
+  type SheetData,
+} from 'write-excel-file/universal';
 import {
   AuditLogEntry,
   AwardDecision,
@@ -232,6 +237,29 @@ export function exportComparativeStatementPdf(params: {
   doc.save(`${params.rfq.rfqNumber}_Comparative_Statement.pdf`);
 }
 
+function encodeColLetter(index: number): string {
+  let letter = '';
+  let n = index;
+  while (n >= 0) {
+    letter = String.fromCharCode((n % 26) + 65) + letter;
+    n = Math.floor(n / 26) - 1;
+  }
+  return letter;
+}
+
+function formulaCell(formula: string): Cell {
+  return { type: 'Formula', value: formula };
+}
+
+export type ExporterSheetName = 'Summary' | 'Line_Matrix' | 'Exceptions' | 'Audit_Log';
+
+export interface ComparativeStatementWorkbook {
+  sheetNames: ExporterSheetName[];
+  sheets: Sheet<Blob>[];
+  toBlob: () => Promise<Blob>;
+  toUint8Array: () => Promise<Uint8Array>;
+}
+
 export function buildComparativeStatementWorkbook(params: {
   rfq: Rfq;
   quotes: Quotation[];
@@ -239,14 +267,12 @@ export function buildComparativeStatementWorkbook(params: {
   settings: OrganizationSettings;
   auditLogs: AuditLogEntry[];
   award?: AwardDecision;
-}): XLSX.WorkBook {
+}): ComparativeStatementWorkbook {
   const { rfq, quotes, suppliers, settings, auditLogs, award } = params;
   const rankedQuotes = rankQuotations(quotes, 'landed', rfq);
 
-  const wb = XLSX.utils.book_new();
-
   // Sheet 1: Summary
-  const summaryRows: (string | number | { f: string })[][] = [
+  const summaryRows: Row[] = [
     ['NORUS QUOTEFLOW — COMPARATIVE STATEMENT SUMMARY'],
     ['Organization', sanitizeSpreadsheetCell(settings.name), 'RFQ Number', rfq.rfqNumber],
     ['RFQ Title', sanitizeSpreadsheetCell(rfq.title), 'Currency', rfq.currency],
@@ -291,7 +317,7 @@ export function buildComparativeStatementWorkbook(params: {
       Math.round(q.globalDiscount * fx * 100) / 100,
       q.totalTax,
       nonCreditableTaxRfq,
-      { f: `MAX(0,E${r}+F${r}+G${r}-H${r}+J${r})` },
+      formulaCell(`MAX(0,E${r}+F${r}+G${r}-H${r}+J${r})`),
       q.leadTimeDays ?? 0,
       sanitizeSpreadsheetCell(q.paymentTerms || ''),
       rk.eligibleForAwardRank ? 'Verified & Complete' : rk.ineligibilityReasons.join('; '),
@@ -314,18 +340,15 @@ export function buildComparativeStatementWorkbook(params: {
       '',
       '',
       '',
-      { f: `MIN(${eligibleRowIndices.join(',')})` },
+      formulaCell(`MIN(${eligibleRowIndices.join(',')})`),
       '',
       '',
       '',
     ]);
   }
 
-  const wsSummary = XLSX.utils.aoa_to_sheet(summaryRows);
-  XLSX.utils.book_append_sheet(wb, wsSummary, 'Summary');
-
   // Sheet 2: Line Matrix
-  const matrixHeader = [
+  const matrixHeader: Row = [
     'Line #',
     'SKU',
     'Description',
@@ -340,10 +363,10 @@ export function buildComparativeStatementWorkbook(params: {
     ),
   ];
 
-  const matrixRows: (string | number | { f: string })[][] = [matrixHeader];
+  const matrixRows: Row[] = [matrixHeader];
   rfq.items.forEach((item, idx) => {
     const rowIdx = idx + 2;
-    const unitCols = rankedQuotes.map((rk) => {
+    const unitCols: Cell[] = rankedQuotes.map((rk) => {
       const l = rk.quotation.lines.find(
         (ql) => ql.rfqItemId === item.id && ql.matchStatus !== 'unmapped'
       );
@@ -352,9 +375,9 @@ export function buildComparativeStatementWorkbook(params: {
       }
       return l.normalizedUnitLanded;
     });
-    const extCols = rankedQuotes.map((_, qIdx) => {
-      const colLetter = XLSX.utils.encode_col(6 + qIdx);
-      return { f: `IF(ISNUMBER(${colLetter}${rowIdx}), D${rowIdx}*${colLetter}${rowIdx}, 0)` };
+    const extCols: Cell[] = rankedQuotes.map((_, qIdx) => {
+      const colLetter = encodeColLetter(6 + qIdx);
+      return formulaCell(`IF(ISNUMBER(${colLetter}${rowIdx}), D${rowIdx}*${colLetter}${rowIdx}, 0)`);
     });
     matrixRows.push([
       item.lineNo,
@@ -391,11 +414,8 @@ export function buildComparativeStatementWorkbook(params: {
     }
   }
 
-  const wsMatrix = XLSX.utils.aoa_to_sheet(matrixRows);
-  XLSX.utils.book_append_sheet(wb, wsMatrix, 'Line_Matrix');
-
   // Sheet 3: Exceptions
-  const exceptionRows: string[][] = [
+  const exceptionRows: SheetData = [
     ['Supplier', 'Line #', 'Issue Type', 'Detail', 'Source Trace'],
   ];
   for (const rk of rankedQuotes) {
@@ -457,10 +477,8 @@ export function buildComparativeStatementWorkbook(params: {
       }
     }
   }
-  const wsExceptions = XLSX.utils.aoa_to_sheet(exceptionRows);
-  XLSX.utils.book_append_sheet(wb, wsExceptions, 'Exceptions');
 
-  const auditRows = [
+  const auditRows: SheetData = [
     ['Timestamp', 'Actor', 'Role', 'Action', 'Detail'],
     ...auditLogs.slice(0, 40).map((a) => [
       a.createdAt,
@@ -470,20 +488,48 @@ export function buildComparativeStatementWorkbook(params: {
       sanitizeSpreadsheetCell(a.detail),
     ]),
   ];
-  const wsAudit = XLSX.utils.aoa_to_sheet(auditRows);
-  XLSX.utils.book_append_sheet(wb, wsAudit, 'Audit_Log');
 
-  return wb;
+  const sheets: Sheet<Blob>[] = [
+    { sheet: 'Summary', data: summaryRows },
+    { sheet: 'Line_Matrix', data: matrixRows },
+    { sheet: 'Exceptions', data: exceptionRows },
+    { sheet: 'Audit_Log', data: auditRows },
+  ];
+
+  const toBlob = () => writeXlsxFile(sheets).toBlob();
+
+  return {
+    sheetNames: ['Summary', 'Line_Matrix', 'Exceptions', 'Audit_Log'],
+    sheets,
+    toBlob,
+    toUint8Array: async () => {
+      const blob = await toBlob();
+      return new Uint8Array(await blob.arrayBuffer());
+    },
+  };
 }
 
-export function exportComparativeStatementExcel(params: {
+export async function exportComparativeStatementExcel(params: {
   rfq: Rfq;
   quotes: Quotation[];
   suppliers: Supplier[];
   settings: OrganizationSettings;
   auditLogs: AuditLogEntry[];
   award?: AwardDecision;
-}) {
+}): Promise<void> {
   const wb = buildComparativeStatementWorkbook(params);
-  XLSX.writeFile(wb, `${params.rfq.rfqNumber}_Comparative_Statement.xlsx`);
+  const blob = await wb.toBlob();
+  const filename = `${params.rfq.rfqNumber}_Comparative_Statement.xlsx`;
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.style.display = 'none';
+  document.body.appendChild(anchor);
+  try {
+    anchor.click();
+  } finally {
+    document.body.removeChild(anchor);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
 }

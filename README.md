@@ -2,7 +2,7 @@
 
 **NORUS QUOTEFLOW** is a multi-tenant B2B Pre-PO supplier quotation extraction, commercial normalization, landed-cost comparison, and historical price-intelligence SaaS platform built for small-to-medium manufacturing and trading teams.
 
-It ingests non-standard vendor quotations across PDF, Excel (`.xlsx`/`.xls`), CSV, image scans (PNG/JPG/WEBP), and pasted email or WhatsApp text, pairs AI structured extraction (`@google/genai`) with deterministic server-side arithmetic auditing, and lets authenticated teams compare normalized landed unit costs inside strictly isolated organization workspaces.
+It ingests non-standard vendor quotations across PDF, Excel (`.xlsx` and UTF-8 text-table `.xls`; binary `.xls` returns clear `415` save-as-`.xlsx`/`.csv` guidance), CSV, image scans (PNG/JPG/WEBP), and pasted email or WhatsApp text, pairs AI structured extraction (`@google/genai`) with deterministic server-side arithmetic auditing, and lets authenticated teams compare normalized landed unit costs inside strictly isolated organization workspaces.
 
 > **Temporary Demo Mode Notice (Task 006 / Hardened in Task 007):** In development/test (`NODE_ENV !== "production"`), unless `DEMO_MODE="false"`, the web UI opens directly into an **isolated synthetic demo workspace** (`Meridian Industrial Demo Works (Sample)`) with zero Cloud SQL access, bounded in-memory demo rate limiting, and genuine synthetic PDF/Excel quotation previews. In **production (`NODE_ENV === "production"`)**, `DEMO_MODE` is strictly **OFF (`false`) by default** and the server **fails closed on startup** if `DEMO_MODE=true` is set, restoring full authentication (`Google Sign-In` + `Email/Password`), registration, and multi-tenant PostgreSQL workspaces (`org-kalyani-hydraulics` remains untouched and locked behind authentication).
 
@@ -27,7 +27,7 @@ It ingests non-standard vendor quotations across PDF, Excel (`.xlsx`/`.xls`), CS
 
 ## Tech Stack
 
-- **Frontend:** React 19, TypeScript, Vite 8, Tailwind CSS v4, Lucide Icons, Firebase Client SDK (`GoogleAuthProvider`), `jspdf`, `jspdf-autotable`, `xlsx` *(browser exports; staged replacement planned in [Security Posture](docs/SECURITY.md))*
+- **Frontend:** React 19, TypeScript, Vite 8, Tailwind CSS v4, Lucide Icons, Firebase Client SDK (`GoogleAuthProvider`), `jspdf`, `jspdf-autotable`, `write-excel-file` (`4.1.1`)
 - **Backend:** Express 4 (`server.ts`), Drizzle ORM + PostgreSQL (`pg`), `firebase-admin`, Multer 2, `@google/genai` (`gemini-4-hydrogen`), `tsx`
 - **Database:** Cloud SQL PostgreSQL 18.6 (`asia-southeast1`) with 17 relational tables (`src/db/schema.ts`), Drizzle migrations (`drizzle/`), and atomic PostgreSQL rate-limiting (`rate_limit_buckets`)
 - **Object Storage:** AWS SigV4 S3-compatible provider (`Cloudflare R2` / `S3` / `MinIO`) or private local filesystem storage (`server/objectStorage.ts`)

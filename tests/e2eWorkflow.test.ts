@@ -1,6 +1,5 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
-import * as XLSX from 'xlsx';
 import {
   buildComparativeStatementPdfDoc,
   buildComparativeStatementWorkbook,
@@ -546,8 +545,8 @@ test(
       auditLogs: wsAfter.auditLogs,
       award: awardRecord,
     });
-    assert.deepEqual(wb.SheetNames, ['Summary', 'Line_Matrix', 'Exceptions', 'Audit_Log']);
-    const xlsxBuf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
+    assert.deepEqual(wb.sheetNames, ['Summary', 'Line_Matrix', 'Exceptions', 'Audit_Log']);
+    const xlsxBuf = Buffer.from(await wb.toUint8Array());
     assert.ok(xlsxBuf.byteLength > 1000);
 
     const pdfDoc = buildComparativeStatementPdfDoc({

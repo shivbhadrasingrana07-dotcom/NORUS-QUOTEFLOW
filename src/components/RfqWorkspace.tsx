@@ -424,16 +424,16 @@ export function RfqWorkspace({
 
         <div className="flex items-center gap-2 shrink-0">
           <button
-            onClick={() =>
-              exportComparativeStatementExcel({
+            onClick={() => {
+              void exportComparativeStatementExcel({
                 rfq,
                 quotes,
                 suppliers,
                 settings,
                 auditLogs,
                 award: activeAward || undefined,
-              })
-            }
+              });
+            }}
             disabled={quotes.length === 0}
             className="px-3 py-2 text-xs font-medium text-[#0F172A] bg-white border border-[#E2E8F0] rounded-lg hover:bg-[#F8FAFC] disabled:opacity-40 whitespace-nowrap flex items-center gap-1.5"
           >
@@ -646,7 +646,7 @@ export function RfqWorkspace({
                       Click to choose quotation document
                     </div>
                     <div className="text-[11px] text-[#475569] mt-1">
-                      Supports PDF, XLSX, XLS, CSV, PNG, JPG up to 25 MB
+                      Supports PDF, XLSX, CSV, text-table XLS, PNG, JPG up to 25 MB (save binary .xls as .xlsx)
                     </div>
                   </>
                 )}
@@ -819,16 +819,16 @@ export function RfqWorkspace({
               award: activeAward || undefined,
             })
           }
-          onExportExcel={() =>
-            exportComparativeStatementExcel({
+          onExportExcel={() => {
+            void exportComparativeStatementExcel({
               rfq,
               quotes,
               suppliers,
               settings,
               auditLogs,
               award: activeAward || undefined,
-            })
-          }
+            });
+          }}
         />
       )}
 
@@ -1240,16 +1240,16 @@ export function RfqWorkspace({
                 <span>Download Landscape A4 CS PDF</span>
               </button>
               <button
-                onClick={() =>
-                  exportComparativeStatementExcel({
+                onClick={() => {
+                  void exportComparativeStatementExcel({
                     rfq,
                     quotes,
                     suppliers,
                     settings,
                     auditLogs,
                     award: activeAward || undefined,
-                  })
-                }
+                  });
+                }}
                 disabled={quotes.length === 0}
                 className="w-full px-4 py-2.5 text-xs font-medium text-[#0F172A] bg-white border border-[#E2E8F0] rounded-lg hover:bg-[#F8FAFC] disabled:opacity-40 flex items-center justify-center gap-2"
               >

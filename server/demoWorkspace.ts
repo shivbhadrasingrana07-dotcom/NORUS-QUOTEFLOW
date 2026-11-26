@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
-import * as XLSX from 'xlsx';
+import writeXlsxFile from 'write-excel-file/node';
 import type {
   AuditLogEntry,
   AwardAllocation,
@@ -66,6 +66,7 @@ export interface DemoStoredDocument {
   buffer: Buffer;
   createdAt: string;
   isSeedSample?: boolean;
+  resolveBuffer?: () => Promise<Buffer>;
 }
 
 interface DemoSeedDocTemplate {
@@ -74,6 +75,7 @@ interface DemoSeedDocTemplate {
   mimeType: string;
   buffer: Buffer;
   createdAt: string;
+  resolveBuffer?: () => Promise<Buffer>;
 }
 
 interface DemoSessionState {
@@ -194,19 +196,18 @@ function buildSampleSupplierPdfBuffer(params: {
   return buffer;
 }
 
-function buildSampleExcelBuffer(
+async function buildSampleExcelBuffer(
   cacheKey: string,
   sheets: Array<{ sheetName: string; rows: string[][] }>
-): Buffer {
+): Promise<Buffer> {
   const cached = sampleXlsxCache.get(cacheKey);
   if (cached) return cached;
 
-  const wb = XLSX.utils.book_new();
-  for (const sheet of sheets) {
-    const ws = XLSX.utils.aoa_to_sheet(sheet.rows);
-    XLSX.utils.book_append_sheet(wb, ws, sheet.sheetName);
-  }
-  const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
+  const xlsxSheets = sheets.map((s) => ({
+    sheet: s.sheetName,
+    data: s.rows.map((row) => row.map((cell) => (cell === '' ? null : cell))),
+  }));
+  const buffer = await writeXlsxFile(xlsxSheets).toBuffer();
   sampleXlsxCache.set(cacheKey, buffer);
   return buffer;
 }
@@ -855,10 +856,7 @@ function createSyntheticDemoRfqAndQuotes(suffix = ''): {
     rfq,
     quote: q1Norm,
   });
-  const q2XlsxBuf = buildSampleExcelBuffer(
-    'vanguard-offer-26-88',
-    q2Norm.sheetPreview || []
-  );
+  const q2PreviewSheets = q2Norm.sheetPreview || [];
 
   return {
     rfq,
@@ -875,7 +873,8 @@ function createSyntheticDemoRfqAndQuotes(suffix = ''): {
         id: q2DocId,
         originalFilename: q2Norm.documentName,
         mimeType: q2Norm.mimeType,
-        buffer: q2XlsxBuf,
+        buffer: sampleXlsxCache.get('vanguard-offer-26-88') ?? Buffer.alloc(0),
+        resolveBuffer: () => buildSampleExcelBuffer('vanguard-offer-26-88', q2PreviewSheets),
         createdAt: q2Norm.createdAt,
       },
     ],
@@ -1533,6 +1532,7 @@ export class DemoWorkspaceStore {
         buffer: d.buffer,
         createdAt: d.createdAt,
         isSeedSample: true,
+        resolveBuffer: d.resolveBuffer,
       });
     }
     const created: DemoSessionState = {
@@ -1769,6 +1769,7 @@ export class DemoWorkspaceStore {
         buffer: d.buffer,
         createdAt: d.createdAt,
         isSeedSample: true,
+        resolveBuffer: d.resolveBuffer,
       });
     }
     session.workspace.rfqs.unshift(sample.rfq);
@@ -1936,10 +1937,15 @@ export class DemoWorkspaceStore {
     return structuredClone(toSave);
   }
 
-  getDocument(sessionId: string, docId: string): DemoStoredDocument | null {
+  async getDocument(sessionId: string, docId: string): Promise<DemoStoredDocument | null> {
     const session = this.getExistingSession(sessionId);
     if (!session) return null;
-    return session.documents.get(docId) ?? null;
+    const doc = session.documents.get(docId) ?? null;
+    if (!doc) return null;
+    if (doc.buffer.byteLength === 0 && doc.resolveBuffer) {
+      doc.buffer = await doc.resolveBuffer();
+    }
+    return doc;
   }
 
   updateQuotationHeader(

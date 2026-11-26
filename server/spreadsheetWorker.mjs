@@ -1,4 +1,4 @@
-import * as XLSX from 'xlsx';
+import readXlsxFile from 'read-excel-file/node';
 import { pathToFileURL } from 'node:url';
 
 export const MAX_SPREADSHEET_BYTES = 10 * 1024 * 1024; // 10 MB
@@ -34,15 +34,14 @@ export function colIndexToLetter(index) {
   return letter;
 }
 
-function formatCellValue(cell) {
-  if (!cell || typeof cell !== 'object') return '';
+function formatParsedCellValue(value) {
+  if (value === null || value === undefined) return '';
   let text = '';
-  if (typeof cell.w === 'string' && cell.w.trim()) {
-    text = cell.w;
-  } else if (cell.v instanceof Date && !Number.isNaN(cell.v.getTime())) {
-    text = cell.v.toISOString().slice(0, 10);
-  } else if (cell.v !== undefined && cell.v !== null) {
-    text = String(cell.v);
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) return '';
+    text = value.toISOString().slice(0, 10);
+  } else {
+    text = String(value);
   }
   const trimmed = text.trim();
   if (!trimmed) return '';
@@ -430,7 +429,7 @@ function buildSheetOutput(sheetName, rows) {
   return cellLines.join('\n');
 }
 
-export function parseSpreadsheetHardened(buffer, options = {}) {
+export async function parseSpreadsheetHardened(buffer, options = {}) {
   if (!Buffer.isBuffer(buffer) || buffer.byteLength === 0) {
     throw new SpreadsheetSecurityError('Uploaded spreadsheet file is empty.', 400);
   }
@@ -481,6 +480,10 @@ export function parseSpreadsheetHardened(buffer, options = {}) {
     inspectXlsxZipContainer(buffer);
   } else if (isOle2Buffer(buffer)) {
     inspectOle2Container(buffer);
+    throw new SpreadsheetSecurityError(
+      'Legacy binary Excel (.xls BIFF5/BIFF8) workbooks are not supported. Please save the quotation as .xlsx or .csv (plain UTF-8 text-table .xls exports remain supported).',
+      415
+    );
   } else {
     // Plain UTF-8 text without CSV filename extension (e.g. text-table .xls export)
     const sample = buffer.subarray(0, Math.min(buffer.length, 4096));
@@ -508,18 +511,9 @@ export function parseSpreadsheetHardened(buffer, options = {}) {
     };
   }
 
-  let workbook;
+  let sheets;
   try {
-    workbook = XLSX.read(buffer, {
-      type: 'buffer',
-      cellFormula: false,
-      cellHTML: false,
-      cellStyles: false,
-      cellNF: false,
-      cellDates: true,
-      bookVBA: false,
-      sheetRows: MAX_PARSED_ROWS + 2,
-    });
+    sheets = await readXlsxFile(buffer, { trim: true });
   } catch (err) {
     throw new SpreadsheetSecurityError(
       `Unable to parse spreadsheet file: ${err instanceof Error ? err.message : 'Invalid format'}`,
@@ -527,12 +521,12 @@ export function parseSpreadsheetHardened(buffer, options = {}) {
     );
   }
 
-  if (!Array.isArray(workbook.SheetNames) || workbook.SheetNames.length === 0) {
+  if (!Array.isArray(sheets) || sheets.length === 0) {
     throw new SpreadsheetSecurityError('Spreadsheet workbook contains no readable worksheets.', 422);
   }
-  if (workbook.SheetNames.length > MAX_WORKSHEETS) {
+  if (sheets.length > MAX_WORKSHEETS) {
     throw new SpreadsheetSecurityError(
-      `Spreadsheet contains ${workbook.SheetNames.length} worksheets, exceeding limit of ${MAX_WORKSHEETS}.`,
+      `Spreadsheet contains ${sheets.length} worksheets, exceeding limit of ${MAX_WORKSHEETS}.`,
       422
     );
   }
@@ -541,82 +535,71 @@ export function parseSpreadsheetHardened(buffer, options = {}) {
   const textBlocks = [];
   let totalPopulatedCells = 0;
 
-  for (const sheetName of workbook.SheetNames) {
-    if (typeof sheetName !== 'string' || !Object.hasOwn(workbook.Sheets, sheetName)) continue;
-    const sheet = workbook.Sheets[sheetName];
-    if (!sheet || typeof sheet !== 'object') continue;
+  for (const sheetEntry of sheets) {
+    if (!sheetEntry || typeof sheetEntry.sheet !== 'string' || !Array.isArray(sheetEntry.data)) {
+      continue;
+    }
+    const sheetName = sheetEntry.sheet;
+    const rawRows = sheetEntry.data;
 
-    const cellKeys = Object.keys(sheet).filter((k) => !k.startsWith('!'));
-    if (cellKeys.length > MAX_CELLS_PER_SHEET * 2) {
+    if (rawRows.length > MAX_PARSED_ROWS) {
       throw new SpreadsheetSecurityError(
-        `Worksheet "${sheetName}" exceeds maximum cell complexity (${MAX_CELLS_PER_SHEET} cells).`,
+        `Worksheet "${sheetName}" exceeds maximum ${MAX_PARSED_ROWS} rows per sheet.`,
         422
       );
     }
 
-    const rowMap = new Map();
-    let maxRowIdx = -1;
+    const rowCells = [];
     let maxColIdx = -1;
     let sheetPopulatedCells = 0;
 
-    for (const key of cellKeys) {
-      if (!Object.hasOwn(sheet, key)) continue;
-      const val = formatCellValue(sheet[key]);
-      if (!val) continue;
-      const decoded = decodeCellAddress(key);
-      if (!decoded) {
-        continue;
-      }
-      if (decoded.r >= MAX_PARSED_ROWS) {
-        throw new SpreadsheetSecurityError(
-          `Worksheet "${sheetName}" exceeds maximum ${MAX_PARSED_ROWS} rows per sheet.`,
-          422
-        );
-      }
-      if (decoded.c >= MAX_PARSED_COLS) {
-        throw new SpreadsheetSecurityError(
-          `Worksheet "${sheetName}" exceeds maximum ${MAX_PARSED_COLS} columns per sheet.`,
-          422
-        );
+    for (let rIdx = 0; rIdx < rawRows.length; rIdx += 1) {
+      const rawRow = rawRows[rIdx];
+      if (!Array.isArray(rawRow) || rawRow.length === 0) continue;
+
+      const formattedRow = new Map();
+      for (let cIdx = 0; cIdx < rawRow.length; cIdx += 1) {
+        const val = formatParsedCellValue(rawRow[cIdx]);
+        if (!val) continue;
+
+        if (cIdx >= MAX_PARSED_COLS) {
+          throw new SpreadsheetSecurityError(
+            `Worksheet "${sheetName}" exceeds maximum ${MAX_PARSED_COLS} columns per sheet.`,
+            422
+          );
+        }
+
+        sheetPopulatedCells += 1;
+        totalPopulatedCells += 1;
+        if (sheetPopulatedCells > MAX_CELLS_PER_SHEET) {
+          throw new SpreadsheetSecurityError(
+            `Worksheet "${sheetName}" exceeds maximum ${MAX_CELLS_PER_SHEET} populated cells.`,
+            422
+          );
+        }
+        if (totalPopulatedCells > MAX_TOTAL_CELLS) {
+          throw new SpreadsheetSecurityError(
+            `Workbook exceeds maximum ${MAX_TOTAL_CELLS} total populated cells.`,
+            422
+          );
+        }
+
+        if (cIdx > maxColIdx) maxColIdx = cIdx;
+        formattedRow.set(cIdx, val);
       }
 
-      sheetPopulatedCells += 1;
-      totalPopulatedCells += 1;
-      if (sheetPopulatedCells > MAX_CELLS_PER_SHEET) {
-        throw new SpreadsheetSecurityError(
-          `Worksheet "${sheetName}" exceeds maximum ${MAX_CELLS_PER_SHEET} populated cells.`,
-          422
-        );
+      if (formattedRow.size > 0) {
+        rowCells.push(formattedRow);
       }
-      if (totalPopulatedCells > MAX_TOTAL_CELLS) {
-        throw new SpreadsheetSecurityError(
-          `Workbook exceeds maximum ${MAX_TOTAL_CELLS} total populated cells.`,
-          422
-        );
-      }
-
-      if (decoded.r > maxRowIdx) maxRowIdx = decoded.r;
-      if (decoded.c > maxColIdx) maxColIdx = decoded.c;
-
-      let colsForRow = rowMap.get(decoded.r);
-      if (!colsForRow) {
-        colsForRow = new Map();
-        rowMap.set(decoded.r, colsForRow);
-      }
-      colsForRow.set(decoded.c, val);
     }
 
-    if (sheetPopulatedCells === 0 || maxColIdx < 0 || maxRowIdx < 0) continue;
+    if (sheetPopulatedCells === 0 || maxColIdx < 0 || rowCells.length === 0) continue;
 
     const colCount = maxColIdx + 1;
-    const sortedRowIndices = Array.from(rowMap.keys()).sort((a, b) => a - b);
-    const nonEmptyRows = sortedRowIndices.map((rIdx) => {
+    const nonEmptyRows = rowCells.map((colsForRow) => {
       const arr = new Array(colCount).fill('');
-      const colsForRow = rowMap.get(rIdx);
-      if (colsForRow) {
-        for (const [cIdx, val] of colsForRow.entries()) {
-          arr[cIdx] = val;
-        }
+      for (const [cIdx, val] of colsForRow.entries()) {
+        arr[cIdx] = val;
       }
       return arr;
     });
@@ -659,11 +642,11 @@ if (isMain) {
     }
     chunks.push(chunk);
   });
-  process.stdin.on('end', () => {
+  process.stdin.on('end', async () => {
     try {
       const payload = JSON.parse(chunks.join(''));
       const buf = Buffer.from(String(payload.base64 || ''), 'base64');
-      const result = parseSpreadsheetHardened(buf, {
+      const result = await parseSpreadsheetHardened(buf, {
         documentName: payload.documentName,
         mimeType: payload.mimeType,
       });

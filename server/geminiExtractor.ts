@@ -81,12 +81,12 @@ export interface ParsedSpreadsheetResult {
   sheetPreview: { sheetName: string; rows: string[][] }[];
 }
 
-export function parseSpreadsheetBuffer(
+export async function parseSpreadsheetBuffer(
   buffer: Buffer,
   options?: { documentName?: string; mimeType?: string }
-): ParsedSpreadsheetResult {
+): Promise<ParsedSpreadsheetResult> {
   try {
-    return parseSpreadsheetHardened(buffer, options);
+    return await parseSpreadsheetHardened(buffer, options);
   } catch (err) {
     if (err instanceof SpreadsheetSecurityError) {
       throw new ExtractionServiceError(err.message, err.statusCode);

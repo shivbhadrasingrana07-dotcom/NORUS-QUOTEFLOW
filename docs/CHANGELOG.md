@@ -1,5 +1,13 @@
 # Changelog
 
+## Task 013 — Spreadsheet Dependency Remediation & Compatibility
+
+### Remediated & Verified
+- **Complete `xlsx@0.18.5` Removal (`package.json`, `package-lock.json`):** Uninstalled `xlsx@0.18.5` and all `21` SheetJS transitive packages (`npm ls xlsx` -> `(empty)`, zero SheetJS entries in `package-lock.json` or `dist/`). Reduced `npm audit --json` from `9` (`5` high, `4` moderate) to `8` (`4` high in unreachable `firebase -> @grpc/grpc-js`, `4` moderate in CLI-only `drizzle-kit -> esbuild`, `0` critical, `0` direct `fixAvailable: false`). Verified clean isolated `npm ci` (`added 419 packages`, `426` audited, exit `0`).
+- **OOXML Ingestion Migration (`server/spreadsheetWorker.mjs`, `server/geminiExtractor.ts`):** Replaced `xlsx` binary reads with `read-excel-file@9.3.20` (`read-excel-file/node`, XXE-immune `saxen` streaming SAX XML parser) inside the `128 MB / 5s` env-stripped child process (`MAX_WORKSHEETS = 12`, `MAX_PARSED_ROWS = 250`, `MAX_PARSED_COLS = 30`, `MAX_CELLS_PER_SHEET = 5000`, `MAX_TOTAL_CELLS = 15000`), preserving `inspectXlsxZipContainer()`, native RFC-4180 CSV/TSV/UTF-8 text-`.xls` parsing, and `inspectOle2Container()`. Clean binary OLE2 `.xls` uploads now return a clear structured `415` guiding users to save as `.xlsx` or `.csv`.
+- **Comparative Statement & Demo `.xlsx` Export Migration (`src/lib/exporters.ts`, `server/demoWorkspace.ts`, `server.ts`, `src/components/RfqWorkspace.tsx`):** Replaced `xlsx` writes with `write-excel-file@4.1.1` (`write-excel-file/universal` in browser exporters with ECMA-376 `<f>` `MAX`/`MIN`/`IF(ISNUMBER(...))` formulas and `write-excel-file/node` cached asynchronously via `DemoWorkspaceStore.getDocument()`), and updated upload helper guidance in `RfqWorkspace.tsx`.
+- **Regression, Security & Runtime Verification (`tests/exporters.test.ts`, `tests/extractionValidation.test.ts`, `tests/demoWorkspace.test.ts`, `tests/e2eWorkflow.test.ts`):** Added tests covering multi-sheet/empty/date/boolean/blank/prototype-key `.xlsx` parsing, XXE immunity (`<!ENTITY ... SYSTEM "file:///etc/passwd">`), malformed OOXML XML `422`, worker timeout boundary (`422`), ECMA-376 `<f>` formula verification via `fflate`, UTF-8 text-`.xls` HTTP `201` upload, and binary OLE2 `.xls` HTTP `415` rejection (`npm run lint`: `0` errors; `npm run build`: `2.45s`; `npm test`: `47` pass, `0` fail, `13` skipped).
+
 ## Task 012 — Production Readiness Assessment & Safe Cutover Planning
 
 ### Assessed & Documented

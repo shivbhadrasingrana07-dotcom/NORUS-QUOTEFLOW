@@ -114,7 +114,7 @@ Creates a supplier profile with per-organization duplicate name/Tax ID protectio
 Adds a catalog item to the organization's Item Price Memory.
 
 ### `POST /api/rfqs/:rfqId/quotes/extract` *(`quotation:extract` + `extractRateLimiter`)*
-Accepts `multipart/form-data` (`supplierId`, optional `file`, optional `rawEmailText`), validates file magic bytes (`PDF`, `XLSX`, `XLS`, `CSV`, `PNG`, `JPG`, `WEBP`; max 25 MB), extracts fields via `geminiExtractor.ts`, uploads any binary file to private object storage (`stored_documents` + `documentId`), computes normalized landed costs, and returns `201 Created`.
+Accepts `multipart/form-data` (`supplierId`, optional `file`, optional `rawEmailText`), validates file magic bytes (`PDF`, `XLSX`, `XLS` [UTF-8 delimited text tables accepted; legacy binary OLE2 `.xls` rejected with structured `415` save-as-`.xlsx`/`.csv` guidance], `CSV`, `PNG`, `JPG`, `WEBP`; max 25 MB), extracts fields via `geminiExtractor.ts`, uploads any binary file to private object storage (`stored_documents` + `documentId`), computes normalized landed costs, and returns `201 Created`.
 
 ### `PATCH /api/quotations/:quoteId`, `PATCH /api/quotations/:quoteId/lines/:lineId`, `POST /api/quotations/:quoteId/verify`, `DELETE /api/quotations/:quoteId`
 - Edit requires `quotation:edit` and rejects (`409 Conflict`) quotes referenced by a `pending` or `approved` award; header/line edits clear `isVerified` / `verifiedBy` / `verifiedAt` (and `verifiedField` when changing `matchStatus` away from `alternate_spec`) and validate non-empty `quoteReference`, integer `leadTimeDays`, and strict 4-value `matchStatus` (`400`).

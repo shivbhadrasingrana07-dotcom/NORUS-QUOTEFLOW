@@ -5,7 +5,8 @@ import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { after, describe, it } from 'node:test';
-import * as XLSX from 'xlsx';
+import readXlsxFile from 'read-excel-file/node';
+import writeXlsxFile from 'write-excel-file/node';
 import { createApp, resolveDemoMode } from '../server.ts';
 import { DevOutboxEmailProvider } from '../server/emailService.ts';
 import { LocalPrivateStorageProvider } from '../server/objectStorage.ts';
@@ -581,13 +582,11 @@ describe('Task 006/007: Temporary No-Login Demo Workspace & Security Isolation',
     );
     const q2Bytes = Buffer.from(await (await fetch(`${srv.baseUrl}${q2Signed.url}`)).arrayBuffer());
     assert.equal(q2Bytes.subarray(0, 2).toString('ascii'), 'PK');
-    const parsedBook = XLSX.read(q2Bytes, { type: 'buffer' });
-    assert.ok(parsedBook.SheetNames.includes('Demo_Offer'));
-    const sheetRows = XLSX.utils.sheet_to_json<string[]>(parsedBook.Sheets['Demo_Offer'], {
-      header: 1,
-    });
-    assert.equal(sheetRows[1][1], 'Ball Valve DN50 SS316L Flanged');
-    assert.equal(String(sheetRows[3][5]), '10400.00');
+    const parsedSheets = await readXlsxFile(q2Bytes);
+    const demoOfferSheet = parsedSheets.find((s) => s.sheet === 'Demo_Offer');
+    assert.ok(demoOfferSheet, 'Parsed XLSX must include Demo_Offer sheet');
+    assert.equal(demoOfferSheet.data[1][1], 'Ball Valve DN50 SS316L Flanged');
+    assert.equal(String(demoOfferSheet.data[3][5]), '10400.00');
 
     // Verify UOM pack-of-20 normalization on q1 line 2 (20 packs * 20 pcs = 400 pcs, 980/pack = 49/pc base + pro-rata overhead)
     assert.equal(q1.lines[1].uomConversionFactor, 20);
@@ -649,11 +648,12 @@ describe('Task 006/007: Temporary No-Login Demo Workspace & Security Isolation',
       auditLogs: ws.auditLogs,
       award: existingAward,
     });
-    assert.deepEqual(wb.SheetNames, ['Summary', 'Line_Matrix', 'Exceptions', 'Audit_Log']);
-    const matrixRows = XLSX.utils.sheet_to_json<string[]>(wb.Sheets['Line_Matrix'], {
-      header: 1,
-    });
-    assert.ok(matrixRows.some((r) => r.includes('AWARD ALLOCATION')));
+    assert.deepEqual(wb.sheetNames, ['Summary', 'Line_Matrix', 'Exceptions', 'Audit_Log']);
+    const csBytes = Buffer.from(await wb.toUint8Array());
+    const parsedCs = await readXlsxFile(csBytes);
+    const matrixSheet = parsedCs.find((s) => s.sheet === 'Line_Matrix');
+    assert.ok(matrixSheet);
+    assert.ok(matrixSheet.data.some((r) => r.includes('AWARD ALLOCATION')));
 
     const pdfDoc = buildComparativeStatementPdfDoc({
       rfq: awardedRfq,
@@ -904,16 +904,13 @@ describe('Task 006/007: Temporary No-Login Demo Workspace & Security Isolation',
     const jsonHeaders = { 'X-Demo-Session': sessId, 'Content-Type': 'application/json' };
 
     // 1. Upload an XLSX container smuggling xl/vbaProject.bin -> rejected 415 by isolated spreadsheet worker
-    const cleanBook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(
-      cleanBook,
-      XLSX.utils.aoa_to_sheet([
+    const cleanBuf = await writeXlsxFile(
+      [
         ['Item', 'Qty', 'Rate', 'Amount'],
         ['CNC Valve', '10', '100', '1000'],
-      ]),
-      'Offer'
-    );
-    const cleanBuf = XLSX.write(cleanBook, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
+      ],
+      { sheet: 'Offer' }
+    ).toBuffer();
 
     // Append synthetic xl/vbaProject.bin local + central directory entry or craft minimal Stored ZIP with xl/vbaProject.bin
     const crcTable = new Uint32Array(256);
@@ -986,6 +983,43 @@ describe('Task 006/007: Temporary No-Login Demo Workspace & Security Isolation',
       { method: 'POST', headers, body: macroForm }
     );
     assert.equal(macroRes.status, 415);
+
+    // 1b. Upload clean binary OLE2 .xls -> rejected 415 with actionable .xlsx guidance; plain UTF-8 text-table .xls -> 201
+    const cleanOle2Xls = Buffer.alloc(1024);
+    Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]).copy(cleanOle2Xls, 0);
+    cleanOle2Xls.writeUInt16LE(0xfffe, 28);
+    cleanOle2Xls.writeUInt16LE(9, 30);
+    const ole2Form = new FormData();
+    ole2Form.append('supplierId', 'sup-demo-1');
+    ole2Form.append(
+      'file',
+      new Blob([new Uint8Array(cleanOle2Xls)], { type: 'application/vnd.ms-excel' }),
+      'legacy-biff.xls'
+    );
+    const ole2Res = await fetch(
+      `${srv.baseUrl}/api/demo-workspace/rfqs/demo-rfq-2026-101/quotes/extract`,
+      { method: 'POST', headers, body: ole2Form }
+    );
+    assert.equal(ole2Res.status, 415);
+    const ole2Body = (await ole2Res.json()) as { error?: string };
+    assert.match(ole2Body.error ?? '', /save the quotation as \.xlsx or \.csv/i);
+
+    const textXlsForm = new FormData();
+    textXlsForm.append('supplierId', 'sup-demo-1');
+    textXlsForm.append(
+      'file',
+      new Blob(['Item,Qty,UOM,Rate\nPrecision Alloy Strip Coil,10,kg,495\n'], {
+        type: 'application/vnd.ms-excel',
+      }),
+      'erp-export.xls'
+    );
+    const textXlsRes = await fetch(
+      `${srv.baseUrl}/api/demo-workspace/rfqs/demo-rfq-2026-101/quotes/extract`,
+      { method: 'POST', headers, body: textXlsForm }
+    );
+    assert.equal(textXlsRes.status, 201);
+    const textXlsBody = (await textXlsRes.json()) as Quotation;
+    assert.ok(textXlsBody.sheetPreview && textXlsBody.sheetPreview.length >= 1);
 
     // 2. Verify precision boundary (0.1% drift rejected 400) & multi-supplier split on one item (201)
     const rfqRes = await fetch(`${srv.baseUrl}/api/demo-workspace/rfqs`, {

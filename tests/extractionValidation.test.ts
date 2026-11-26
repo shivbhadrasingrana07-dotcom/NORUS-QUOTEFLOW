@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import * as XLSX from 'xlsx';
+import writeXlsxFile, { type SheetData } from 'write-excel-file/node';
+import { zipSync, strToU8 } from 'fflate';
 import { validateUploadedFile, sanitizeFilename } from '../server/fileSecurity.ts';
 import {
   buildQuotationFromExtraction,
@@ -64,20 +65,28 @@ test('validateUploadedFile enforces magic-byte verification and blocks dangerous
   if (!empty.ok) assert.equal(empty.status, 400);
 });
 
-test('parseSpreadsheetBuffer extracts cell coordinates from XLSX and CSV', () => {
-  const wb = XLSX.utils.book_new();
-  const ws = XLSX.utils.aoa_to_sheet([
-    ['Item', 'Qty', 'UOM', 'Rate', 'Total'],
-    ['Hydraulic Manifold', 60, 'pcs', 2400, 144000],
+async function makeXlsxBuffer(
+  sheets: Array<{ sheet: string; data: SheetData; dateFormat?: string }>
+): Promise<Buffer> {
+  return writeXlsxFile(sheets).toBuffer();
+}
+
+test('parseSpreadsheetBuffer extracts cell coordinates from XLSX and CSV', async () => {
+  const xlsxBuf = await makeXlsxBuffer([
+    {
+      sheet: 'QuoteSheet',
+      data: [
+        ['Item', 'Qty', 'UOM', 'Rate', 'Total'],
+        ['Hydraulic Manifold', 60, 'pcs', 2400, 144000],
+      ],
+    },
   ]);
-  XLSX.utils.book_append_sheet(wb, ws, 'QuoteSheet');
-  const xlsxBuf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
 
   // Validate magic bytes on generated XLSX
   const valid = validateUploadedFile(xlsxBuf, 'vendor.xlsx', 'application/octet-stream');
   assert.equal(valid.ok, true);
 
-  const parsed = parseSpreadsheetBuffer(xlsxBuf);
+  const parsed = await parseSpreadsheetBuffer(xlsxBuf);
   assert.equal(parsed.sheetPreview.length, 1);
   assert.equal(parsed.sheetPreview[0].sheetName, 'QuoteSheet');
   assert.ok(parsed.structuredText.includes('A2: Hydraulic Manifold'));
@@ -166,13 +175,15 @@ test('extractQuotationWithGemini works offline with generateContentOverride and 
   const ws = createInitialWorkspaceState();
   const rfq = ws.rfqs[0];
 
-  const wb = XLSX.utils.book_new();
-  const sheet = XLSX.utils.aoa_to_sheet([
-    ['Item', 'Qty', 'Rate', 'Total'],
-    [rfq.items[0].description, 60, 2300, 149000], // Deliberate vendor math mismatch: 60*2300 = 138000 vs printed 149000
+  const xlsxBuffer = await makeXlsxBuffer([
+    {
+      sheet: 'Commercial',
+      data: [
+        ['Item', 'Qty', 'Rate', 'Total'],
+        [rfq.items[0].description, 60, 2300, 149000], // Deliberate vendor math mismatch: 60*2300 = 138000 vs printed 149000
+      ],
+    },
   ]);
-  XLSX.utils.book_append_sheet(wb, sheet, 'Commercial');
-  const xlsxBuffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
 
   let capturedModel = '';
   const extracted = await extractQuotationWithGemini({
@@ -371,32 +382,32 @@ test('Task 009: parses RFC-4180 CSV natively without evaluating formulas or invo
 
 test('Task 009: enforces worksheet, row, column limits, ZIP bomb compression ratio, macro rejection, and subprocess isolation', async () => {
   // 1. Excessive worksheets (> 12) -> 422
-  const manySheetsWb = XLSX.utils.book_new();
-  for (let i = 0; i < 13; i += 1) {
-    XLSX.utils.book_append_sheet(manySheetsWb, XLSX.utils.aoa_to_sheet([['A', i]]), `S${i + 1}`);
-  }
-  const manySheetsBuf = XLSX.write(manySheetsWb, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
-  assert.throws(
+  const manySheetsBuf = await makeXlsxBuffer(
+    Array.from({ length: 13 }, (_, i) => ({
+      sheet: `S${i + 1}`,
+      data: [['A', i]],
+    }))
+  );
+  await assert.rejects(
     () => parseSpreadsheetBuffer(manySheetsBuf),
     (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 422
   );
 
   // 2. Excessive rows (> 250) -> 422
-  const tooManyRowsData = Array.from({ length: 260 }, (_, idx) => [`Row ${idx + 1}`, idx + 1]);
-  const tooManyRowsWb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(tooManyRowsWb, XLSX.utils.aoa_to_sheet(tooManyRowsData), 'Sheet1');
-  const tooManyRowsBuf = XLSX.write(tooManyRowsWb, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
-  assert.throws(
+  const tooManyRowsData: SheetData = Array.from({ length: 260 }, (_, idx) => [
+    `Row ${idx + 1}`,
+    idx + 1,
+  ]);
+  const tooManyRowsBuf = await makeXlsxBuffer([{ sheet: 'Sheet1', data: tooManyRowsData }]);
+  await assert.rejects(
     () => parseSpreadsheetBuffer(tooManyRowsBuf),
     (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 422
   );
 
   // 3. Excessive columns (> 30) -> 422
   const wideRow = Array.from({ length: 32 }, (_, idx) => `C${idx}`);
-  const wideWb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wideWb, XLSX.utils.aoa_to_sheet([wideRow]), 'Sheet1');
-  const wideBuf = XLSX.write(wideWb, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
-  assert.throws(
+  const wideBuf = await makeXlsxBuffer([{ sheet: 'Sheet1', data: [wideRow] }]);
+  await assert.rejects(
     () => parseSpreadsheetBuffer(wideBuf),
     (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 422
   );
@@ -405,7 +416,7 @@ test('Task 009: enforces worksheet, row, column limits, ZIP bomb compression rat
   const zipBombBuf = buildSyntheticZip([
     { name: 'xl/worksheets/sheet1.xml', compressedSize: 512, uncompressedSize: 20 * 1024 * 1024 },
   ]);
-  assert.throws(
+  await assert.rejects(
     () => parseSpreadsheetBuffer(zipBombBuf, { documentName: 'bomb.xlsx' }),
     (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 422
   );
@@ -414,22 +425,21 @@ test('Task 009: enforces worksheet, row, column limits, ZIP bomb compression rat
   const macroZipBuf = buildSyntheticZip([
     { name: 'xl/vbaProject.bin', compressedSize: 128, uncompressedSize: 256 },
   ]);
-  assert.throws(
+  await assert.rejects(
     () => parseSpreadsheetBuffer(macroZipBuf, { documentName: 'macro.xlsx' }),
     (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 415
   );
 
   // 6. Isolated worker parses valid XLSX cleanly without inheriting parent prototype mutation or secrets
-  const validWb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(
-    validWb,
-    XLSX.utils.aoa_to_sheet([
-      ['Description', 'Qty', 'Rate'],
-      ['Hydraulic Valve', 10, 450],
-    ]),
-    'Quote'
-  );
-  const validBuf = XLSX.write(validWb, { type: 'buffer', bookType: 'xlsx', compression: true }) as Buffer;
+  const validBuf = await makeXlsxBuffer([
+    {
+      sheet: 'Quote',
+      data: [
+        ['Description', 'Qty', 'Rate'],
+        ['Hydraulic Valve', 10, 450],
+      ],
+    },
+  ]);
   const isoRes = await parseSpreadsheetBufferIsolated(validBuf, { documentName: 'ok.xlsx' });
   assert.equal(isoRes.sheetPreview[0].sheetName, 'Quote');
   assert.ok(isoRes.structuredText.includes('B2: 10'));
@@ -455,7 +465,7 @@ test('Task 010: hardens ZIP container LFH/CD parity, encrypted entry rejection, 
       flags: 0x0001,
     },
   ]);
-  assert.throws(
+  await assert.rejects(
     () => parseSpreadsheetBuffer(encryptedZip, { documentName: 'enc.xlsx' }),
     (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 422
   );
@@ -469,8 +479,22 @@ test('Task 010: hardens ZIP container LFH/CD parity, encrypted entry rejection, 
       content: samplePayload,
     },
   ]);
-  assert.throws(
+  await assert.rejects(
     () => parseSpreadsheetBuffer(backslashZip, { documentName: 'winpath.xlsx' }),
+    (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 422
+  );
+
+  // POSIX path traversal smuggling -> 422
+  const posixTraversalZip = buildSyntheticZip([
+    {
+      name: '../../etc/passwd',
+      compressedSize: samplePayload.length,
+      uncompressedSize: samplePayload.length,
+      content: samplePayload,
+    },
+  ]);
+  await assert.rejects(
+    () => parseSpreadsheetBuffer(posixTraversalZip, { documentName: 'traversal.xlsx' }),
     (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 422
   );
 
@@ -484,7 +508,7 @@ test('Task 010: hardens ZIP container LFH/CD parity, encrypted entry rejection, 
       content: samplePayload,
     },
   ]);
-  assert.throws(
+  await assert.rejects(
     () => parseSpreadsheetBuffer(mismatchSizeZip, { documentName: 'mismatch.xlsx' }),
     (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 422
   );
@@ -505,12 +529,12 @@ test('Task 010: hardens ZIP container LFH/CD parity, encrypted entry rejection, 
       overrideLocalOffset: 0,
     },
   ]);
-  assert.throws(
+  await assert.rejects(
     () => parseSpreadsheetBuffer(overlapZip, { documentName: 'overlap.xlsx' }),
     (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 422
   );
 
-  // Native TSV parsing via tab delimiter detection without touching xlsx
+  // Native TSV parsing via tab delimiter detection without touching binary parser
   const tsvBuf = Buffer.from('Item\tQty\tRate\nSS316 Valve\t25\t1800\n', 'utf8');
   const parsedTsv = await parseSpreadsheetBufferIsolated(tsvBuf, {
     documentName: 'quote.xls',
@@ -528,43 +552,115 @@ test('Task 010: hardens ZIP container LFH/CD parity, encrypted entry rejection, 
   );
 });
 
-test('Task 011: ignores prototype-named sheets, supports clean OLE2 .xls, and rejects OLE2 VBA macros/corrupt headers', async () => {
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(
-    wb,
-    XLSX.utils.aoa_to_sheet([
-      ['Item', 'Qty'],
-      ['Forged Flange', 12],
-    ]),
-    'Quote'
-  );
-  // Inject a prototype-key entry in SheetNames that does not exist as own property on Sheets
-  wb.SheetNames.push('toString');
-  const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
-  const parsed = await parseSpreadsheetBufferIsolated(buf, { documentName: 'safe.xlsx' });
-  assert.equal(parsed.sheetPreview.length, 1);
-  assert.equal(parsed.sheetPreview[0].sheetName, 'Quote');
-  assert.equal(parsed.sheetPreview[0].rows[1][1], '12');
+test('Task 013: handles multi-sheet, date/boolean/blank/empty workbooks, blocks XXE & malformed XML, and enforces binary OLE2 .xls 415 policy', async () => {
+  // 1. Multi-sheet workbook with empty sheet excluded, dates/booleans/blanks/prototype-key sheet names
+  const multiBuf = await makeXlsxBuffer([
+    {
+      sheet: 'Quote',
+      dateFormat: 'yyyy-mm-dd',
+      data: [
+        ['Item', 'Qty', 'Date', 'Confirmed', 'Note'],
+        ['Forged Flange', 12, new Date(Date.UTC(2026, 10, 25)), true, null],
+      ],
+    },
+    {
+      sheet: 'BlankSheet',
+      data: [],
+    },
+    {
+      sheet: 'toString',
+      data: [
+        ['Term', 'Value'],
+        ['Warranty', '12 months'],
+      ],
+    },
+  ]);
+  const parsedMulti = await parseSpreadsheetBufferIsolated(multiBuf, { documentName: 'multi.xlsx' });
+  assert.equal(parsedMulti.sheetPreview.length, 2);
+  assert.equal(parsedMulti.sheetPreview[0].sheetName, 'Quote');
+  assert.equal(parsedMulti.sheetPreview[0].rows[1][1], '12');
+  assert.equal(parsedMulti.sheetPreview[0].rows[1][2], '2026-11-25');
+  assert.equal(parsedMulti.sheetPreview[0].rows[1][3], 'true');
+  assert.equal(parsedMulti.sheetPreview[0].rows[1][4], '');
+  assert.equal(parsedMulti.sheetPreview[1].sheetName, 'toString');
+  assert.equal(({} as Record<string, unknown>).polluted, undefined);
 
-  // Legacy binary OLE2 .xls support preserved inside isolated worker
-  const cleanXlsWb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(
-    cleanXlsWb,
-    XLSX.utils.aoa_to_sheet([
-      ['Description', 'Qty', 'Rate'],
-      ['Alloy Flange', 8, 920],
-    ]),
-    'LegacyQuote'
+  // 2. All-empty XLSX workbook parses cleanly to empty result
+  const emptyWbBuf = await makeXlsxBuffer([{ sheet: 'EmptyOnly', data: [[null, '']] }]);
+  const emptyParsed = await parseSpreadsheetBufferIsolated(emptyWbBuf, { documentName: 'empty.xlsx' });
+  assert.equal(emptyParsed.structuredText, '');
+  assert.deepEqual(emptyParsed.sheetPreview, []);
+
+  // 3. Malformed / non-worksheet XML inside valid OOXML ZIP -> 422
+  const malformedXmlZip = Buffer.from(
+    zipSync({
+      '[Content_Types].xml': strToU8(
+        '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/></Types>'
+      ),
+      '_rels/.rels': strToU8(
+        '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'
+      ),
+      'xl/workbook.xml': strToU8('<<broken-xml'),
+      'xl/_rels/workbook.xml.rels': strToU8(
+        '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>'
+      ),
+      'xl/worksheets/sheet1.xml': strToU8('<<broken-xml'),
+    })
   );
-  const cleanXlsBuf = XLSX.write(cleanXlsWb, { type: 'buffer', bookType: 'xls' }) as Buffer;
-  const parsedXls = await parseSpreadsheetBufferIsolated(cleanXlsBuf, {
-    documentName: 'legacy.xls',
+  await assert.rejects(
+    () => parseSpreadsheetBufferIsolated(malformedXmlZip, { documentName: 'broken.xlsx' }),
+    (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 422
+  );
+
+  // 4. XXE / external entity declaration inside valid OOXML sheet XML does NOT read local files
+  const xxeXmlZip = Buffer.from(
+    zipSync({
+      '[Content_Types].xml': strToU8(
+        '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/></Types>'
+      ),
+      '_rels/.rels': strToU8(
+        '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'
+      ),
+      'xl/workbook.xml': strToU8(
+        '<?xml version="1.0" encoding="UTF-8"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="XXE" sheetId="1" r:id="rId1"/></sheets></workbook>'
+      ),
+      'xl/_rels/workbook.xml.rels': strToU8(
+        '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>'
+      ),
+      'xl/worksheets/sheet1.xml': strToU8(
+        '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>&xxe;</t></is></c><c r="B1" t="inlineStr"><is><t>SafeCell</t></is></c></row></sheetData></worksheet>'
+      ),
+    })
+  );
+  const xxeRes = await parseSpreadsheetBufferIsolated(xxeXmlZip, { documentName: 'xxe.xlsx' });
+  assert.ok(!xxeRes.structuredText.includes('root:x:0:0'));
+  assert.ok(xxeRes.structuredText.includes('SafeCell'));
+
+  // 5. Plain UTF-8 text-table .xls remains supported while binary OLE2 .xls returns structured 415
+  const textXlsBuf = Buffer.from('Item,Qty,Rate\nSS304 Gasket,50,120\n', 'utf8');
+  const parsedTextXls = await parseSpreadsheetBufferIsolated(textXlsBuf, {
+    documentName: 'legacy_export.xls',
     mimeType: 'application/vnd.ms-excel',
   });
-  assert.equal(parsedXls.sheetPreview[0].sheetName, 'LegacyQuote');
-  assert.ok(parsedXls.structuredText.includes('B2: 8'));
+  assert.equal(parsedTextXls.sheetPreview[0].rows[1][0], 'SS304 Gasket');
 
-  // OLE2 .xls containing UTF-16LE VBA macro storage marker -> 415 rejection
+  const cleanOle2XlsBuf = Buffer.alloc(1024);
+  Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]).copy(cleanOle2XlsBuf, 0);
+  cleanOle2XlsBuf.writeUInt16LE(0xfffe, 28);
+  cleanOle2XlsBuf.writeUInt16LE(9, 30);
+  await assert.rejects(
+    () =>
+      parseSpreadsheetBufferIsolated(cleanOle2XlsBuf, {
+        documentName: 'legacy.xls',
+        mimeType: 'application/vnd.ms-excel',
+      }),
+    (err: unknown) =>
+      err instanceof ExtractionServiceError &&
+      err.statusCode === 415 &&
+      err.message.includes('Legacy binary Excel (.xls BIFF5/BIFF8)')
+  );
+
+  // 6. OLE2 .xls containing UTF-16LE VBA macro storage marker -> 415 rejection
   const macroXlsBuf = Buffer.alloc(1024);
   Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]).copy(macroXlsBuf, 0);
   macroXlsBuf.writeUInt16LE(0xfffe, 28);
@@ -579,13 +675,26 @@ test('Task 011: ignores prototype-named sheets, supports clean OLE2 .xls, and re
     (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 415
   );
 
-  // Truncated / malformed OLE2 .xls header -> 422 rejection
+  // 7. Truncated / malformed OLE2 .xls header -> 422 rejection
   const truncatedOle2 = Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1, 0x00, 0x00]);
   await assert.rejects(
     () =>
       parseSpreadsheetBufferIsolated(truncatedOle2, {
         documentName: 'truncated.xls',
         mimeType: 'application/vnd.ms-excel',
+      }),
+    (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 422
+  );
+
+  // 8. Isolated worker timeout boundary -> kills child and rejects cleanly with 422
+  const validSmallXlsx = await makeXlsxBuffer([
+    { sheet: 'TimeoutCheck', data: [['Item', 'Qty'], ['Bolt', 10]] },
+  ]);
+  await assert.rejects(
+    () =>
+      parseSpreadsheetBufferIsolated(validSmallXlsx, {
+        documentName: 'timeout.xlsx',
+        timeoutMs: 1,
       }),
     (err: unknown) => err instanceof ExtractionServiceError && err.statusCode === 422
   );

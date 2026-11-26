@@ -33,29 +33,24 @@ One test in `tests/extractionValidation.test.ts` (`Live Gemini API extraction sm
 RUN_LIVE_GEMINI_TESTS=true GEMINI_API_KEY="your-key" npm test
 ```
 
-## Latest Verification Scope (Task 012)
-- **VERIFIED (Local Sandbox Execution — Read-Only Verification):**
-  - `npm ci --dry-run`: Clean lockfile resolution on Node `v22.23.5` / npm `10.9.9` without `--legacy-peer-deps` (`EBADENGINE` warnings only for `@firebase/*` `>=24.12.0`).
-  - `npm audit --json`: Reported `9` vulnerabilities (`5` high, `4` moderate, `0` critical) across `500` dependency entries (`xlsx`, `firebase -> @grpc/grpc-js`, and `drizzle-kit -> esbuild` chains; audited in [Security Posture](SECURITY.md)).
+## Latest Verification Scope (Task 013)
+- **VERIFIED (Local Sandbox Execution — Post-`xlsx` Removal):**
+  - `npm ci` (executed in clean isolated `/tmp/norus-ci-verify`): `added 419 packages`, `426` audited, exited `0` cleanly on Node `v22.23.5` / npm `10.9.9` without `--legacy-peer-deps` (`EBADENGINE` warnings only for `@firebase/*` `>=24.12.0`); `npm ls xlsx` returned `(empty)`.
+  - `npm audit --json`: Reported `8` transitive/dev advisories (`4` high in `firebase -> @grpc/grpc-js`, `4` moderate in `drizzle-kit -> esbuild`, `0` critical) across `426` packages — **zero `xlsx`, `read-excel-file`, or `write-excel-file` vulnerabilities**.
   - `npm run lint` (`tsc --noEmit`): Passed with `0` errors.
-  - `npm run build` (`vite build`): Succeeded (`1889` modules transformed in `2.02s`).
-  - `npm test`: `47` passing tests (`0` failing, `13` skipped, `47.0s`).
-- **VERIFIED VIA GITHUB ACTIONS REST API — RAW LOGS INACCESSIBLE (`HTTP 403`):**
-  - GitHub `main` head (`66b9367ee2eb0a29788cd3efd5473e9bd9954250`, `"refactor: harden spreadsheet extraction and IPC"`) passed Actions Run `#7` (`https://github.com/shivbhadrasingrana07-dotcom/NORUS-QUOTEFLOW/actions/runs/45767730514`):
-    - Job `verify` (`139732610410`): `conclusion: "success"` (all steps passed: Node 22, `npm ci`, PG16 `0000` + `0001_preflight` + `0001_tenant_integrity` + `0001_rollback` + re-apply `0001`, `tsc --noEmit`, `npm test`, `vite build`).
-    - Job `browser-e2e` (`139732940757`): `conclusion: "success"` (Playwright Chromium install + `DEMO_MODE=true` `tests/browserE2E.mjs`).
-  - Unauthenticated log archive downloads (`/actions/runs/45767730514/logs`) return `HTTP 403`, so exact remote CI test/skip numbers remain inaccessible without GitHub authentication.
-- **BLOCKED in Current Container (Requires External PostgreSQL 15+ / Chromium / API Key):**
+  - `npm run build` (`vite build`): Succeeded (`1967` modules transformed in `2.45s`); `dist/` scan confirmed zero `SheetJS`, `xlsx`, or `write-excel-file/node` (`node:fs`) references.
+  - `npm test`: `47` passing tests (`0` failing, `13` skipped: `12` disposable PG + `1` live Gemini; `46.0s`). Targeted export + demo signed-URL `.xlsx` runtime smoke check also verified 4-sheet workbook export, Blob download trigger, and `Demo_Offer` round-trip (`3,235` bytes, `PK` signature).
+- **BLOCKED in Current Container (Requires External PostgreSQL 15+ / Chromium / API Key / Remote CI):**
   - Disposable PostgreSQL integration & concurrency suites (`12` skipped tests across `tests/apiAndDb.test.ts`, `tests/authAndMultiTenancy.test.ts`, `tests/e2eWorkflow.test.ts`, `tests/opsAndMonitoring.test.ts`, and `tests/objectStorageAndRateLimit.test.ts`) and live `psql` DDL/rollback verification require PostgreSQL 15+ (`psql` and `docker` are absent locally).
-  - Local headless browser E2E (`tests/browserE2E.mjs`) requires `playwright` and Chromium (both absent locally).
+  - Local headless browser E2E (`tests/browserE2E.mjs`) requires `playwright` and Chromium (both absent locally). *(Prior GitHub Actions Run `#7` succeeded on commit `66b9367e` before Task 013; Task 013 changes have not been pushed to trigger a fresh CI run.)*
   - Live Gemini API smoke test (`1` skipped test in `tests/extractionValidation.test.ts`) requires `RUN_LIVE_GEMINI_TESTS=true` and `GEMINI_API_KEY`.
 
-### Mandatory Regression Gate for Phased `xlsx@0.18.5` Replacement
-Before uninstalling `xlsx@0.18.5` (Stage 1 & Stage 2 in [Security Posture](SECURITY.md)), verify all of the following:
-1. **Excel Export Formula & Layout Parity (`tests/exporters.test.ts`):** `Summary` (`MAX`/`MIN`), `Line_Matrix` (`IF(ISNUMBER(...))` + split award rows), `Exceptions` (`Insufficient Quantity`, `Arithmetic Mismatch`, `Not Quoted`, `Alternate Spec`, `Missing Freight`), `Audit_Log`, and `sanitizeSpreadsheetCell` formula-injection escaping pass cleanly in Excel/LibreOfficeCalc and automated buffer inspection.
-2. **OOXML `.xlsx` Ingestion Parity (`tests/extractionValidation.test.ts`):** Multi-sheet `.xlsx` cell coordinate extraction (`sheetName`, `E4:F4`), date formatting, ZIP container pre-scan (`inspectXlsxZipContainer`), and `128 MB / 5s` worker resource bounds remain intact.
-3. **Delimited `.csv` / `.tsv` / UTF-8 Text `.xls` Parity:** `parseDelimitedTextToRows` continues handling CSV, TSV, and UTF-8 text-table `.xls` files without binary parsers.
-4. **Legacy Binary OLE2 `.xls` Policy Coverage:** Either isolated `.xls -> .xlsx` converter round-trip tests pass OR explicit `415` deprecation error + `inspectOle2Container()` macro rejection are regression-tested.
+### `xlsx@0.18.5` Replacement Regression Gate (Verified in Task 013)
+All four regression gates passed after uninstalling `xlsx@0.18.5`:
+1. **Excel Export Formula & Layout Parity (`tests/exporters.test.ts`):** `Summary` (`MAX`/`MIN`), `Line_Matrix` (`IF(ISNUMBER(...))` + split award rows) verified directly in unzipped OOXML `<f>` elements via `fflate`, `Exceptions` (`Insufficient Quantity`, `Arithmetic Mismatch`, `Not Quoted`, `Alternate Spec`, `Missing Freight`), `Audit_Log`, and `sanitizeSpreadsheetCell` formula-injection escaping pass cleanly alongside `read-excel-file/node` round-trip validation.
+2. **OOXML `.xlsx` Ingestion Parity (`tests/extractionValidation.test.ts`):** Multi-sheet `.xlsx` cell coordinate extraction (`sheetName`, `A2:D2`), empty-sheet omission, all-empty workbook handling, date/boolean/blank formatting, prototype-key sheet safety (`toString`), XXE/external-entity immunity (`saxen`), malformed XML rejection (`422`), ZIP container pre-scan (`inspectXlsxZipContainer`), and `128 MB / 5s` worker resource & timeout bounds verified.
+3. **Delimited `.csv` / `.tsv` / UTF-8 Text `.xls` Parity (`tests/extractionValidation.test.ts`, `tests/demoWorkspace.test.ts`):** `parseDelimitedTextToRows` handles CSV, TSV, and UTF-8 text-table `.xls` uploads (`201 Created`) without binary parsers.
+4. **Legacy Binary OLE2 `.xls` Policy Coverage (`tests/extractionValidation.test.ts`, `tests/demoWorkspace.test.ts`):** `inspectOle2Container()` rejects malformed OLE2 (`422`) and embedded VBA macros (`415`), and clean binary OLE2 `.xls` returns structured `415` guidance over both isolated parser and HTTP `/quotes/extract` routes.
 
 ## Test Coverage Breakdown
 

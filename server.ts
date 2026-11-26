@@ -839,54 +839,62 @@ export async function createApp(options: AppOptions = {}) {
     }
   });
 
-  app.get('/api/demo-workspace/documents/:docId/signed-url', requireDemoMode, demoDocRateLimiter, (req, res) => {
-    const candidateSession = extractProvidedDemoSessionId(req);
-    if (!candidateSession || !demoStore.hasSession(candidateSession)) {
-      return res.status(404).json({ error: 'Demo document not found in this session.' });
+  app.get('/api/demo-workspace/documents/:docId/signed-url', requireDemoMode, demoDocRateLimiter, async (req, res, next) => {
+    try {
+      const candidateSession = extractProvidedDemoSessionId(req);
+      if (!candidateSession || !demoStore.hasSession(candidateSession)) {
+        return res.status(404).json({ error: 'Demo document not found in this session.' });
+      }
+      const doc = await demoStore.getDocument(candidateSession, req.params.docId);
+      if (!doc) {
+        return res.status(404).json({ error: 'Demo document not found in this session.' });
+      }
+      const exp = Math.floor(Date.now() / 1000) + 300;
+      const sig = signHmac(`demo:${doc.id}:${candidateSession}:${exp}`);
+      res.json({
+        url: `/api/demo-workspace/documents/${encodeURIComponent(doc.id)}/content?demo=${encodeURIComponent(
+          candidateSession
+        )}&exp=${exp}&sig=${encodeURIComponent(sig)}`,
+        expiresAt: new Date(exp * 1000).toISOString(),
+        mimeType: doc.mimeType,
+        originalFilename: doc.originalFilename,
+      });
+    } catch (err) {
+      next(err);
     }
-    const doc = demoStore.getDocument(candidateSession, req.params.docId);
-    if (!doc) {
-      return res.status(404).json({ error: 'Demo document not found in this session.' });
-    }
-    const exp = Math.floor(Date.now() / 1000) + 300;
-    const sig = signHmac(`demo:${doc.id}:${candidateSession}:${exp}`);
-    res.json({
-      url: `/api/demo-workspace/documents/${encodeURIComponent(doc.id)}/content?demo=${encodeURIComponent(
-        candidateSession
-      )}&exp=${exp}&sig=${encodeURIComponent(sig)}`,
-      expiresAt: new Date(exp * 1000).toISOString(),
-      mimeType: doc.mimeType,
-      originalFilename: doc.originalFilename,
-    });
   });
 
-  app.get('/api/demo-workspace/documents/:docId/content', requireDemoMode, demoDocRateLimiter, (req, res) => {
-    const demoParam = typeof req.query.demo === 'string' ? req.query.demo : '';
-    const expParam = typeof req.query.exp === 'string' ? Number(req.query.exp) : NaN;
-    const sigParam = typeof req.query.sig === 'string' ? req.query.sig : '';
+  app.get('/api/demo-workspace/documents/:docId/content', requireDemoMode, demoDocRateLimiter, async (req, res, next) => {
+    try {
+      const demoParam = typeof req.query.demo === 'string' ? req.query.demo : '';
+      const expParam = typeof req.query.exp === 'string' ? Number(req.query.exp) : NaN;
+      const sigParam = typeof req.query.sig === 'string' ? req.query.sig : '';
 
-    if (
-      !demoParam ||
-      !Number.isFinite(expParam) ||
-      expParam < Math.floor(Date.now() / 1000) ||
-      !verifyHmac(`demo:${req.params.docId}:${demoParam}:${expParam}`, sigParam)
-    ) {
-      return res.status(403).json({ error: 'Signed demo document URL is invalid or expired.' });
+      if (
+        !demoParam ||
+        !Number.isFinite(expParam) ||
+        expParam < Math.floor(Date.now() / 1000) ||
+        !verifyHmac(`demo:${req.params.docId}:${demoParam}:${expParam}`, sigParam)
+      ) {
+        return res.status(403).json({ error: 'Signed demo document URL is invalid or expired.' });
+      }
+
+      const doc = await demoStore.getDocument(demoParam, req.params.docId);
+      if (!doc) {
+        return res.status(404).json({ error: 'Demo document not found.' });
+      }
+
+      res.setHeader('Content-Type', doc.mimeType || 'application/octet-stream');
+      res.setHeader(
+        'Content-Disposition',
+        `inline; filename="${doc.originalFilename.replace(/["\r\n]/g, '_')}"`
+      );
+      res.setHeader('Cache-Control', 'private, no-store');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.send(doc.buffer);
+    } catch (err) {
+      next(err);
     }
-
-    const doc = demoStore.getDocument(demoParam, req.params.docId);
-    if (!doc) {
-      return res.status(404).json({ error: 'Demo document not found.' });
-    }
-
-    res.setHeader('Content-Type', doc.mimeType || 'application/octet-stream');
-    res.setHeader(
-      'Content-Disposition',
-      `inline; filename="${doc.originalFilename.replace(/["\r\n]/g, '_')}"`
-    );
-    res.setHeader('Cache-Control', 'private, no-store');
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.send(doc.buffer);
   });
 
   app.post('/api/auth/register', authRateLimiter, async (req, res, next) => {

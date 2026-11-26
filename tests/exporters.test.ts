@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import * as XLSX from 'xlsx';
+import readXlsxFile from 'read-excel-file/node';
+import { unzipSync, strFromU8 } from 'fflate';
 import { createInitialWorkspaceState } from '../server/seedData.ts';
 import {
   buildComparativeStatementPdfDoc,
@@ -17,7 +18,7 @@ test('sanitizeSpreadsheetCell neutralizes CSV/Excel formula injection payloads',
   assert.equal(sanitizeSpreadsheetCell('Normal Vendor Pvt Ltd'), 'Normal Vendor Pvt Ltd');
 });
 
-test('buildComparativeStatementWorkbook creates 4 sheets, live formulas, sanitized cells, verified L1 rank, and split-award table', () => {
+test('buildComparativeStatementWorkbook creates 4 sheets, live formulas, sanitized cells, verified L1 rank, and split-award table', async () => {
   const ws = createInitialWorkspaceState();
   const rfq = ws.rfqs[0];
   const quotes = ws.quotations.filter((q) => q.rfqId === rfq.id);
@@ -58,20 +59,44 @@ test('buildComparativeStatementWorkbook creates 4 sheets, live formulas, sanitiz
     award,
   });
 
-  assert.deepEqual(wb.SheetNames, ['Summary', 'Line_Matrix', 'Exceptions', 'Audit_Log']);
+  assert.deepEqual(wb.sheetNames, ['Summary', 'Line_Matrix', 'Exceptions', 'Audit_Log']);
 
-  const summary = wb.Sheets['Summary'];
-  // Row 7 should be the verified complete L1 quote (Shree Ganesh), not incomplete Bharat Fasteners
-  assert.equal(summary['A7']?.v, 'L1');
-  assert.ok(String(summary['B7']?.v).startsWith("'=")); // Formula injection neutralized!
-  assert.match(String(summary['K7']?.f), /^MAX\(0,E7\+F7\+G7-H7\+J7\)$/);
-
-  const matrix = wb.Sheets['Line_Matrix'];
-  const matrixAoA = XLSX.utils.sheet_to_json<string[]>(matrix, { header: 1 });
-  assert.ok(matrixAoA.some((row) => row[0] === 'AWARD ALLOCATION'));
-
-  const outBuf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
+  const outBytes = await wb.toUint8Array();
+  const outBuf = Buffer.from(outBytes);
   assert.ok(outBuf.byteLength > 2000);
+  assert.equal(outBuf.subarray(0, 2).toString('ascii'), 'PK');
+
+  // Inspect OOXML zip directly for ECMA-376 <f> formula elements
+  const unzipped = unzipSync(outBytes);
+  const sheet1Xml = strFromU8(unzipped['xl/worksheets/sheet1.xml']);
+  const sheet2Xml = strFromU8(unzipped['xl/worksheets/sheet2.xml']);
+  assert.ok(
+    sheet1Xml.includes('<f>MAX(0,E7+F7+G7-H7+J7)</f>'),
+    'Summary sheet must contain MAX landed cost formula in K7'
+  );
+  assert.ok(
+    sheet1Xml.includes('<f>MIN(K7'),
+    'Summary sheet must contain MIN verified L1 formula'
+  );
+  assert.ok(
+    sheet2Xml.includes('<f>IF(ISNUMBER(G2), D2*G2, 0)</f>'),
+    'Line_Matrix must contain IF(ISNUMBER(...)) extended cost formula'
+  );
+
+  // Round-trip read via read-excel-file/node (note: formula cells without cached <v> parse as null)
+  const parsedSheets = await readXlsxFile(outBuf);
+  assert.deepEqual(
+    parsedSheets.map((s) => s.sheet),
+    ['Summary', 'Line_Matrix', 'Exceptions', 'Audit_Log']
+  );
+
+  const summary = parsedSheets[0].data;
+  assert.equal(summary[6][0], 'L1');
+  assert.ok(String(summary[6][1]).startsWith("'=")); // Formula injection neutralized!
+  assert.equal(typeof summary[6][4], 'number');
+
+  const matrix = parsedSheets[1].data;
+  assert.ok(matrix.some((row) => row[0] === 'AWARD ALLOCATION'));
 });
 
 test('buildComparativeStatementPdfDoc produces valid landscape PDF bytes including split-award table', () => {
@@ -117,7 +142,7 @@ test('buildComparativeStatementPdfDoc produces valid landscape PDF bytes includi
   assert.ok(buf.byteLength > 1500);
 });
 
-test('Task 008: Excel Exceptions logs Insufficient Quantity and PDF includes [Short Qty] alongside UOM conversion', () => {
+test('Task 008: Excel Exceptions logs Insufficient Quantity and PDF includes [Short Qty] alongside UOM conversion', async () => {
   const ws = createInitialWorkspaceState();
   const rfq = ws.rfqs[0];
   const baseQuotes = ws.quotations.filter((q) => q.rfqId === rfq.id);
@@ -144,9 +169,15 @@ test('Task 008: Excel Exceptions logs Insufficient Quantity and PDF includes [Sh
     settings: ws.settings,
     auditLogs: ws.auditLogs,
   });
-  const exceptionsAoA = XLSX.utils.sheet_to_json<string[]>(wb.Sheets['Exceptions'], { header: 1 });
+  const outBuf = Buffer.from(await wb.toUint8Array());
+  const parsedSheets = await readXlsxFile(outBuf);
+  const exceptionsAoA = parsedSheets[2].data;
   assert.ok(
-    exceptionsAoA.some((row) => row[2] === 'Insufficient Quantity' && /Converted qty 2 < RFQ required/.test(row[3])),
+    exceptionsAoA.some(
+      (row) =>
+        row[2] === 'Insufficient Quantity' &&
+        /Converted qty 2 < RFQ required/.test(String(row[3] ?? ''))
+    ),
     'Expected Insufficient Quantity row in Excel Exceptions sheet'
   );
 
