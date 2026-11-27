@@ -221,23 +221,29 @@ export function RfqCreateModal({
             <div className="text-xs font-medium text-[#475569] mb-2">
               Target Suppliers ({invitedSupplierIds.length} selected)
             </div>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-              {suppliers.map((s) => (
-                <label
-                  key={s.id}
-                  className="flex items-center gap-2.5 px-3 py-2 border border-[#E2E8F0] rounded-md text-xs cursor-pointer hover:bg-[#F8FAFC]"
-                >
-                  <input
-                    type="checkbox"
-                    checked={invitedSupplierIds.includes(s.id)}
-                    onChange={() => toggleSupplier(s.id)}
-                    className="rounded border-[#CBD5E1] text-[#0F4C81]"
-                  />
-                  <span className="font-medium text-[#0F172A] truncate">{s.name}</span>
-                  <span className="text-[#475569] ml-auto shrink-0">{s.city}</span>
-                </label>
-              ))}
-            </div>
+            {suppliers.length === 0 ? (
+              <div className="px-3 py-2.5 bg-[#F8FAFC] border border-[#E2E8F0] rounded-md text-xs text-[#475569]">
+                No suppliers added yet. You can create this RFQ now and add suppliers from the Suppliers tab before uploading quotes.
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                {suppliers.map((s) => (
+                  <label
+                    key={s.id}
+                    className="flex items-center gap-2.5 px-3 py-2 border border-[#E2E8F0] rounded-md text-xs cursor-pointer hover:bg-[#F8FAFC]"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={invitedSupplierIds.includes(s.id)}
+                      onChange={() => toggleSupplier(s.id)}
+                      className="rounded border-[#CBD5E1] text-[#0F4C81]"
+                    />
+                    <span className="font-medium text-[#0F172A] truncate">{s.name}</span>
+                    <span className="text-[#475569] ml-auto shrink-0">{s.city}</span>
+                  </label>
+                ))}
+              </div>
+            )}
           </div>
 
           {/* BOM Line Items */}

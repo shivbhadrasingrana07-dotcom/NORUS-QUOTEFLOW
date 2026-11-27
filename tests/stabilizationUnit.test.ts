@@ -1392,4 +1392,104 @@ describe('Task 007 Stabilization Unit Suite', () => {
     assert.equal(kahanSplit.totalAwardedLanded, 2010);
     assert.equal(kahanSplit.isNonL1, false);
   });
+
+  it('Task 014: renders clear onboarding empty states for new customer workspaces and 5-minute demo guidance when demoMode is active', async () => {
+    const React = await import('react');
+    const { renderToStaticMarkup } = await import('react-dom/server');
+    const { DashboardView } = await import('../src/components/DashboardView.tsx');
+    const { RfqCreateModal } = await import('../src/components/RfqCreateModal.tsx');
+    const { RfqsListView, SuppliersView, ItemsView, ReportsView } = await import(
+      '../src/components/SecondaryViews.tsx'
+    );
+    const { DemoWorkspaceStore } = await import('../server/demoWorkspace.ts');
+
+    // 1. Fresh customer workspace (non-demo, empty arrays) displays clear onboarding CTAs & empty states
+    const emptyDashHtml = renderToStaticMarkup(
+      React.createElement(DashboardView, {
+        rfqs: [],
+        quotations: [],
+        suppliers: [],
+        awards: [],
+        defaultCurrency: 'INR',
+        onOpenRfq: () => {},
+        onNewRfq: () => {},
+        onLoadSample: async () => {},
+        loadingSample: false,
+        demoMode: false,
+      })
+    );
+    assert.match(emptyDashHtml, /Welcome to NORUS QUOTEFLOW/);
+    assert.match(emptyDashHtml, /Create First RFQ/);
+    assert.doesNotMatch(emptyDashHtml, /5-Minute Demo Walkthrough/);
+
+    const emptyRfqsHtml = renderToStaticMarkup(
+      React.createElement(RfqsListView, {
+        rfqs: [],
+        quotations: [],
+        onOpenRfq: () => {},
+        onNewRfq: () => {},
+      })
+    );
+    assert.match(emptyRfqsHtml, /No RFQs created yet/);
+
+    const emptySuppliersHtml = renderToStaticMarkup(
+      React.createElement(SuppliersView, {
+        suppliers: [],
+        quotations: [],
+        awards: [],
+        onAddSupplier: async () => {},
+      })
+    );
+    assert.match(emptySuppliersHtml, /No suppliers added yet/);
+
+    const emptyItemsHtml = renderToStaticMarkup(
+      React.createElement(ItemsView, {
+        items: [],
+        suppliers: [],
+      })
+    );
+    assert.match(emptyItemsHtml, /No item price history yet/);
+
+    const emptyReportsHtml = renderToStaticMarkup(
+      React.createElement(ReportsView, {
+        awards: [],
+        rfqs: [],
+        auditLogs: [],
+        onOpenRfq: () => {},
+      })
+    );
+    assert.match(emptyReportsHtml, /No award decisions submitted yet/);
+    assert.match(emptyReportsHtml, /No extraction or approval events logged yet/);
+
+    const emptySupplierModalHtml = renderToStaticMarkup(
+      React.createElement(RfqCreateModal, {
+        suppliers: [],
+        defaultCurrency: 'INR',
+        onClose: () => {},
+        onCreate: async () => {},
+      })
+    );
+    assert.match(emptySupplierModalHtml, /No suppliers added yet/);
+
+    // 2. Demo mode DashboardView preserves DEMO-RFQ-2026-101 table rows and shows synthetic 5-minute walkthrough
+    const store = new DemoWorkspaceStore();
+    const demoWs = store.getWorkspace('task014-ui-check');
+    const demoDashHtml = renderToStaticMarkup(
+      React.createElement(DashboardView, {
+        rfqs: demoWs.rfqs,
+        quotations: demoWs.quotations,
+        suppliers: demoWs.suppliers,
+        awards: demoWs.awards,
+        defaultCurrency: demoWs.settings.defaultCurrency,
+        onOpenRfq: () => {},
+        onNewRfq: () => {},
+        onLoadSample: async () => {},
+        loadingSample: false,
+        demoMode: true,
+      })
+    );
+    assert.match(demoDashHtml, /5-Minute Demo Walkthrough \(Synthetic Data/);
+    assert.match(demoDashHtml, /DEMO-RFQ-2026-101/);
+  });
 });
+

@@ -112,38 +112,48 @@ export function RfqsListView({
               </tr>
             </thead>
             <tbody className="divide-y divide-[#E2E8F0]">
-              {filtered.map((rfq) => {
-                const rq = quotations.filter((q) => q.rfqId === rfq.id);
-                const l1 = rankQuotations(rq, 'landed', rfq).find((r) => r.rankIndex === 1);
-                const best = l1 ? l1.totalForBasis : null;
-                return (
-                  <tr
-                    key={rfq.id}
-                    onClick={() => onOpenRfq(rfq.id)}
-                    className="hover:bg-[#F8FAFC] cursor-pointer"
-                  >
-                    <td className="py-3 px-4 font-mono text-xs font-semibold text-[#0F4C81]">
-                      {rfq.rfqNumber}
-                    </td>
-                    <td className="py-3 px-4 font-medium text-[#0F172A]">{rfq.title}</td>
-                    <td className="py-3 px-4 text-xs text-[#475569]">{rfq.deliveryLocation}</td>
-                    <td className="py-3 px-4 text-right font-mono tabular-nums">
-                      {rfq.items.length}
-                    </td>
-                    <td className="py-3 px-4 text-right font-mono tabular-nums">{rq.length}</td>
-                    <td className="py-3 px-4 text-right font-mono tabular-nums font-semibold">
-                      {best !== null
-                        ? formatMoney(best, rfq.currency)
-                        : rq.length > 0
-                        ? 'Pending Audit'
-                        : '—'}
-                    </td>
-                    <td className="py-3 px-4 text-xs font-medium text-[#0F172A]">
-                      {rfqStatusLabel(rfq.status)}
-                    </td>
-                  </tr>
-                );
-              })}
+              {filtered.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="py-8 px-4 text-center text-xs text-[#475569]">
+                    {rfqs.length === 0
+                      ? 'No RFQs created yet. Click Create RFQ above to start your first Pre-PO quotation comparison.'
+                      : 'No RFQs match the current search or status filter.'}
+                  </td>
+                </tr>
+              ) : (
+                filtered.map((rfq) => {
+                  const rq = quotations.filter((q) => q.rfqId === rfq.id);
+                  const l1 = rankQuotations(rq, 'landed', rfq).find((r) => r.rankIndex === 1);
+                  const best = l1 ? l1.totalForBasis : null;
+                  return (
+                    <tr
+                      key={rfq.id}
+                      onClick={() => onOpenRfq(rfq.id)}
+                      className="hover:bg-[#F8FAFC] cursor-pointer"
+                    >
+                      <td className="py-3 px-4 font-mono text-xs font-semibold text-[#0F4C81]">
+                        {rfq.rfqNumber}
+                      </td>
+                      <td className="py-3 px-4 font-medium text-[#0F172A]">{rfq.title}</td>
+                      <td className="py-3 px-4 text-xs text-[#475569]">{rfq.deliveryLocation}</td>
+                      <td className="py-3 px-4 text-right font-mono tabular-nums">
+                        {rfq.items.length}
+                      </td>
+                      <td className="py-3 px-4 text-right font-mono tabular-nums">{rq.length}</td>
+                      <td className="py-3 px-4 text-right font-mono tabular-nums font-semibold">
+                        {best !== null
+                          ? formatMoney(best, rfq.currency)
+                          : rq.length > 0
+                          ? 'Pending Audit'
+                          : '—'}
+                      </td>
+                      <td className="py-3 px-4 text-xs font-medium text-[#0F172A]">
+                        {rfqStatusLabel(rfq.status)}
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
             </tbody>
           </table>
         </div>
@@ -356,38 +366,48 @@ export function SuppliersView({
               </tr>
             </thead>
             <tbody className="divide-y divide-[#E2E8F0]">
-              {filtered.map((s) => {
-                const quoteCount = quotations.filter((q) => q.supplierId === s.id).length;
-                const wonCount = awards.filter(
-                  (a) =>
-                    a.approvalStatus === 'approved' &&
-                    a.allocations.some((al) => al.supplierId === s.id)
-                ).length;
-                return (
-                  <tr key={s.id} className="hover:bg-[#F8FAFC]">
-                    <td className="py-3 px-4">
-                      <div className="font-semibold text-sm text-[#0F172A] flex items-center gap-2">
-                        <Building2 className="w-3.5 h-3.5 text-[#475569]" />
-                        <span>{s.name}</span>
-                      </div>
-                      <div className="text-[#475569] mt-0.5">
-                        {s.city}
-                        {s.categories.length > 0 && ` · ${s.categories.join(', ')}`}
-                      </div>
-                    </td>
-                    <td className="py-3 px-4 font-mono text-[#0F172A]">{s.taxId || '—'}</td>
-                    <td className="py-3 px-4 text-[#475569]">
-                      <div>{s.contactName || '—'}</div>
-                      <div className="font-mono">{s.phoneWhatsapp || s.email}</div>
-                    </td>
-                    <td className="py-3 px-4 text-[#0F172A]">{s.defaultPaymentTerms}</td>
-                    <td className="py-3 px-4 text-right font-mono tabular-nums">{quoteCount}</td>
-                    <td className="py-3 px-4 text-right font-mono tabular-nums font-semibold text-[#059669]">
-                      {wonCount}
-                    </td>
-                  </tr>
-                );
-              })}
+              {filtered.length === 0 ? (
+                <tr>
+                  <td colSpan={6} className="py-8 px-4 text-center text-xs text-[#475569]">
+                    {suppliers.length === 0
+                      ? 'No suppliers added yet. Click Add Supplier to register vendors for RFQ comparisons.'
+                      : 'No suppliers match your search query.'}
+                  </td>
+                </tr>
+              ) : (
+                filtered.map((s) => {
+                  const quoteCount = quotations.filter((q) => q.supplierId === s.id).length;
+                  const wonCount = awards.filter(
+                    (a) =>
+                      a.approvalStatus === 'approved' &&
+                      a.allocations.some((al) => al.supplierId === s.id)
+                  ).length;
+                  return (
+                    <tr key={s.id} className="hover:bg-[#F8FAFC]">
+                      <td className="py-3 px-4">
+                        <div className="font-semibold text-sm text-[#0F172A] flex items-center gap-2">
+                          <Building2 className="w-3.5 h-3.5 text-[#475569]" />
+                          <span>{s.name}</span>
+                        </div>
+                        <div className="text-[#475569] mt-0.5">
+                          {s.city}
+                          {s.categories.length > 0 && ` · ${s.categories.join(', ')}`}
+                        </div>
+                      </td>
+                      <td className="py-3 px-4 font-mono text-[#0F172A]">{s.taxId || '—'}</td>
+                      <td className="py-3 px-4 text-[#475569]">
+                        <div>{s.contactName || '—'}</div>
+                        <div className="font-mono">{s.phoneWhatsapp || s.email}</div>
+                      </td>
+                      <td className="py-3 px-4 text-[#0F172A]">{s.defaultPaymentTerms}</td>
+                      <td className="py-3 px-4 text-right font-mono tabular-nums">{quoteCount}</td>
+                      <td className="py-3 px-4 text-right font-mono tabular-nums font-semibold text-[#059669]">
+                        {wonCount}
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
             </tbody>
           </table>
         </div>
@@ -440,52 +460,62 @@ export function ItemsView({ items, suppliers }: { items: CatalogItem[]; supplier
               </tr>
             </thead>
             <tbody className="divide-y divide-[#E2E8F0]">
-              {filtered.map((item) => {
-                const supName =
-                  suppliers.find((s) => s.id === item.lastSupplierId)?.name || '—';
-                const prev = item.priceHistory[1]?.unitLandedPrice;
-                const curr = item.lastAwardedUnitPrice;
-                const deltaPct = prev && curr ? ((curr - prev) / prev) * 100 : null;
-                return (
-                  <tr key={item.id} className="hover:bg-[#F8FAFC]">
-                    <td className="py-3 px-4 font-mono font-semibold text-[#0F4C81]">
-                      {item.skuCode || '—'}
-                    </td>
-                    <td className="py-3 px-4 font-medium text-sm text-[#0F172A]">
-                      {item.name}
-                      <span className="text-xs font-normal text-[#475569] ml-2">
-                        ({item.defaultUom})
-                      </span>
-                    </td>
-                    <td className="py-3 px-4 font-mono text-[#475569]">
-                      {item.hsnSacCode || '—'}
-                    </td>
-                    <td className="py-3 px-4 text-[#0F172A]">{supName}</td>
-                    <td className="py-3 px-4 text-right font-mono tabular-nums font-bold text-[#0F172A]">
-                      {curr !== null
-                        ? formatMoney(curr, item.lastAwardedCurrency || 'INR')
-                        : '—'}
-                    </td>
-                    <td className="py-3 px-4 font-mono text-[#475569]">
-                      {formatDateShort(item.lastAwardedAt)}
-                    </td>
-                    <td className="py-3 px-4 text-right font-mono tabular-nums">
-                      {deltaPct === null ? (
-                        <span className="text-[#475569]">Baseline</span>
-                      ) : deltaPct > 0 ? (
-                        <span className="text-[#DC2626] inline-flex items-center gap-1">
-                          <TrendingUp className="w-3.5 h-3.5" />+{deltaPct.toFixed(1)}%
+              {filtered.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="py-8 px-4 text-center text-xs text-[#475569]">
+                    {items.length === 0
+                      ? 'No item price history yet. Item Price Memory updates automatically once an RFQ award is approved.'
+                      : 'No catalog items match your search query.'}
+                  </td>
+                </tr>
+              ) : (
+                filtered.map((item) => {
+                  const supName =
+                    suppliers.find((s) => s.id === item.lastSupplierId)?.name || '—';
+                  const prev = item.priceHistory[1]?.unitLandedPrice;
+                  const curr = item.lastAwardedUnitPrice;
+                  const deltaPct = prev && curr ? ((curr - prev) / prev) * 100 : null;
+                  return (
+                    <tr key={item.id} className="hover:bg-[#F8FAFC]">
+                      <td className="py-3 px-4 font-mono font-semibold text-[#0F4C81]">
+                        {item.skuCode || '—'}
+                      </td>
+                      <td className="py-3 px-4 font-medium text-sm text-[#0F172A]">
+                        {item.name}
+                        <span className="text-xs font-normal text-[#475569] ml-2">
+                          ({item.defaultUom})
                         </span>
-                      ) : (
-                        <span className="text-[#059669] inline-flex items-center gap-1">
-                          <TrendingDown className="w-3.5 h-3.5" />
-                          {deltaPct.toFixed(1)}%
-                        </span>
-                      )}
-                    </td>
-                  </tr>
-                );
-              })}
+                      </td>
+                      <td className="py-3 px-4 font-mono text-[#475569]">
+                        {item.hsnSacCode || '—'}
+                      </td>
+                      <td className="py-3 px-4 text-[#0F172A]">{supName}</td>
+                      <td className="py-3 px-4 text-right font-mono tabular-nums font-bold text-[#0F172A]">
+                        {curr !== null
+                          ? formatMoney(curr, item.lastAwardedCurrency || 'INR')
+                          : '—'}
+                      </td>
+                      <td className="py-3 px-4 font-mono text-[#475569]">
+                        {formatDateShort(item.lastAwardedAt)}
+                      </td>
+                      <td className="py-3 px-4 text-right font-mono tabular-nums">
+                        {deltaPct === null ? (
+                          <span className="text-[#475569]">Baseline</span>
+                        ) : deltaPct > 0 ? (
+                          <span className="text-[#DC2626] inline-flex items-center gap-1">
+                            <TrendingUp className="w-3.5 h-3.5" />+{deltaPct.toFixed(1)}%
+                          </span>
+                        ) : (
+                          <span className="text-[#059669] inline-flex items-center gap-1">
+                            <TrendingDown className="w-3.5 h-3.5" />
+                            {deltaPct.toFixed(1)}%
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
             </tbody>
           </table>
         </div>
@@ -533,27 +563,35 @@ export function ReportsView({
               </tr>
             </thead>
             <tbody className="divide-y divide-[#E2E8F0]">
-              {awards.map((a) => {
-                const rfq = rfqs.find((r) => r.id === a.rfqId);
-                return (
-                  <tr
-                    key={a.id}
-                    onClick={() => onOpenRfq(a.rfqId)}
-                    className="hover:bg-[#F8FAFC] cursor-pointer"
-                  >
-                    <td className="py-3 px-4 font-mono font-semibold text-[#0F4C81]">
-                      {rfq?.rfqNumber || a.rfqId}
-                    </td>
-                    <td className="py-3 px-4">{a.isSplitAward ? 'Split Award' : 'Full Package'}</td>
-                    <td className="py-3 px-4">{a.recommendedBy}</td>
-                    <td className="py-3 px-4">{a.approvedBy || 'Pending'}</td>
-                    <td className="py-3 px-4 text-right font-mono tabular-nums font-semibold">
-                      {formatMoney(a.totalAwardedLanded, rfq?.currency || 'INR')}
-                    </td>
-                    <td className="py-3 px-4 font-semibold uppercase">{a.approvalStatus}</td>
-                  </tr>
-                );
-              })}
+              {awards.length === 0 ? (
+                <tr>
+                  <td colSpan={6} className="py-8 px-4 text-center text-xs text-[#475569]">
+                    No award decisions submitted yet. Verify supplier quotes and submit an award recommendation from an RFQ&apos;s Compare Matrix.
+                  </td>
+                </tr>
+              ) : (
+                awards.map((a) => {
+                  const rfq = rfqs.find((r) => r.id === a.rfqId);
+                  return (
+                    <tr
+                      key={a.id}
+                      onClick={() => onOpenRfq(a.rfqId)}
+                      className="hover:bg-[#F8FAFC] cursor-pointer"
+                    >
+                      <td className="py-3 px-4 font-mono font-semibold text-[#0F4C81]">
+                        {rfq?.rfqNumber || a.rfqId}
+                      </td>
+                      <td className="py-3 px-4">{a.isSplitAward ? 'Split Award' : 'Full Package'}</td>
+                      <td className="py-3 px-4">{a.recommendedBy}</td>
+                      <td className="py-3 px-4">{a.approvedBy || 'Pending'}</td>
+                      <td className="py-3 px-4 text-right font-mono tabular-nums font-semibold">
+                        {formatMoney(a.totalAwardedLanded, rfq?.currency || 'INR')}
+                      </td>
+                      <td className="py-3 px-4 font-semibold uppercase">{a.approvalStatus}</td>
+                    </tr>
+                  );
+                })
+              )}
             </tbody>
           </table>
         </div>
@@ -567,17 +605,23 @@ export function ReportsView({
           </h2>
         </div>
         <div className="divide-y divide-[#E2E8F0] max-h-96 overflow-y-auto">
-          {auditLogs.map((log) => (
-            <div key={log.id} className="px-5 py-3 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-              <div>
-                <span className="font-mono font-semibold text-[#0F4C81] mr-2">{log.action}</span>
-                <span className="text-[#0F172A]">{log.detail}</span>
-              </div>
-              <div className="text-[#475569] font-mono shrink-0">
-                {log.actorName} · {formatDateShort(log.createdAt)}
-              </div>
+          {auditLogs.length === 0 ? (
+            <div className="px-5 py-8 text-center text-xs text-[#475569]">
+              No extraction or approval events logged yet.
             </div>
-          ))}
+          ) : (
+            auditLogs.map((log) => (
+              <div key={log.id} className="px-5 py-3 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div>
+                  <span className="font-mono font-semibold text-[#0F4C81] mr-2">{log.action}</span>
+                  <span className="text-[#0F172A]">{log.detail}</span>
+                </div>
+                <div className="text-[#475569] font-mono shrink-0">
+                  {log.actorName} · {formatDateShort(log.createdAt)}
+                </div>
+              </div>
+            ))
+          )}
         </div>
       </div>
     </div>

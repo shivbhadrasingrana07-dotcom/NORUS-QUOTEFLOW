@@ -20,6 +20,7 @@ interface DashboardViewProps {
   onNewRfq: () => void;
   onLoadSample: () => Promise<void>;
   loadingSample: boolean;
+  demoMode?: boolean;
 }
 
 export function DashboardView({
@@ -32,6 +33,7 @@ export function DashboardView({
   onNewRfq,
   onLoadSample,
   loadingSample,
+  demoMode = false,
 }: DashboardViewProps) {
   const activeRfqs = rfqs.filter((r) => r.status !== 'closed' && r.status !== 'awarded');
   const quotesPendingReview = quotations.filter((q) => !q.isVerified);
@@ -109,6 +111,19 @@ export function DashboardView({
           <div className="text-xs text-[#475569] mt-1">Normalized landed cost delta</div>
         </div>
       </div>
+
+      {demoMode && (
+        <div className="bg-white border border-[#E2E8F0] rounded-lg px-5 py-3.5 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+          <div className="space-y-1">
+            <div className="text-xs font-semibold text-[#0F172A]">
+              5-Minute Demo Walkthrough (Synthetic Data · Offline Parser)
+            </div>
+            <div className="text-xs text-[#475569]">
+              1. Open <span className="font-mono text-[#0F4C81] font-medium">DEMO-RFQ-2026-101</span> below · 2. Fix Vanguard&apos;s math mismatch in Extraction Review · 3. Compare Landed Cost &amp; Split Award · 4. Approve &amp; export Comparative Statement Excel/PDF. Authenticated workspaces extract live supplier PDFs/images via Gemini AI.
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Action Queue: Needs Your Attention */}
       <div className="bg-white border border-[#E2E8F0] rounded-lg overflow-hidden">
@@ -235,84 +250,112 @@ export function DashboardView({
           <span className="text-xs text-[#475569]">Click any RFQ to inspect quotes or compare landed cost</span>
         </div>
 
-        <div className="overflow-x-auto">
-          <table className="w-full text-left border-collapse">
-            <thead>
-              <tr className="border-b border-[#E2E8F0] bg-[#F8FAFC] text-xs font-medium text-[#475569]">
-                <th className="py-2.5 px-4">RFQ #</th>
-                <th className="py-2.5 px-4">Title</th>
-                <th className="py-2.5 px-4 text-right">Items</th>
-                <th className="py-2.5 px-4 text-right">Quotes</th>
-                <th className="py-2.5 px-4 text-right">Best Landed (L1)</th>
-                <th className="py-2.5 px-4">Deadline</th>
-                <th className="py-2.5 px-4">Status</th>
-                <th className="py-2.5 px-4 text-right">Action</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-[#E2E8F0] text-sm">
-              {rfqs.map((rfq) => {
-                const rQuotes = quotations.filter((q) => q.rfqId === rfq.id);
-                const ranked = rankQuotations(rQuotes, 'landed', rfq);
-                const l1 = ranked.find((r) => r.rankIndex === 1);
-                const bestLanded = l1 ? l1.totalForBasis : null;
-                return (
-                  <tr
-                    key={rfq.id}
-                    onClick={() => onOpenRfq(rfq.id, rQuotes.length > 0 ? 'compare' : 'upload')}
-                    className="hover:bg-[#F8FAFC] cursor-pointer transition-colors"
-                  >
-                    <td className="py-3 px-4 font-mono text-xs font-semibold text-[#0F4C81] whitespace-nowrap">
-                      {rfq.rfqNumber}
-                    </td>
-                    <td className="py-3 px-4 font-medium text-[#0F172A] max-w-xs truncate">
-                      {rfq.title}
-                    </td>
-                    <td className="py-3 px-4 font-mono tabular-nums text-right text-[#475569]">
-                      {rfq.items.length}
-                    </td>
-                    <td className="py-3 px-4 font-mono tabular-nums text-right text-[#475569]">
-                      {rQuotes.length} / {Math.max(rQuotes.length, rfq.invitedSupplierIds.length)}
-                    </td>
-                    <td className="py-3 px-4 font-mono tabular-nums text-right font-semibold text-[#0F172A] whitespace-nowrap">
-                      {bestLanded !== null
-                        ? formatMoney(bestLanded, rfq.currency)
-                        : rQuotes.length > 0
-                        ? 'Pending Audit'
-                        : '—'}
-                    </td>
-                    <td className="py-3 px-4 font-mono text-xs text-[#475569] whitespace-nowrap">
-                      {formatDateShort(rfq.deadlineDate)}
-                    </td>
-                    <td className="py-3 px-4 whitespace-nowrap">
-                      <span
-                        className={`text-xs font-medium ${
-                          rfq.status === 'awarded' || rfq.status === 'approved'
-                            ? 'text-[#059669]'
-                            : rfq.status === 'pending_approval'
-                            ? 'text-[#0F4C81]'
-                            : 'text-[#D97706]'
-                        }`}
-                      >
-                        {rfqStatusLabel(rfq.status)}
-                      </span>
-                    </td>
-                    <td className="py-3 px-4 text-right whitespace-nowrap">
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          onOpenRfq(rfq.id, rQuotes.length > 0 ? 'compare' : 'upload');
-                        }}
-                        className="text-xs font-medium text-[#0F4C81] hover:underline"
-                      >
-                        {rQuotes.length > 0 ? 'Compare Matrix' : 'Upload Quotes'}
-                      </button>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
+        {rfqs.length === 0 ? (
+          <div className="px-5 py-8 text-center space-y-3">
+            <div className="text-sm font-semibold text-[#0F172A]">
+              Welcome to NORUS QUOTEFLOW — start your first Pre-PO comparison
+            </div>
+            <p className="text-xs text-[#475569] max-w-xl mx-auto">
+              1. Create an RFQ (or paste BOM lines from Excel) · 2. Upload supplier PDF, XLSX, CSV, or WhatsApp quotes · 3. Verify arithmetic &amp; freight · 4. Compare Net Landed Cost and export an audit-ready Comparative Statement.
+            </p>
+            <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
+              <button
+                type="button"
+                onClick={onNewRfq}
+                className="px-3.5 py-1.5 text-xs font-medium text-white bg-[#0F4C81] rounded-md hover:bg-[#0A365C]"
+              >
+                Create First RFQ
+              </button>
+              <button
+                type="button"
+                onClick={onLoadSample}
+                disabled={loadingSample}
+                className="px-3.5 py-1.5 text-xs font-medium text-[#0F4C81] bg-white border border-[#E2E8F0] rounded-md hover:bg-[#F8FAFC] disabled:opacity-50"
+              >
+                {loadingSample ? 'Loading...' : 'Load Sample RFQ'}
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse">
+              <thead>
+                <tr className="border-b border-[#E2E8F0] bg-[#F8FAFC] text-xs font-medium text-[#475569]">
+                  <th className="py-2.5 px-4">RFQ #</th>
+                  <th className="py-2.5 px-4">Title</th>
+                  <th className="py-2.5 px-4 text-right">Items</th>
+                  <th className="py-2.5 px-4 text-right">Quotes</th>
+                  <th className="py-2.5 px-4 text-right">Best Landed (L1)</th>
+                  <th className="py-2.5 px-4">Deadline</th>
+                  <th className="py-2.5 px-4">Status</th>
+                  <th className="py-2.5 px-4 text-right">Action</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[#E2E8F0] text-sm">
+                {rfqs.map((rfq) => {
+                  const rQuotes = quotations.filter((q) => q.rfqId === rfq.id);
+                  const ranked = rankQuotations(rQuotes, 'landed', rfq);
+                  const l1 = ranked.find((r) => r.rankIndex === 1);
+                  const bestLanded = l1 ? l1.totalForBasis : null;
+                  return (
+                    <tr
+                      key={rfq.id}
+                      onClick={() => onOpenRfq(rfq.id, rQuotes.length > 0 ? 'compare' : 'upload')}
+                      className="hover:bg-[#F8FAFC] cursor-pointer transition-colors"
+                    >
+                      <td className="py-3 px-4 font-mono text-xs font-semibold text-[#0F4C81] whitespace-nowrap">
+                        {rfq.rfqNumber}
+                      </td>
+                      <td className="py-3 px-4 font-medium text-[#0F172A] max-w-xs truncate">
+                        {rfq.title}
+                      </td>
+                      <td className="py-3 px-4 font-mono tabular-nums text-right text-[#475569]">
+                        {rfq.items.length}
+                      </td>
+                      <td className="py-3 px-4 font-mono tabular-nums text-right text-[#475569]">
+                        {rQuotes.length} / {Math.max(rQuotes.length, rfq.invitedSupplierIds.length)}
+                      </td>
+                      <td className="py-3 px-4 font-mono tabular-nums text-right font-semibold text-[#0F172A] whitespace-nowrap">
+                        {bestLanded !== null
+                          ? formatMoney(bestLanded, rfq.currency)
+                          : rQuotes.length > 0
+                          ? 'Pending Audit'
+                          : '—'}
+                      </td>
+                      <td className="py-3 px-4 font-mono text-xs text-[#475569] whitespace-nowrap">
+                        {formatDateShort(rfq.deadlineDate)}
+                      </td>
+                      <td className="py-3 px-4 whitespace-nowrap">
+                        <span
+                          className={`text-xs font-medium ${
+                            rfq.status === 'awarded' || rfq.status === 'approved'
+                              ? 'text-[#059669]'
+                              : rfq.status === 'pending_approval'
+                              ? 'text-[#0F4C81]'
+                              : 'text-[#D97706]'
+                          }`}
+                        >
+                          {rfqStatusLabel(rfq.status)}
+                        </span>
+                      </td>
+                      <td className="py-3 px-4 text-right whitespace-nowrap">
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onOpenRfq(rfq.id, rQuotes.length > 0 ? 'compare' : 'upload');
+                          }}
+                          className="text-xs font-medium text-[#0F4C81] hover:underline"
+                        >
+                          {rQuotes.length > 0 ? 'Compare Matrix' : 'Upload Quotes'}
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
     </div>
   );

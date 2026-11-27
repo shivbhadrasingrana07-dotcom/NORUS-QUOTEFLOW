@@ -1,5 +1,15 @@
 # Changelog
 
+## Task 014 — Customer & Commercial Readiness Assessment, Staging Audit & Onboarding UX
+
+### Assessed, Designed & Improved
+- **Onboarding & Empty-State UX (`src/App.tsx`, `src/components/DashboardView.tsx`, `src/components/SecondaryViews.tsx`, `src/components/RfqCreateModal.tsx`):**
+  - Replaced blank empty tables on new customer workspaces (`0` RFQs, `0` suppliers, `0` item price history, `0` awards/audit logs) with actionable empty states (`Create First RFQ` / `Load Sample RFQ` onboarding checklist on `DashboardView`, helper guidance in `RfqsListView`, `SuppliersView`, `ItemsView`, `ReportsView`, and `RfqCreateModal` when `suppliers.length === 0`).
+  - Added a compact **5-Minute Demo Walkthrough** card on `DashboardView` when `demoMode === true` clarifying synthetic sample data + offline extraction vs. live authenticated AI extraction while preserving all existing table/E2E selectors.
+- **Customer, Commercial & Staging Readiness Audits (`docs/PROJECT_STATUS.md`, `docs/CONFIGURATION.md`, `docs/NEXT_TASK.md`):**
+  - Documented non-validated INR pricing tier hypotheses (`Starter`, `Professional`, `Business`) with AI document quota guardrails, positioning/sales demo playbook, and non-mutating staging verification status across all 10 cutover prerequisites.
+- **Regression Tests (`tests/stabilizationUnit.test.ts`):** Added SSR component rendering tests verifying empty-state onboarding across all views and `demoMode` walkthrough rendering.
+
 ## Task 013.2 — Lockfile Reconciliation & Remote CI Closure
 
 ### Reconciled & Verified

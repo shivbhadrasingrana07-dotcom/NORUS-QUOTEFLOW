@@ -123,3 +123,18 @@
 - [ ] Verify rate-limit `429` spikes vs. auth failures (`authRateLimiter`), Gemini API quota usage/latency, and S3 bucket storage growth.
 - [ ] Confirm `ops:maintenance` (in-process or Cloud Scheduler) completes without `advisory lock` contention and purges expired `sessions` / `rate_limit_buckets` / orphaned `stored_documents` on schedule.
 
+## Current Staging Readiness Snapshot (Task 014 Non-Mutating Audit)
+
+| Prerequisite | Status | Observed Evidence |
+| :--- | :--- | :--- |
+| Cloud SQL backup & recovery procedure | `NOT CONFIGURED` / `UNKNOWN / CANNOT VERIFY` | Runbook documented above; live GCP PITR/snapshots not inspectable from sandbox |
+| `0001_tenant_integrity.sql` migration status | `NOT CONFIGURED` *(CI PG16 Verified)* | `drizzle/0001_tenant_integrity*.sql` passed CI Run `#12` PG16; not yet applied to Cloud SQL |
+| Organization owner bootstrap | `NOT CONFIGURED` | `scripts/bootstrap-org-owner.ts` present; `org-kalyani-hydraulics` awaits founder claim |
+| Private S3/R2 storage | `NOT CONFIGURED` | `/api/health` shows `storageProvider: "local"`; `STORAGE_PROVIDER` / `S3_*` unset |
+| Resend verified email domain | `NOT CONFIGURED` | `/api/health` shows `emailProvider: "dev_outbox"`; `RESEND_API_KEY` / `EMAIL_FROM` unset |
+| Firebase Authorized Domains | `UNKNOWN / CANNOT VERIFY` | `googleAuthConfigured: true` locally; Firebase Console domain list requires console inspection |
+| `CSP_MODE=enforce` | `NOT CONFIGURED` | `CSP_MODE` unset (defaults to `report-only` in `NODE_ENV=production`) |
+| `ERROR_WEBHOOK_URL` & monitoring | `NOT CONFIGURED` | `ERROR_WEBHOOK_URL` unset; external Cloud Monitoring uptime alerts unverified |
+| Staging Gemini schema validation | `BLOCKED` / `NOT CONFIGURED` | Shell `GEMINI_API_KEY` & `RUN_LIVE_GEMINI_TESTS` unset (`1` live test skipped locally) |
+| `/api/health/ready` verification | `UNKNOWN / CANNOT VERIFY` | Route implemented (`server.ts:517`); intentionally not probed against live Cloud SQL in read-only audit |
+

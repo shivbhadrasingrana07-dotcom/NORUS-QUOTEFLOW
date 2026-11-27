@@ -601,6 +601,7 @@ export default function App() {
               onNewRfq={() => setCreateModalOpen(true)}
               onLoadSample={handleLoadSample}
               loadingSample={loadingSample}
+              demoMode={demoMode}
             />
           )}
 
