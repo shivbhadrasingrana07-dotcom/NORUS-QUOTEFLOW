@@ -14,12 +14,15 @@ import { MemoryRateLimitStore } from '../server/rateLimiter.ts';
 import type { DrizzleDb } from '../src/db/index.ts';
 import * as schema from '../src/db/schema.ts';
 import {
+  aiExtractionReservations,
+  aiTokenUsageLogs,
   auditLogs,
   awardAllocations,
   awards,
   catalogItems,
   invitations,
   organizationMemberships,
+  organizationMonthlyUsage,
   organizations,
   priceHistory,
   quotationLines,
@@ -346,6 +349,13 @@ export async function cleanupTestOrganizationsAndUsers(params: {
   }
 
   if (orgIds.length > 0) {
+    await db.delete(aiTokenUsageLogs).where(inArray(aiTokenUsageLogs.organizationId, orgIds));
+    await db
+      .delete(aiExtractionReservations)
+      .where(inArray(aiExtractionReservations.organizationId, orgIds));
+    await db
+      .delete(organizationMonthlyUsage)
+      .where(inArray(organizationMonthlyUsage.organizationId, orgIds));
     await db.delete(awardAllocations).where(inArray(awardAllocations.organizationId, orgIds));
     await db.delete(awards).where(inArray(awards.organizationId, orgIds));
     await db.delete(quotationLines).where(inArray(quotationLines.organizationId, orgIds));

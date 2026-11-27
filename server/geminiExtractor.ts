@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { GoogleGenAI, Type } from '@google/genai';
 import {
+  AiTokenUsageTelemetry,
   OrganizationSettings,
   Quotation,
   QuotationLine,
@@ -42,11 +43,61 @@ export function estimateExchangeRate(
 
 export class ExtractionServiceError extends Error {
   statusCode: number;
-  constructor(message: string, statusCode = 500) {
+  tokenUsage?: AiTokenUsageTelemetry;
+  constructor(message: string, statusCode = 500, tokenUsage?: AiTokenUsageTelemetry) {
     super(message);
     this.name = 'ExtractionServiceError';
     this.statusCode = statusCode;
+    this.tokenUsage = tokenUsage;
   }
+}
+
+export interface GeminiRawUsageMetadata {
+  promptTokenCount?: number | null;
+  candidatesTokenCount?: number | null;
+  totalTokenCount?: number | null;
+  thoughtsTokenCount?: number | null;
+  cachedContentTokenCount?: number | null;
+  toolUsePromptTokenCount?: number | null;
+}
+
+function parseOptionalTokenInt(raw: unknown): number | null {
+  if (raw === null || raw === undefined) return null;
+  const n = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number(raw.trim()) : NaN;
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.round(n);
+}
+
+export function normalizeGeminiUsageMetadata(
+  raw: unknown,
+  model: string = GEMINI_EXTRACTION_MODEL
+): AiTokenUsageTelemetry {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return {
+      model,
+      usageAvailable: false,
+      promptTokenCount: null,
+      candidatesTokenCount: null,
+      totalTokenCount: null,
+      thoughtsTokenCount: null,
+    };
+  }
+  const obj = raw as Record<string, unknown>;
+  const promptTokenCount = parseOptionalTokenInt(obj.promptTokenCount);
+  const candidatesTokenCount = parseOptionalTokenInt(obj.candidatesTokenCount);
+  const totalTokenCount = parseOptionalTokenInt(obj.totalTokenCount);
+  const thoughtsTokenCount = parseOptionalTokenInt(obj.thoughtsTokenCount);
+  const usageAvailable =
+    promptTokenCount !== null || candidatesTokenCount !== null || totalTokenCount !== null;
+
+  return {
+    model,
+    usageAvailable,
+    promptTokenCount: usageAvailable ? promptTokenCount : null,
+    candidatesTokenCount: usageAvailable ? candidatesTokenCount : null,
+    totalTokenCount: usageAvailable ? totalTokenCount : null,
+    thoughtsTokenCount: usageAvailable ? thoughtsTokenCount : null,
+  };
 }
 
 function sanitizeErrorMessage(raw: string): string {
@@ -569,17 +620,22 @@ export function buildQuotationFromExtraction(params: {
   return recomputeQuotation(rawQuotation, rfq);
 }
 
+export interface GenerateContentResponseLike {
+  text?: string;
+  usageMetadata?: GeminiRawUsageMetadata | Record<string, unknown> | null;
+}
+
 export type GenerateContentFn = (params: {
   model: string;
   contents: { parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> };
   config: Record<string, unknown>;
-}) => Promise<{ text?: string }>;
+}) => Promise<GenerateContentResponseLike>;
 
 async function callWithTimeoutAndRetry(
-  fn: () => Promise<{ text?: string }>,
+  fn: () => Promise<GenerateContentResponseLike>,
   timeoutMs: number,
   maxRetries = 2
-): Promise<{ text?: string }> {
+): Promise<GenerateContentResponseLike> {
   let lastErr: unknown;
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -638,12 +694,20 @@ export interface ExtractQuoteInput {
   mimeType: string;
   fileBuffer?: Buffer;
   rawEmailText?: string;
+  preParsedSpreadsheet?: ParsedSpreadsheetResult;
   skipInlineDataUrl?: boolean;
   generateContentOverride?: GenerateContentFn;
   timeoutMs?: number;
 }
 
-export async function extractQuotationWithGemini(input: ExtractQuoteInput): Promise<Quotation> {
+export interface ExtractQuoteTelemetryResult {
+  quotation: Quotation;
+  tokenUsage: AiTokenUsageTelemetry;
+}
+
+export async function extractQuotationWithTelemetry(
+  input: ExtractQuoteInput
+): Promise<ExtractQuoteTelemetryResult> {
   const {
     rfq,
     supplierId,
@@ -652,6 +716,7 @@ export async function extractQuotationWithGemini(input: ExtractQuoteInput): Prom
     mimeType,
     fileBuffer,
     rawEmailText,
+    preParsedSpreadsheet,
     skipInlineDataUrl = false,
     generateContentOverride,
     timeoutMs = 45000,
@@ -674,11 +739,13 @@ export async function extractQuotationWithGemini(input: ExtractQuoteInput): Prom
   let sheetPreview: { sheetName: string; rows: string[][] }[] | undefined;
   let spreadsheetText = '';
 
-  if (isSpreadsheet && fileBuffer) {
-    const parsed = await parseSpreadsheetBufferIsolated(fileBuffer, {
-      documentName,
-      mimeType,
-    });
+  if (isSpreadsheet && (preParsedSpreadsheet || fileBuffer)) {
+    const parsed =
+      preParsedSpreadsheet ??
+      (await parseSpreadsheetBufferIsolated(fileBuffer!, {
+        documentName,
+        mimeType,
+      }));
     sheetPreview = parsed.sheetPreview;
     spreadsheetText = parsed.structuredText;
     if (!spreadsheetText.trim()) {
@@ -819,14 +886,27 @@ Instructions:
     timeoutMs
   );
 
-  const parsed = parseAndValidateAiJson(response.text);
+  const tokenUsage = normalizeGeminiUsageMetadata(
+    response.usageMetadata,
+    GEMINI_EXTRACTION_MODEL
+  );
+
+  let parsed: GeminiExtractedQuote;
+  try {
+    parsed = parseAndValidateAiJson(response.text);
+  } catch (err) {
+    if (err instanceof ExtractionServiceError) {
+      err.tokenUsage = tokenUsage;
+    }
+    throw err;
+  }
 
   let fileDataUrl: string | undefined;
   if (!skipInlineDataUrl && (isImage || isPdf) && fileBuffer && fileBuffer.byteLength <= 4 * 1024 * 1024) {
     fileDataUrl = `data:${isPdf ? 'application/pdf' : mimeType};base64,${fileBuffer.toString('base64')}`;
   }
 
-  return buildQuotationFromExtraction({
+  const quotation = buildQuotationFromExtraction({
     parsed,
     rfq,
     supplierId,
@@ -838,4 +918,14 @@ Instructions:
     rawEmailText,
     sheetPreview,
   });
+
+  return {
+    quotation,
+    tokenUsage,
+  };
+}
+
+export async function extractQuotationWithGemini(input: ExtractQuoteInput): Promise<Quotation> {
+  const { quotation } = await extractQuotationWithTelemetry(input);
+  return quotation;
 }

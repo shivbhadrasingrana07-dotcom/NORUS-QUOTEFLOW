@@ -1,5 +1,6 @@
-import { relations } from 'drizzle-orm';
+import { relations, sql } from 'drizzle-orm';
 import {
+  bigint,
   boolean,
   doublePrecision,
   index,
@@ -38,6 +39,9 @@ export const organizations = pgTable('organizations', {
   taxRegime: text('tax_regime').notNull().default('INDIA_GST'),
   defaultTaxCreditable: boolean('default_tax_creditable').notNull().default(true),
   uomAliases: jsonb('uom_aliases').$type<Record<string, string>>().notNull().default({}),
+  planTier: text('plan_tier').notNull().default('legacy'),
+  monthlyExtractionLimitOverride: integer('monthly_extraction_limit_override'),
+  storageLimitBytesOverride: bigint('storage_limit_bytes_override', { mode: 'number' }),
   createdByUserId: text('created_by_user_id').references(() => users.id, { onDelete: 'set null' }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
@@ -420,6 +424,79 @@ export const rateLimitBuckets = pgTable('rate_limit_buckets', {
   hits: integer('hits').notNull().default(0),
   resetAt: timestamp('reset_at', { withTimezone: true }).notNull(),
 });
+
+export const organizationMonthlyUsage = pgTable(
+  'organization_monthly_usage',
+  {
+    id: text('id').primaryKey(),
+    organizationId: text('organization_id')
+      .notNull()
+      .references(() => organizations.id, { onDelete: 'cascade' }),
+    periodMonth: text('period_month').notNull(), // YYYY-MM (UTC)
+    committedExtractions: integer('committed_extractions').notNull().default(0),
+    totalPromptTokens: bigint('total_prompt_tokens', { mode: 'number' }).notNull().default(0),
+    totalCandidatesTokens: bigint('total_candidates_tokens', { mode: 'number' }).notNull().default(0),
+    totalTokens: bigint('total_tokens', { mode: 'number' }).notNull().default(0),
+    unavailableEventsCount: integer('unavailable_events_count').notNull().default(0),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('org_monthly_usage_org_period_uidx').on(table.organizationId, table.periodMonth),
+  ]
+);
+
+export const aiExtractionReservations = pgTable(
+  'ai_extraction_reservations',
+  {
+    id: text('id').primaryKey(),
+    organizationId: text('organization_id')
+      .notNull()
+      .references(() => organizations.id, { onDelete: 'cascade' }),
+    periodMonth: text('period_month').notNull(),
+    rfqId: text('rfq_id').notNull(),
+    supplierId: text('supplier_id').notNull(),
+    idempotencyKey: text('idempotency_key'),
+    reservedBytes: bigint('reserved_bytes', { mode: 'number' }).notNull().default(0),
+    status: text('status').notNull().default('reserved'), // reserved | committed | released
+    quotationId: text('quotation_id'),
+    documentId: text('document_id'),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    finalizedAt: timestamp('finalized_at', { withTimezone: true }),
+  },
+  (table) => [
+    index('ai_reservations_org_status_exp_idx').on(
+      table.organizationId,
+      table.status,
+      table.expiresAt
+    ),
+    uniqueIndex('ai_reservations_org_idemp_uidx')
+      .on(table.organizationId, table.idempotencyKey)
+      .where(sql`idempotency_key IS NOT NULL AND status IN ('reserved', 'committed')`),
+  ]
+);
+
+export const aiTokenUsageLogs = pgTable(
+  'ai_token_usage_logs',
+  {
+    id: text('id').primaryKey(),
+    organizationId: text('organization_id')
+      .notNull()
+      .references(() => organizations.id, { onDelete: 'cascade' }),
+    documentId: text('document_id'),
+    quotationId: text('quotation_id'),
+    reservationId: text('reservation_id'),
+    model: text('model').notNull(),
+    outcome: text('outcome').notNull(), // succeeded | failed
+    usageAvailable: boolean('usage_available').notNull().default(false),
+    promptTokenCount: integer('prompt_token_count'),
+    candidatesTokenCount: integer('candidates_token_count'),
+    totalTokenCount: integer('total_token_count'),
+    thoughtsTokenCount: integer('thoughts_token_count'),
+    createdAt: text('created_at').notNull(),
+  },
+  (table) => [index('ai_token_usage_org_created_idx').on(table.organizationId, table.createdAt)]
+);
 
 // Drizzle Relations
 export const usersRelations = relations(users, ({ many }) => ({

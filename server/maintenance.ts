@@ -3,6 +3,7 @@ import path from 'path';
 import { and, eq, inArray, lt, lte, notExists, or } from 'drizzle-orm';
 import type { DrizzleDb } from '../src/db/index.ts';
 import {
+  aiExtractionReservations,
   invitations,
   quotations,
   rateLimitBuckets,
@@ -27,6 +28,7 @@ export interface MaintenanceSummary {
   deletedExpiredRateBuckets: number;
   cleanedOrphanedDocuments: number;
   cleanedTempStorageFiles: number;
+  releasedExpiredReservations?: number;
   errors: string[];
 }
 
@@ -92,6 +94,7 @@ export async function runScheduledMaintenance(params: {
   let deletedExpiredRateBuckets = 0;
   let cleanedOrphanedDocuments = 0;
   let cleanedTempStorageFiles = 0;
+  let releasedExpiredReservations = 0;
 
   const lockPool: AdvisoryLockPool | undefined =
     params.lockPool === null
@@ -123,6 +126,7 @@ export async function runScheduledMaintenance(params: {
           deletedExpiredRateBuckets: 0,
           cleanedOrphanedDocuments: 0,
           cleanedTempStorageFiles: 0,
+          releasedExpiredReservations: 0,
           errors: [],
         };
       }
@@ -321,6 +325,36 @@ export async function runScheduledMaintenance(params: {
     errors.push(`temp_files: ${err instanceof Error ? err.message : String(err)}`);
   }
 
+  // 7. Release expired in-flight AI extraction quota reservations
+  try {
+    const staleReservations = await params.db
+      .select({ id: aiExtractionReservations.id })
+      .from(aiExtractionReservations)
+      .where(
+        and(
+          eq(aiExtractionReservations.status, 'reserved'),
+          lte(aiExtractionReservations.expiresAt, now)
+        )
+      )
+      .limit(batchSize);
+
+    if (staleReservations.length > 0) {
+      const updated = await params.db
+        .update(aiExtractionReservations)
+        .set({ status: 'released', finalizedAt: now })
+        .where(
+          inArray(
+            aiExtractionReservations.id,
+            staleReservations.map((r) => r.id)
+          )
+        )
+        .returning({ id: aiExtractionReservations.id });
+      releasedExpiredReservations = updated.length;
+    }
+  } catch (err) {
+    errors.push(`ai_extraction_reservations: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
   const summary: MaintenanceSummary = {
     startedAt: startedAt.toISOString(),
     durationMs: Date.now() - startedAt.getTime(),
@@ -333,6 +367,7 @@ export async function runScheduledMaintenance(params: {
     deletedExpiredRateBuckets,
     cleanedOrphanedDocuments,
     cleanedTempStorageFiles,
+    releasedExpiredReservations,
     errors,
   };
 

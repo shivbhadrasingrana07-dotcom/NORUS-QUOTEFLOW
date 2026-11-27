@@ -37,6 +37,7 @@
 | `DEMO_MODE` | No (`false` in prod) | `true` in dev/test; **`false` in prod** | Controls the isolated synthetic no-login sandbox (`/api/demo-workspace*`). In `development`/`test`, unset/`true` enables demo mode and `false` restores full login (`AuthView`/`OrganizationView`). In `NODE_ENV=production`, demo mode is strictly **OFF by default**, and setting `DEMO_MODE="true"` **fails closed on boot** |
 | `TEST_DATABASE_URL` / `TEST_SQL_*` | For PG integration tests | *(unset)* | Disposable PostgreSQL target (`TEST_SQL_HOST`, `TEST_SQL_PORT`, `TEST_SQL_DB_NAME`, `TEST_SQL_USER`, `TEST_SQL_PASSWORD`, `TEST_SQL_SSL`, `TEST_SQL_SSL_CA`, `TEST_SQL_SSL_ALLOW_SELF_SIGNED`) used by `tests/_helpers.ts`. Rejects Unix socket/`/cloudsql/` hosts, `cloud_sql_development_database`/`prod`/`production`/`staging`/`postgres`, and live `SQL_HOST`+`SQL_DB_NAME` overlap (except `NODE_ENV=test` local CI loopback `127.0.0.1`/`localhost`/`::1`/`postgres` with `*_test`/`*-test` DB names) |
 | `RUN_LIVE_GEMINI_TESTS` | No | `'false'` | Set `'true'` alongside a valid `GEMINI_API_KEY` to execute live Gemini API smoke tests in `tests/extractionValidation.test.ts` |
+| `DEFAULT_NEW_ORG_PLAN` | No | `'starter'` | Default `plan_tier` assigned to newly registered/created organizations (`starter` \| `professional` \| `business` \| `legacy`). Existing DB rows default `'legacy'` |
 
 ## Key NPM Scripts (`package.json`)
 
@@ -77,7 +78,7 @@
 | # | Area | Exact Requirement & Configuration | Safety / Verification Note |
 | :--- | :--- | :--- | :--- |
 | 1 | **Cloud SQL Backup & Recovery** | Enable automated daily backups + **7-day Point-in-Time Recovery (PITR)**; capture an on-demand pre-migration Cloud SQL snapshot (`gcloud sql backups create`) before executing any DDL | Never modify production/staging Cloud SQL directly without a verified recent snapshot |
-| 2 | **`0001` Tenant-Integrity Migration** | Against backed-up PostgreSQL 15+ Cloud SQL: (a) run `drizzle/0001_tenant_integrity_preflight.sql` (must return `0` cross-org rows); (b) execute `drizzle/0001_tenant_integrity.sql` (`BEGIN;...COMMIT;`); (c) keep `drizzle/0001_tenant_integrity_rollback.sql` ready | Verified in GitHub Actions PG16 (`Run #7`, commit `66b9367e`); not yet run on Cloud SQL |
+| 2 | **`0001` & `0002` Schema Migrations** | Against backed-up PostgreSQL 15+ Cloud SQL: (a) run `drizzle/0001_tenant_integrity_preflight.sql` (must return `0` cross-org rows); (b) execute `drizzle/0001_tenant_integrity.sql` (`BEGIN;...COMMIT;`); (c) execute `drizzle/0002_usage_quotas_and_tokens.sql` (`BEGIN;...COMMIT;`); (d) keep both `_rollback.sql` scripts ready | `0001` passed CI Run `#12`; `0002` wired into CI `.github/workflows/ci.yml`; neither executed on Cloud SQL |
 | 3 | **Founder Account Bootstrap** | Claim `org-kalyani-hydraulics` (`0` owners) via `npm run org:bootstrap-owner -- --org-id=org-kalyani-hydraulics --issue-token --email="<founder-email>" --ttl-hours=72` (or `--claim-direct`) | Protected by `organizations FOR UPDATE` lock; rejects duplicate owners (`409`) |
 | 4 | **`SESSION_SECRET`** | Generate cryptographically random `>= 32`-character secret (`openssl rand -base64 48`) stored in Secret Manager | `getSigningSecret()` fails closed on boot in `NODE_ENV=production` if unset or `< 32` chars |
 | 5 | **Canonical URL, CORS & Cookies** | Set `APP_URL="https://<prod-domain>"`, `ALLOWED_ORIGINS="https://<prod-domain>"`, `COOKIE_SAMESITE="lax"` (for dedicated custom domain; leave unset/`none` only if embedded in HTTPS iframe), and `TRUST_PROXY_HOPS` matching exact proxy hop depth (`1` Cloud Run LB, `2` CDN+LB) | Prevents `Host`-header link construction fallback in `getAppBaseUrl(req)` and ensures accurate `req.ip` rate limiting |
@@ -95,13 +96,13 @@
 - [ ] Latest commit built and passed CI (`verify` + `browser-e2e`) with `NODE_ENV=production` and `DEMO_MODE` unset (verified `demoMode: false` on `/api/auth/me`).
 - [ ] All Secret Manager entries (`SESSION_SECRET`, `SQL_*`, `GEMINI_API_KEY`, `RESEND_API_KEY`, `S3_*`) mounted and verified non-placeholder.
 - [ ] `APP_URL`, `ALLOWED_ORIGINS`, `EMAIL_FROM`, `COOKIE_SAMESITE`, `TRUST_PROXY_HOPS`, and `CSP_MODE=enforce` verified in Cloud Run env.
-- [ ] Cloud SQL backup + `0001_tenant_integrity_preflight.sql` + `0001_tenant_integrity.sql` completed cleanly.
+- [ ] Cloud SQL backup + `0001_tenant_integrity_preflight.sql` + `0001_tenant_integrity.sql` + `0002_usage_quotas_and_tokens.sql` completed cleanly.
 - [ ] Deploy new revision at `0%` traffic (`--no-traffic`), run `curl -sf https://<staging-tag>/api/health/ready` (`database.ok: true`, `storage.ok: true`, `email.mode: "resend"`), smoke-test login + Google popup + PDF upload + comparison export, then shift traffic to `100%`.
 
 ### 2. Backup & Rollback Checklist
 - [ ] Record current working Cloud Run revision name and on-demand Cloud SQL backup ID prior to change.
 - [ ] **Application-only regression:** Route `100%` Cloud Run traffic back to prior revision (`gcloud run services update-traffic ... --to-revisions=<PREV>=100`); verify `/api/health/ready`.
-- [ ] **Schema rollback (if `0001` triggered post-apply issues):** Pause writes/scale to maintenance if needed, run `drizzle/0001_tenant_integrity_rollback.sql`, then roll traffic back; restore PITR/snapshot only if corrupted data must be rewound.
+- [ ] **Schema rollback (if `0002` / `0001` triggered post-apply issues):** Pause writes/scale to maintenance if needed, run `drizzle/0002_usage_quotas_and_tokens_rollback.sql` (and `drizzle/0001_tenant_integrity_rollback.sql` if reverting `0001`), then roll traffic back; restore PITR/snapshot only if corrupted data must be rewound.
 
 ### 3. Incident Response Checklist
 - [ ] Inspect structured JSON logs using `X-Request-Id` from failing API responses or `ERROR_WEBHOOK_URL` alerts (`GET /api/health/ready` identifies DB vs. S3 vs. config failure).
@@ -128,7 +129,7 @@
 | Prerequisite | Status | Observed Evidence |
 | :--- | :--- | :--- |
 | Cloud SQL backup & recovery procedure | `NOT CONFIGURED` / `UNKNOWN / CANNOT VERIFY` | Runbook documented above; live GCP PITR/snapshots not inspectable from sandbox |
-| `0001_tenant_integrity.sql` migration status | `NOT CONFIGURED` *(CI PG16 Verified)* | `drizzle/0001_tenant_integrity*.sql` passed CI Run `#12` PG16; not yet applied to Cloud SQL |
+| `0001` & `0002` migration status | `NOT CONFIGURED` *(0001 CI PG16 Verified; 0002 Added to CI)* | `0001` passed CI Run `#12`; `0002` authored in Task 017; neither applied to live Cloud SQL |
 | Organization owner bootstrap | `NOT CONFIGURED` | `scripts/bootstrap-org-owner.ts` present; `org-kalyani-hydraulics` awaits founder claim |
 | Private S3/R2 storage | `NOT CONFIGURED` | `/api/health` shows `storageProvider: "local"`; `STORAGE_PROVIDER` / `S3_*` unset |
 | Resend verified email domain | `NOT CONFIGURED` | `/api/health` shows `emailProvider: "dev_outbox"`; `RESEND_API_KEY` / `EMAIL_FROM` unset |
@@ -137,4 +138,16 @@
 | `ERROR_WEBHOOK_URL` & monitoring | `NOT CONFIGURED` | `ERROR_WEBHOOK_URL` unset; external Cloud Monitoring uptime alerts unverified |
 | Staging Gemini schema validation | `BLOCKED` / `NOT CONFIGURED` | Shell `GEMINI_API_KEY` & `RUN_LIVE_GEMINI_TESTS` unset (`1` live test skipped locally) |
 | `/api/health/ready` verification | `UNKNOWN / CANNOT VERIFY` | Route implemented (`server.ts:517`); intentionally not probed against live Cloud SQL in read-only audit |
+
+## Organization Usage Quota Policy (`server/usagePolicy.ts` — Task 017)
+
+> All plan caps below (`starter`, `professional`, `business`) are **unvalidated commercial hypotheses** (`isUnvalidatedHypothesis: true`); `legacy` preserves unrestricted access for migrated/pre-Task-017 organizations. Storage usage is computed from `SUM(stored_documents.byte_size)` + active `ai_extraction_reservations`, reclaiming immediately when quotations/documents are deleted. Quotas reset on the 1st of each UTC calendar month.
+
+| `plan_tier` | Monthly AI Extraction Limit | Storage Limit | Notes |
+| :--- | :---: | :---: | :--- |
+| `legacy` | Unlimited (`null`) | Unlimited (`null`) | Default for existing DB rows (`0002` DDL); non-blocking |
+| `starter` | `60` docs / UTC month | `5 GiB` (`5,368,709,120` B) | Default for new organizations (`DEFAULT_NEW_ORG_PLAN=starter`) |
+| `professional` | `250` docs / UTC month | `25 GiB` (`26,843,545,600` B) | Unvalidated mid-tier hypothesis |
+| `business` | `800` docs / UTC month | `100 GiB` (`107,374,182,400` B) | Unvalidated multi-plant hypothesis |
+
 

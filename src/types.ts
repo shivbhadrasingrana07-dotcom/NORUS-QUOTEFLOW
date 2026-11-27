@@ -47,6 +47,49 @@ export interface AuthUser {
   hasGoogleLinked: boolean;
 }
 
+export type OrganizationPlanTier = 'legacy' | 'starter' | 'professional' | 'business';
+
+export interface AiTokenUsageTelemetry {
+  model: string;
+  usageAvailable: boolean;
+  promptTokenCount: number | null;
+  candidatesTokenCount: number | null;
+  totalTokenCount: number | null;
+  thoughtsTokenCount: number | null;
+}
+
+export interface OrganizationUsageSummary {
+  organizationId: string;
+  planTier: OrganizationPlanTier;
+  planLabel: string;
+  isUnvalidatedHypothesis: boolean;
+  periodMonth: string;
+  periodStart: string;
+  resetAt: string;
+  extractions: {
+    limit: number | null;
+    committed: number;
+    activeReserved: number;
+    remaining: number | null;
+    isCustomOverride: boolean;
+  };
+  storage: {
+    limitBytes: number | null;
+    usedBytes: number;
+    activeReservedBytes: number;
+    remainingBytes: number | null;
+    isCustomOverride: boolean;
+  };
+  tokens: {
+    periodMonth: string;
+    promptTokens: number;
+    candidatesTokens: number;
+    totalTokens: number;
+    unavailableEventsCount: number;
+    costVerified: false;
+  };
+}
+
 export interface OrganizationSummary {
   id: string;
   slug: string;
@@ -56,6 +99,7 @@ export interface OrganizationSummary {
   taxRegime: TaxRegime;
   defaultTaxCreditable: boolean;
   role: UserRole;
+  planTier?: OrganizationPlanTier;
 }
 
 export interface OrganizationMember {

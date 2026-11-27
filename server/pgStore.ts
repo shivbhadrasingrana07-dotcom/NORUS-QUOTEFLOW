@@ -1,12 +1,15 @@
-import { and, asc, desc, eq, gt, inArray, isNull } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, inArray, isNull, lte, sql } from 'drizzle-orm';
 import type { DrizzleDb } from '../src/db/index.ts';
 import {
+  aiExtractionReservations,
+  aiTokenUsageLogs,
   auditLogs,
   awardAllocations,
   awards,
   catalogItems,
   invitations,
   organizationMemberships,
+  organizationMonthlyUsage,
   organizations,
   priceHistory,
   quotationLines,
@@ -20,6 +23,7 @@ import {
 } from '../src/db/schema.ts';
 import { AwardValidationError, validateAwardSubmission } from '../src/lib/awardValidation.ts';
 import type {
+  AiTokenUsageTelemetry,
   AuditLogEntry,
   AuthUser,
   AwardAllocation,
@@ -29,6 +33,7 @@ import type {
   OrganizationMember,
   OrganizationSettings,
   OrganizationSummary,
+  OrganizationUsageSummary,
   Quotation,
   QuotationLine,
   Rfq,
@@ -38,6 +43,17 @@ import type {
   UserRole,
   WorkspaceState,
 } from '../src/types.ts';
+import {
+  DEFAULT_RESERVATION_TTL_MS,
+  QuotaExceededError,
+  evaluateExtractionQuota,
+  evaluateStorageQuota,
+  formatBytesCompact,
+  getUtcPeriodBounds,
+  normalizePlanTier,
+  resolveDefaultNewOrgPlan,
+  resolveEffectiveOrganizationPolicy,
+} from './usagePolicy.ts';
 import { recomputeQuotation } from './normalization.ts';
 import { canAssignRole, INVITABLE_ROLES, VALID_ORG_ROLES } from './rbac.ts';
 import {
@@ -108,6 +124,7 @@ function parseOptionalNonNegativeInt(val: unknown): number | null {
 
 function handleDbError(err: unknown, context: string): never {
   if (err instanceof StoreError) throw err;
+  if (err instanceof QuotaExceededError) throw err;
   if (err instanceof AwardValidationError) {
     throw new StoreError(err.statusCode, err.message);
   }
@@ -155,6 +172,7 @@ function mapOrgSummary(
       : 'INDIA_GST') as TaxRegime,
     defaultTaxCreditable: org.defaultTaxCreditable,
     role,
+    planTier: normalizePlanTier(org.planTier),
   };
 }
 
@@ -421,6 +439,7 @@ export class PgDataStore {
             taxRegime: 'INDIA_GST',
             defaultTaxCreditable: true,
             uomAliases: { ...DEFAULT_UOM_ALIASES },
+            planTier: resolveDefaultNewOrgPlan(),
             createdByUserId: userId,
           });
 
@@ -648,6 +667,7 @@ export class PgDataStore {
               taxRegime: 'INDIA_GST',
               defaultTaxCreditable: true,
               uomAliases: { ...DEFAULT_UOM_ALIASES },
+              planTier: resolveDefaultNewOrgPlan(),
               createdByUserId: userId,
             });
 
@@ -1049,6 +1069,7 @@ export class PgDataStore {
             taxRegime,
             defaultTaxCreditable: true,
             uomAliases: { ...DEFAULT_UOM_ALIASES },
+            planTier: resolveDefaultNewOrgPlan(),
             createdByUserId: params.userId,
           })
           .returning();
@@ -2625,18 +2646,543 @@ export class PgDataStore {
     }
   }
 
+  private async loadQuotationByIdTx(
+    tx: Parameters<Parameters<DrizzleDb['transaction']>[0]>[0],
+    organizationId: string,
+    quoteId: string
+  ): Promise<Quotation | null> {
+    const [qRow] = await tx
+      .select()
+      .from(quotations)
+      .where(and(eq(quotations.id, quoteId), eq(quotations.organizationId, organizationId)))
+      .limit(1);
+    if (!qRow) return null;
+
+    const qLines = await tx
+      .select()
+      .from(quotationLines)
+      .where(
+        and(
+          eq(quotationLines.quotationId, qRow.id),
+          eq(quotationLines.organizationId, organizationId)
+        )
+      )
+      .orderBy(asc(quotationLines.vendorLineNo));
+
+    return {
+      id: qRow.id,
+      rfqId: qRow.rfqId,
+      supplierId: qRow.supplierId,
+      documentId: qRow.documentId,
+      documentName: qRow.documentName,
+      documentKind: qRow.documentKind as Quotation['documentKind'],
+      mimeType: qRow.mimeType,
+      rawEmailText: qRow.rawEmailText ?? undefined,
+      sheetPreview: qRow.sheetPreview ?? undefined,
+      parseStatus: qRow.parseStatus as Quotation['parseStatus'],
+      quoteReference: qRow.quoteReference,
+      quoteDate: qRow.quoteDate,
+      validUntil: qRow.validUntil,
+      currency: qRow.currency as Quotation['currency'],
+      exchangeRateToRfq: qRow.exchangeRateToRfq,
+      leadTimeDays: qRow.leadTimeDays,
+      paymentTerms: qRow.paymentTerms,
+      freightCharges: qRow.freightCharges,
+      packingForwarding: qRow.packingForwarding,
+      otherCharges: qRow.otherCharges,
+      globalDiscount: qRow.globalDiscount,
+      taxIncludedInRates: qRow.taxIncludedInRates,
+      missingFreightWarning: qRow.missingFreightWarning,
+      subtotalBase: qRow.subtotalBase,
+      totalTax: qRow.totalTax,
+      totalLandedCost: qRow.totalLandedCost,
+      totalGrossPayable: qRow.totalGrossPayable,
+      completenessRatio: qRow.completenessRatio,
+      isVerified: qRow.isVerified,
+      verifiedBy: qRow.verifiedBy,
+      verifiedAt: qRow.verifiedAt,
+      headerTraces: qRow.headerTraces || {},
+      createdAt: qRow.createdAt,
+      lines: qLines.map((l) => ({
+        id: l.id,
+        quotationId: l.quotationId,
+        rfqItemId: l.rfqItemId,
+        vendorLineNo: l.vendorLineNo,
+        rawDescription: l.rawDescription,
+        quotedQty: l.quotedQty,
+        quotedUom: l.quotedUom,
+        uomConversionFactor: l.uomConversionFactor,
+        quotedUnitRate: l.quotedUnitRate,
+        discountAmount: l.discountAmount,
+        taxRatePct: l.taxRatePct,
+        taxCreditable: l.taxCreditable,
+        allocatedOverhead: l.allocatedOverhead,
+        normalizedUnitBase: l.normalizedUnitBase,
+        normalizedUnitLanded: l.normalizedUnitLanded,
+        normalizedUnitGross: l.normalizedUnitGross,
+        lineTotalQuoted: l.lineTotalQuoted,
+        expectedLineTotal: l.expectedLineTotal,
+        mathValid: l.mathValid,
+        mathErrorDetail: l.mathErrorDetail,
+        matchStatus: l.matchStatus as QuotationLine['matchStatus'],
+        confidenceScore: l.confidenceScore,
+        humanEdited: l.humanEdited,
+        verifiedField: l.verifiedField,
+        sourceTrace: l.sourceTrace,
+      })),
+    };
+  }
+
+  private async upsertMonthlyUsageDeltaTx(
+    tx: Parameters<Parameters<DrizzleDb['transaction']>[0]>[0],
+    params: {
+      organizationId: string;
+      periodMonth: string;
+      committedExtractionsDelta: number;
+      tokenUsage?: AiTokenUsageTelemetry | null;
+      now: Date;
+    }
+  ): Promise<void> {
+    const promptDelta =
+      params.tokenUsage?.usageAvailable ? (params.tokenUsage.promptTokenCount ?? 0) : 0;
+    const candidatesDelta =
+      params.tokenUsage?.usageAvailable ? (params.tokenUsage.candidatesTokenCount ?? 0) : 0;
+    const totalDelta =
+      params.tokenUsage?.usageAvailable ? (params.tokenUsage.totalTokenCount ?? 0) : 0;
+    const unavailableDelta =
+      params.tokenUsage && !params.tokenUsage.usageAvailable ? 1 : 0;
+
+    const [existing] = await tx
+      .select()
+      .from(organizationMonthlyUsage)
+      .where(
+        and(
+          eq(organizationMonthlyUsage.organizationId, params.organizationId),
+          eq(organizationMonthlyUsage.periodMonth, params.periodMonth)
+        )
+      )
+      .limit(1);
+
+    if (!existing) {
+      await tx.insert(organizationMonthlyUsage).values({
+        id: makeId('usage'),
+        organizationId: params.organizationId,
+        periodMonth: params.periodMonth,
+        committedExtractions: Math.max(0, params.committedExtractionsDelta),
+        totalPromptTokens: promptDelta,
+        totalCandidatesTokens: candidatesDelta,
+        totalTokens: totalDelta,
+        unavailableEventsCount: unavailableDelta,
+        updatedAt: params.now,
+      });
+    } else {
+      await tx
+        .update(organizationMonthlyUsage)
+        .set({
+          committedExtractions: existing.committedExtractions + params.committedExtractionsDelta,
+          totalPromptTokens: existing.totalPromptTokens + promptDelta,
+          totalCandidatesTokens: existing.totalCandidatesTokens + candidatesDelta,
+          totalTokens: existing.totalTokens + totalDelta,
+          unavailableEventsCount: existing.unavailableEventsCount + unavailableDelta,
+          updatedAt: params.now,
+        })
+        .where(eq(organizationMonthlyUsage.id, existing.id));
+    }
+  }
+
+  async reserveExtractionAndStorageQuota(params: {
+    organizationId: string;
+    rfqId: string;
+    supplierId: string;
+    reservedBytes: number;
+    idempotencyKey?: string | null;
+    now?: Date;
+    ttlMs?: number;
+  }): Promise<
+    | { kind: 'reserved'; reservationId: string; periodMonth: string }
+    | { kind: 'idempotent_hit'; quotation: Quotation }
+  > {
+    try {
+      const now = params.now ?? new Date();
+      const ttlMs = params.ttlMs ?? DEFAULT_RESERVATION_TTL_MS;
+      const incomingBytes = Math.max(0, Math.floor(params.reservedBytes || 0));
+      const { periodMonth, resetAtIso } = getUtcPeriodBounds(now);
+
+      return await this.db.transaction(async (tx) => {
+        // Lock organization row first (acyclic lock hierarchy: organizations -> rfqs -> quotations -> awards)
+        const [org] = await tx
+          .select()
+          .from(organizations)
+          .where(eq(organizations.id, params.organizationId))
+          .for('update')
+          .limit(1);
+        if (!org) throw new StoreError(404, 'Organization not found.');
+
+        // Expire stale in-flight reservations before counting active slots/bytes
+        await tx
+          .update(aiExtractionReservations)
+          .set({ status: 'released', finalizedAt: now })
+          .where(
+            and(
+              eq(aiExtractionReservations.organizationId, params.organizationId),
+              eq(aiExtractionReservations.status, 'reserved'),
+              lte(aiExtractionReservations.expiresAt, now)
+            )
+          );
+
+        if (params.idempotencyKey) {
+          const [existingRes] = await tx
+            .select()
+            .from(aiExtractionReservations)
+            .where(
+              and(
+                eq(aiExtractionReservations.organizationId, params.organizationId),
+                eq(aiExtractionReservations.idempotencyKey, params.idempotencyKey),
+                inArray(aiExtractionReservations.status, ['reserved', 'committed'])
+              )
+            )
+            .limit(1);
+
+          if (existingRes) {
+            if (existingRes.status === 'reserved') {
+              throw new StoreError(
+                409,
+                'An extraction request with this Idempotency-Key is already in progress.'
+              );
+            }
+            if (existingRes.status === 'committed' && existingRes.quotationId) {
+              const existingQuote = await this.loadQuotationByIdTx(
+                tx,
+                params.organizationId,
+                existingRes.quotationId
+              );
+              if (existingQuote) {
+                return { kind: 'idempotent_hit', quotation: existingQuote };
+              }
+            }
+          }
+        }
+
+        const policy = resolveEffectiveOrganizationPolicy(org);
+
+        const [monthlyRow] = await tx
+          .select()
+          .from(organizationMonthlyUsage)
+          .where(
+            and(
+              eq(organizationMonthlyUsage.organizationId, params.organizationId),
+              eq(organizationMonthlyUsage.periodMonth, periodMonth)
+            )
+          )
+          .limit(1);
+
+        const activeReservations = await tx
+          .select({
+            periodMonth: aiExtractionReservations.periodMonth,
+            reservedBytes: aiExtractionReservations.reservedBytes,
+          })
+          .from(aiExtractionReservations)
+          .where(
+            and(
+              eq(aiExtractionReservations.organizationId, params.organizationId),
+              eq(aiExtractionReservations.status, 'reserved'),
+              gt(aiExtractionReservations.expiresAt, now)
+            )
+          );
+
+        const committedCount = monthlyRow?.committedExtractions ?? 0;
+        let activeReservedCount = 0;
+        let activeReservedBytes = 0;
+        for (const r of activeReservations) {
+          if (r.periodMonth === periodMonth) {
+            activeReservedCount += 1;
+          }
+          activeReservedBytes += Number(r.reservedBytes || 0);
+        }
+
+        const [storageAgg] = await tx
+          .select({
+            totalBytes: sql<string>`COALESCE(SUM(${storedDocuments.byteSize}), 0)`,
+          })
+          .from(storedDocuments)
+          .where(eq(storedDocuments.organizationId, params.organizationId));
+        const storedBytes = Number(storageAgg?.totalBytes ?? 0);
+
+        const extractionEval = evaluateExtractionQuota({
+          monthlyLimit: policy.monthlyExtractionLimit,
+          committedCount,
+          activeReservedCount,
+        });
+        if (!extractionEval.allowed && policy.monthlyExtractionLimit !== null) {
+          throw new QuotaExceededError(
+            `Monthly AI extraction limit (${policy.monthlyExtractionLimit} documents for ${periodMonth} UTC) reached on ${policy.label} plan. Resets on ${resetAtIso}.`,
+            {
+              code: 'MONTHLY_EXTRACTION_QUOTA_EXCEEDED',
+              organizationId: params.organizationId,
+              planTier: policy.tier,
+              isUnvalidatedHypothesis: policy.isUnvalidatedHypothesis,
+              periodMonth,
+              resetAt: resetAtIso,
+              limit: policy.monthlyExtractionLimit,
+              used: committedCount,
+              reserved: activeReservedCount,
+              remaining: extractionEval.remaining ?? 0,
+            }
+          );
+        }
+
+        const storageEval = evaluateStorageQuota({
+          storageLimitBytes: policy.storageLimitBytes,
+          storedBytes,
+          activeReservedBytes,
+          incomingBytes,
+        });
+        if (!storageEval.allowed && policy.storageLimitBytes !== null) {
+          throw new QuotaExceededError(
+            `Organization storage limit (${formatBytesCompact(policy.storageLimitBytes)}) exceeded. Delete older quotations or contact support before uploading more documents.`,
+            {
+              code: 'STORAGE_QUOTA_EXCEEDED',
+              organizationId: params.organizationId,
+              planTier: policy.tier,
+              isUnvalidatedHypothesis: policy.isUnvalidatedHypothesis,
+              periodMonth,
+              resetAt: resetAtIso,
+              limit: policy.storageLimitBytes,
+              used: storedBytes,
+              reserved: activeReservedBytes,
+              remaining: storageEval.remainingBytes ?? 0,
+              requestedBytes: incomingBytes,
+            }
+          );
+        }
+
+        const reservationId = makeId('res');
+        await tx.insert(aiExtractionReservations).values({
+          id: reservationId,
+          organizationId: params.organizationId,
+          periodMonth,
+          rfqId: params.rfqId,
+          supplierId: params.supplierId,
+          idempotencyKey: params.idempotencyKey ?? null,
+          reservedBytes: incomingBytes,
+          status: 'reserved',
+          quotationId: null,
+          documentId: null,
+          expiresAt: new Date(now.getTime() + ttlMs),
+          createdAt: now,
+          finalizedAt: null,
+        });
+
+        return {
+          kind: 'reserved',
+          reservationId,
+          periodMonth,
+        };
+      });
+    } catch (err) {
+      handleDbError(err, 'reserveExtractionAndStorageQuota');
+    }
+  }
+
+  async releaseExtractionReservation(params: {
+    organizationId: string;
+    reservationId: string;
+    tokenUsage?: AiTokenUsageTelemetry | null;
+    now?: Date;
+  }): Promise<void> {
+    try {
+      const now = params.now ?? new Date();
+      await this.db.transaction(async (tx) => {
+        const [org] = await tx
+          .select({ id: organizations.id })
+          .from(organizations)
+          .where(eq(organizations.id, params.organizationId))
+          .for('update')
+          .limit(1);
+        if (!org) return;
+
+        const [resRow] = await tx
+          .select()
+          .from(aiExtractionReservations)
+          .where(
+            and(
+              eq(aiExtractionReservations.id, params.reservationId),
+              eq(aiExtractionReservations.organizationId, params.organizationId)
+            )
+          )
+          .limit(1);
+        if (!resRow) return;
+
+        if (resRow.status === 'reserved') {
+          await tx
+            .update(aiExtractionReservations)
+            .set({ status: 'released', finalizedAt: now })
+            .where(eq(aiExtractionReservations.id, resRow.id));
+        }
+
+        if (params.tokenUsage) {
+          await this.upsertMonthlyUsageDeltaTx(tx, {
+            organizationId: params.organizationId,
+            periodMonth: resRow.periodMonth,
+            committedExtractionsDelta: 0,
+            tokenUsage: params.tokenUsage,
+            now,
+          });
+          await tx.insert(aiTokenUsageLogs).values({
+            id: makeId('tok'),
+            organizationId: params.organizationId,
+            documentId: null,
+            quotationId: null,
+            reservationId: resRow.id,
+            model: params.tokenUsage.model,
+            outcome: 'failed',
+            usageAvailable: params.tokenUsage.usageAvailable,
+            promptTokenCount: params.tokenUsage.promptTokenCount,
+            candidatesTokenCount: params.tokenUsage.candidatesTokenCount,
+            totalTokenCount: params.tokenUsage.totalTokenCount,
+            thoughtsTokenCount: params.tokenUsage.thoughtsTokenCount,
+            createdAt: now.toISOString(),
+          });
+        }
+      });
+    } catch (err) {
+      handleDbError(err, 'releaseExtractionReservation');
+    }
+  }
+
+  async getOrganizationUsageSummary(
+    organizationId: string,
+    now: Date = new Date()
+  ): Promise<OrganizationUsageSummary> {
+    try {
+      const { periodMonth, periodStartIso, resetAtIso } = getUtcPeriodBounds(now);
+      const [org] = await this.db
+        .select()
+        .from(organizations)
+        .where(eq(organizations.id, organizationId))
+        .limit(1);
+      if (!org) throw new StoreError(404, 'Organization not found.');
+
+      const policy = resolveEffectiveOrganizationPolicy(org);
+
+      const [monthlyRow] = await this.db
+        .select()
+        .from(organizationMonthlyUsage)
+        .where(
+          and(
+            eq(organizationMonthlyUsage.organizationId, organizationId),
+            eq(organizationMonthlyUsage.periodMonth, periodMonth)
+          )
+        )
+        .limit(1);
+
+      const activeReservations = await this.db
+        .select({
+          periodMonth: aiExtractionReservations.periodMonth,
+          reservedBytes: aiExtractionReservations.reservedBytes,
+        })
+        .from(aiExtractionReservations)
+        .where(
+          and(
+            eq(aiExtractionReservations.organizationId, organizationId),
+            eq(aiExtractionReservations.status, 'reserved'),
+            gt(aiExtractionReservations.expiresAt, now)
+          )
+        );
+
+      const committed = monthlyRow?.committedExtractions ?? 0;
+      let activeReservedCount = 0;
+      let activeReservedBytes = 0;
+      for (const r of activeReservations) {
+        if (r.periodMonth === periodMonth) activeReservedCount += 1;
+        activeReservedBytes += Number(r.reservedBytes || 0);
+      }
+
+      const [storageAgg] = await this.db
+        .select({
+          totalBytes: sql<string>`COALESCE(SUM(${storedDocuments.byteSize}), 0)`,
+        })
+        .from(storedDocuments)
+        .where(eq(storedDocuments.organizationId, organizationId));
+      const storedBytes = Number(storageAgg?.totalBytes ?? 0);
+
+      const extractionEval = evaluateExtractionQuota({
+        monthlyLimit: policy.monthlyExtractionLimit,
+        committedCount: committed,
+        activeReservedCount,
+      });
+      const storageEval = evaluateStorageQuota({
+        storageLimitBytes: policy.storageLimitBytes,
+        storedBytes,
+        activeReservedBytes,
+        incomingBytes: 0,
+      });
+
+      return {
+        organizationId,
+        planTier: policy.tier,
+        planLabel: policy.label,
+        isUnvalidatedHypothesis: policy.isUnvalidatedHypothesis,
+        periodMonth,
+        periodStart: periodStartIso,
+        resetAt: resetAtIso,
+        extractions: {
+          limit: policy.monthlyExtractionLimit,
+          committed,
+          activeReserved: activeReservedCount,
+          remaining: extractionEval.remaining,
+          isCustomOverride: policy.isMonthlyLimitOverride,
+        },
+        storage: {
+          limitBytes: policy.storageLimitBytes,
+          usedBytes: storedBytes,
+          activeReservedBytes,
+          remainingBytes: storageEval.remainingBytes,
+          isCustomOverride: policy.isStorageLimitOverride,
+        },
+        tokens: {
+          periodMonth,
+          promptTokens: Number(monthlyRow?.totalPromptTokens ?? 0),
+          candidatesTokens: Number(monthlyRow?.totalCandidatesTokens ?? 0),
+          totalTokens: Number(monthlyRow?.totalTokens ?? 0),
+          unavailableEventsCount: Number(monthlyRow?.unavailableEventsCount ?? 0),
+          costVerified: false,
+        },
+      };
+    } catch (err) {
+      handleDbError(err, 'getOrganizationUsageSummary');
+    }
+  }
+
   async saveExtractedQuotation(params: {
     organizationId: string;
     rfqId: string;
     supplierName: string;
     quotation: Quotation;
     storedDoc?: StoredDocumentRecord | null;
+    reservationId?: string | null;
+    tokenUsage?: AiTokenUsageTelemetry | null;
+    now?: Date;
     actorUserId: string;
     actorName: string;
     actorRole: UserRole;
   }): Promise<Quotation> {
     try {
+      const now = params.now ?? new Date();
+      const defaultPeriodMonth = getUtcPeriodBounds(now).periodMonth;
+
       return await this.db.transaction(async (tx) => {
+        // Lock organization row FIRST when finalizing reservation/monthly usage to keep lock order organizations -> rfqs
+        if (params.reservationId || params.tokenUsage) {
+          const [orgRow] = await tx
+            .select({ id: organizations.id })
+            .from(organizations)
+            .where(eq(organizations.id, params.organizationId))
+            .for('update')
+            .limit(1);
+          if (!orgRow) throw new StoreError(404, 'Organization not found.');
+        }
+
         const [targetRfq] = await tx
           .select()
           .from(rfqs)
@@ -2746,6 +3292,70 @@ export class PgDataStore {
             .where(
               and(eq(rfqs.id, targetRfq.id), eq(rfqs.organizationId, params.organizationId))
             );
+        }
+
+        let usagePeriodMonth = defaultPeriodMonth;
+        let committedIncrement = 0;
+
+        if (params.reservationId) {
+          const [resRow] = await tx
+            .select()
+            .from(aiExtractionReservations)
+            .where(
+              and(
+                eq(aiExtractionReservations.id, params.reservationId),
+                eq(aiExtractionReservations.organizationId, params.organizationId)
+              )
+            )
+            .limit(1);
+
+          if (!resRow || resRow.status !== 'reserved') {
+            throw new StoreError(
+              409,
+              'Extraction quota reservation expired or was already finalized.'
+            );
+          }
+
+          usagePeriodMonth = resRow.periodMonth;
+          committedIncrement = 1;
+
+          await tx
+            .update(aiExtractionReservations)
+            .set({
+              status: 'committed',
+              quotationId: q.id,
+              documentId: q.documentId,
+              finalizedAt: now,
+            })
+            .where(eq(aiExtractionReservations.id, resRow.id));
+        }
+
+        if (committedIncrement > 0 || params.tokenUsage) {
+          await this.upsertMonthlyUsageDeltaTx(tx, {
+            organizationId: params.organizationId,
+            periodMonth: usagePeriodMonth,
+            committedExtractionsDelta: committedIncrement,
+            tokenUsage: params.tokenUsage,
+            now,
+          });
+        }
+
+        if (params.tokenUsage) {
+          await tx.insert(aiTokenUsageLogs).values({
+            id: makeId('tok'),
+            organizationId: params.organizationId,
+            documentId: q.documentId,
+            quotationId: q.id,
+            reservationId: params.reservationId ?? null,
+            model: params.tokenUsage.model,
+            outcome: 'succeeded',
+            usageAvailable: params.tokenUsage.usageAvailable,
+            promptTokenCount: params.tokenUsage.promptTokenCount,
+            candidatesTokenCount: params.tokenUsage.candidatesTokenCount,
+            totalTokenCount: params.tokenUsage.totalTokenCount,
+            thoughtsTokenCount: params.tokenUsage.thoughtsTokenCount,
+            createdAt: now.toISOString(),
+          });
         }
 
         await this.appendAuditTx(tx, {

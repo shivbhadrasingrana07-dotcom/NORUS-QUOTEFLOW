@@ -66,6 +66,9 @@ jobs:
           psql -h 127.0.0.1 -U postgres -d quoteflow_test -v ON_ERROR_STOP=1 -f drizzle/0001_tenant_integrity.sql
           psql -h 127.0.0.1 -U postgres -d quoteflow_test -v ON_ERROR_STOP=1 -f drizzle/0001_tenant_integrity_rollback.sql
           psql -h 127.0.0.1 -U postgres -d quoteflow_test -v ON_ERROR_STOP=1 -f drizzle/0001_tenant_integrity.sql
+          psql -h 127.0.0.1 -U postgres -d quoteflow_test -v ON_ERROR_STOP=1 -f drizzle/0002_usage_quotas_and_tokens.sql
+          psql -h 127.0.0.1 -U postgres -d quoteflow_test -v ON_ERROR_STOP=1 -f drizzle/0002_usage_quotas_and_tokens_rollback.sql
+          psql -h 127.0.0.1 -U postgres -d quoteflow_test -v ON_ERROR_STOP=1 -f drizzle/0002_usage_quotas_and_tokens.sql
 
       - name: TypeScript check
         run: npm run lint

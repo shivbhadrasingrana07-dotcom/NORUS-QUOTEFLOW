@@ -1,5 +1,22 @@
 # Changelog
 
+## Task 017 — Production-Safe Monthly Usage Quotas & AI Token Usage Tracking
+
+### Implemented & Verified
+- **Organization Usage Policy & Concurrency Coordinator (`server/usagePolicy.ts`, `src/types.ts`, `.env.example`):**
+  - Added `PLAN_POLICIES` (`starter`: `60` AI extractions/mo & `5 GiB`; `professional`: `250` / `25 GiB`; `business`: `800` / `100 GiB` — flagged `isUnvalidatedHypothesis: true`; `legacy`: non-blocking default for existing migrated organizations) and `resolveDefaultNewOrgPlan()` controlled by `DEFAULT_NEW_ORG_PLAN` (defaults `'starter'`).
+  - Implemented `getUtcPeriodBounds()`, `validateOptionalIdempotencyKey()`, `evaluateExtractionQuota()`, `evaluateStorageQuota()`, `QuotaExceededError` (`429`), and `InMemoryUsageQuotaCoordinator` for offline quota/concurrency verification.
+- **Additive Schema, Migration & CI Lifecycle (`src/db/schema.ts`, `drizzle/0002_usage_quotas_and_tokens.sql`, `drizzle/0002_usage_quotas_and_tokens_rollback.sql`, `.github/workflows/ci.yml`):**
+  - Added `plan_tier` (default `'legacy'`), `monthly_extraction_limit_override`, and `storage_limit_bytes_override` (`bigint`) on `organizations`, plus `organization_monthly_usage`, `ai_extraction_reservations` (with partial unique `(organization_id, idempotency_key)` index), and `ai_token_usage_logs`.
+  - Wrapped `0002` DDL and `_rollback.sql` in `BEGIN; ... COMMIT;` and added apply -> rollback -> re-apply checks to `.github/workflows/ci.yml` without modifying managed Cloud SQL.
+- **Gemini `usageMetadata` Token Telemetry (`server/geminiExtractor.ts`):**
+  - Added `normalizeGeminiUsageMetadata()` and `extractQuotationWithTelemetry()` capturing `promptTokenCount`, `candidatesTokenCount`, `totalTokenCount`, optional `thoughtsTokenCount`, model ID, and outcome (`succeeded`/`failed`), retaining `tokenUsage` on `ExtractionServiceError` and recording `usageAvailable: false` (`null` counts) when metadata is absent without inventing counts or costs.
+- **Transactional Quota Reservations, Reclaim & API Enforcement (`server/pgStore.ts`, `server/maintenance.ts`, `server.ts`):**
+  - Added `reserveExtractionAndStorageQuota()`, `releaseExtractionReservation()`, `getOrganizationUsageSummary()`, and reservation/token commit inside `saveExtractedQuotation()` (`organizations -> rfqs -> quotations -> awards` lock order); `updateOrganizationSettings` (`PATCH /api/settings`) ignores `planTier` and quota overrides; `runScheduledMaintenance` expires stale `'reserved'` reservations in bounded batches.
+  - Updated `POST /api/rfqs/:rfqId/quotes/extract` to validate supplier/magic-bytes/`Idempotency-Key`/pre-parsed spreadsheets before reserving quota, measure actual `file.buffer.byteLength`, handle `idempotent_hit` retries (`200`), return structured `429` quota errors, and roll back storage objects + release reservations on extraction errors while keeping `DEMO_MODE` completely isolated. Added `GET /api/organization/usage`.
+- **Tests & Docs (`tests/usageQuotas.test.ts`, `tests/_helpers.ts`, `docs/`):**
+  - Added unit, concurrency, idempotency, UTC rollover, telemetry, demo-isolation, and skipped-unless-PG-configured integration tests (`npm run lint` `0` errors; `npm test`: `54` pass, `0` fail, `14` skipped; `npm run build`: `1.74s`).
+
 ## Task 014 — Customer & Commercial Readiness Assessment, Staging Audit & Onboarding UX
 
 ### Assessed, Designed & Improved

@@ -17,8 +17,16 @@ import {
 import {
   ExtractionServiceError,
   extractQuotationWithGemini,
+  extractQuotationWithTelemetry,
+  GEMINI_EXTRACTION_MODEL,
+  parseSpreadsheetBufferIsolated,
   type GenerateContentFn,
+  type ParsedSpreadsheetResult,
 } from './server/geminiExtractor.ts';
+import {
+  QuotaExceededError,
+  validateOptionalIdempotencyKey,
+} from './server/usagePolicy.ts';
 import { runScheduledMaintenance } from './server/maintenance.ts';
 import {
   checkDependencyReadiness,
@@ -1339,6 +1347,21 @@ export async function createApp(options: AppOptions = {}) {
     }
   );
 
+  app.get(
+    '/api/organization/usage',
+    requireAuth,
+    requireOrgAndPermission('workspace:read'),
+    async (req, res, next) => {
+      try {
+        const org = req.auth!.activeOrganization!;
+        const summary = await store.getOrganizationUsageSummary(org.id);
+        res.json(summary);
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
   app.post(
     '/api/rfqs/load-sample',
     requireAuth,
@@ -1436,11 +1459,23 @@ export async function createApp(options: AppOptions = {}) {
     upload.single('file'),
     async (req, res, next) => {
       let uploadedKeyForRollback: string | null = null;
+      let reservationIdForRollback: string | null = null;
+      let activeOrgIdForRollback: string | null = null;
       try {
         const org = req.auth!.activeOrganization!;
+        activeOrgIdForRollback = org.id;
         const supplierId = req.body?.supplierId;
         if (typeof supplierId !== 'string' || !supplierId.trim()) {
           return res.status(400).json({ error: 'Valid supplierId is required.' });
+        }
+
+        const rawIdempotency =
+          typeof req.headers['idempotency-key'] === 'string'
+            ? req.headers['idempotency-key']
+            : req.body?.idempotencyKey;
+        const idempotencyCheck = validateOptionalIdempotencyKey(rawIdempotency);
+        if (!idempotencyCheck.valid) {
+          return res.status(400).json({ error: idempotencyCheck.error });
         }
 
         const { rfq, settings, supplierName } = await store.getExtractionContext({
@@ -1470,7 +1505,43 @@ export async function createApp(options: AppOptions = {}) {
           safeMime = validation.detectedMime;
         }
 
-        const extracted = await extractQuotationWithGemini({
+        const isSpreadsheet =
+          safeMime.includes('spreadsheet') ||
+          safeMime.includes('excel') ||
+          safeMime.includes('csv') ||
+          /\.(xlsx|xls|csv)$/i.test(safeName);
+
+        // Pre-validate & isolate-parse spreadsheets BEFORE reserving monthly/storage quota
+        let preParsedSpreadsheet: ParsedSpreadsheetResult | undefined;
+        if (isSpreadsheet && file) {
+          preParsedSpreadsheet = await parseSpreadsheetBufferIsolated(file.buffer, {
+            documentName: safeName,
+            mimeType: safeMime,
+          });
+          if (!preParsedSpreadsheet.structuredText.trim()) {
+            throw new ExtractionServiceError(
+              'The uploaded spreadsheet contains no readable rows or quotation data.',
+              422
+            );
+          }
+        }
+
+        const actualBytes = file ? file.buffer.byteLength : 0;
+        const reservation = await store.reserveExtractionAndStorageQuota({
+          organizationId: org.id,
+          rfqId: rfq.id,
+          supplierId: supplierId.trim(),
+          reservedBytes: actualBytes,
+          idempotencyKey: idempotencyCheck.key,
+        });
+
+        if (reservation.kind === 'idempotent_hit') {
+          return res.status(200).json(reservation.quotation);
+        }
+
+        reservationIdForRollback = reservation.reservationId;
+
+        const { quotation: extracted, tokenUsage } = await extractQuotationWithTelemetry({
           rfq,
           supplierId: supplierId.trim(),
           settings,
@@ -1478,6 +1549,7 @@ export async function createApp(options: AppOptions = {}) {
           mimeType: safeMime,
           fileBuffer: file?.buffer,
           rawEmailText: rawEmailText || undefined,
+          preParsedSpreadsheet,
           skipInlineDataUrl: true,
           generateContentOverride,
         });
@@ -1512,11 +1584,27 @@ export async function createApp(options: AppOptions = {}) {
           supplierName,
           quotation: extracted,
           storedDoc,
+          reservationId: reservationIdForRollback,
+          tokenUsage,
           actorUserId: req.auth!.user.id,
           actorName: req.auth!.user.fullName,
           actorRole: org.role,
         });
+        reservationIdForRollback = null;
         uploadedKeyForRollback = null;
+
+        logEvent('info', 'ai_extraction_completed', {
+          requestId: req.requestId,
+          organizationId: org.id,
+          quotationId: saved.id,
+          documentId: saved.documentId ?? null,
+          model: tokenUsage.model,
+          usageAvailable: tokenUsage.usageAvailable,
+          promptTokenCount: tokenUsage.promptTokenCount,
+          candidatesTokenCount: tokenUsage.candidatesTokenCount,
+          totalTokenCount: tokenUsage.totalTokenCount,
+          byteSize: actualBytes,
+        });
 
         res.status(201).json(saved);
       } catch (err) {
@@ -1528,6 +1616,32 @@ export async function createApp(options: AppOptions = {}) {
               error: delErr instanceof Error ? delErr.message : String(delErr),
             });
           });
+        }
+        if (reservationIdForRollback && activeOrgIdForRollback) {
+          const observedUsage =
+            err instanceof ExtractionServiceError && err.tokenUsage
+              ? err.tokenUsage
+              : {
+                  model: GEMINI_EXTRACTION_MODEL,
+                  usageAvailable: false,
+                  promptTokenCount: null,
+                  candidatesTokenCount: null,
+                  totalTokenCount: null,
+                  thoughtsTokenCount: null,
+                };
+          await store
+            .releaseExtractionReservation({
+              organizationId: activeOrgIdForRollback,
+              reservationId: reservationIdForRollback,
+              tokenUsage: observedUsage,
+            })
+            .catch((relErr) => {
+              logEvent('warn', 'quota_reservation_release_failed', {
+                requestId: req.requestId,
+                reservationId: reservationIdForRollback,
+                error: relErr instanceof Error ? relErr.message : String(relErr),
+              });
+            });
         }
         next(err);
       }
@@ -1833,6 +1947,14 @@ export async function createApp(options: AppOptions = {}) {
       }
       return res.status(400).json({
         error: `File upload error: ${redactSensitiveText(err.message)}`,
+        requestId: req.requestId,
+      });
+    }
+    if (err instanceof QuotaExceededError) {
+      return res.status(err.statusCode).json({
+        error: redactSensitiveText(err.message),
+        code: err.code,
+        quota: err.details,
         requestId: req.requestId,
       });
     }

@@ -102,7 +102,10 @@ All endpoints below require an authenticated session (`401`), valid `X-CSRF-Toke
 Returns the active organization's `WorkspaceState` (`settings`, `suppliers`, `items`, `rfqs`, `quotations`, `awards`, `auditLogs`).
 
 ### `PATCH /api/settings` *(`org:settings:write` — `owner`, `admin`)*
-Updates organization commercial defaults (`name`, `defaultCurrency`, `taxRegime`, `defaultTaxCreditable`). Does **not** accept client-side role overrides.
+Updates organization commercial defaults (`name`, `defaultCurrency`, `taxRegime`, `defaultTaxCreditable`). Does **not** accept client-side role, `planTier`, or quota limit overrides.
+
+### `GET /api/organization/usage` *(`workspace:read` — All Organization Members)*
+Returns read-only organization plan policy (`planTier`, `planLabel`, `isUnvalidatedHypothesis`), UTC calendar month bounds (`periodMonth`, `periodStart`, `resetAt`), monthly AI extraction counts (`limit`, `committed`, `activeReserved`, `remaining`), storage usage in bytes (`limitBytes`, `usedBytes`, `activeReservedBytes`, `remainingBytes`), and observed Gemini token totals (`promptTokens`, `candidatesTokens`, `totalTokens`, `unavailableEventsCount`, `costVerified: false`).
 
 ### `POST /api/rfqs` & `POST /api/rfqs/load-sample` *(`rfq:write` — `owner`, `admin`, `buyer`)*
 Creates sequential `RFQ-YYYY-XXXX` RFQs (scoped per org) or loads a sample manufacturing RFQ + 3 vendor quotes into the active organization.
@@ -114,12 +117,12 @@ Creates a supplier profile with per-organization duplicate name/Tax ID protectio
 Adds a catalog item to the organization's Item Price Memory.
 
 ### `POST /api/rfqs/:rfqId/quotes/extract` *(`quotation:extract` + `extractRateLimiter`)*
-Accepts `multipart/form-data` (`supplierId`, optional `file`, optional `rawEmailText`), validates file magic bytes (`PDF`, `XLSX`, `XLS` [UTF-8 delimited text tables accepted; legacy binary OLE2 `.xls` rejected with structured `415` save-as-`.xlsx`/`.csv` guidance], `CSV`, `PNG`, `JPG`, `WEBP`; max 25 MB), extracts fields via `geminiExtractor.ts`, uploads any binary file to private object storage (`stored_documents` + `documentId`), computes normalized landed costs, and returns `201 Created`.
+Accepts `multipart/form-data` (`supplierId`, optional `file`, optional `rawEmailText`, optional `Idempotency-Key` header/field `[A-Za-z0-9._-]{8,128}`), validates file magic bytes (`PDF`, `XLSX`, `XLS` [UTF-8 delimited text tables accepted; legacy binary OLE2 `.xls` rejected with structured `415` save-as-`.xlsx`/`.csv` guidance], `CSV`, `PNG`, `JPG`, `WEBP`; max 25 MB), pre-parses spreadsheets in the isolated worker before reserving quota, atomically reserves monthly extraction + actual byte storage quota under an `organizations FOR UPDATE` lock (`429` `MONTHLY_EXTRACTION_QUOTA_EXCEEDED` / `STORAGE_QUOTA_EXCEEDED` when exhausted; `200` replay on committed `Idempotency-Key`; `409` on in-flight duplicate key), extracts fields + Gemini `usageMetadata` telemetry via `geminiExtractor.ts`, uploads any binary file to private object storage (`stored_documents` + `documentId`), commits the reservation and `ai_token_usage_logs` entry atomically, and releases the reservation on any failure so failed extractions do not consume monthly document quota.
 
 ### `PATCH /api/quotations/:quoteId`, `PATCH /api/quotations/:quoteId/lines/:lineId`, `POST /api/quotations/:quoteId/verify`, `DELETE /api/quotations/:quoteId`
 - Edit requires `quotation:edit` and rejects (`409 Conflict`) quotes referenced by a `pending` or `approved` award; header/line edits clear `isVerified` / `verifiedBy` / `verifiedAt` (and `verifiedField` when changing `matchStatus` away from `alternate_spec`) and validate non-empty `quoteReference`, integer `leadTimeDays`, and strict 4-value `matchStatus` (`400`).
 - Verify requires `quotation:verify` (blocked with `409` if locked by a `pending`/`approved` award and `422` if any line has `mathValid === false`).
-- Delete requires `quotation:delete` (blocked with `409` if referenced by an `approved`, `pending`, or `rejected` award, and deletes the private object storage file if unreferenced).
+- Delete requires `quotation:delete` (blocked with `409` if referenced by an `approved`, `pending`, or `rejected` award, and deletes the private object storage file + `stored_documents` row so storage bytes are immediately reclaimed).
 
 ### `POST /api/rfqs/:rfqId/award` *(`award:recommend` — `owner`, `admin`, `buyer`)*
 Runs inside a transaction holding an RFQ row lock (`FOR UPDATE`) and validates allocations via `validateAwardSubmission` (`src/lib/awardValidation.ts`): rejects existing `pending` (`409`) or `approved` (`409`) awards while preserving `rejected` award history, enforces unique 100% BOM line coverage (`400`), enforces `isLineQuantitySufficient` (`QUANTITY_EPSILON = 1e-4`) on every allocation (`422`), requires `isVerified === true`, valid math, and package completeness (`422`), requires explicit `commercialExceptionAccepted` + written justification for `missingFreightWarning` (`422`), requires explicit `acceptedAlternateLineIds` + written justification for `alternate_spec` lines (`422`), and enforces cent-accurate `isExceedingL1Total` `nonL1Justification` against verified `L1` (`400`).
