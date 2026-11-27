@@ -161,11 +161,53 @@ export class ResendEmailProvider implements EmailProvider {
   }
 }
 
-export function createEmailProvider(): EmailProvider {
-  const apiKey = process.env.RESEND_API_KEY?.trim();
-  const from = process.env.EMAIL_FROM?.trim() || 'NORUS QUOTEFLOW <noreply@norus.local>';
-  if (apiKey) {
-    return new ResendEmailProvider(apiKey, from);
+function stripSurroundingQuotes(value: string): string {
+  const trimmed = String(value || '').trim();
+  if (
+    trimmed.length >= 2 &&
+    ((trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+      (trimmed.startsWith("'") && trimmed.endsWith("'")))
+  ) {
+    return trimmed.slice(1, -1).trim();
   }
-  return new DevOutboxEmailProvider();
+  return trimmed;
+}
+
+function isPlaceholderSecret(value: string): boolean {
+  const normalized = stripSurroundingQuotes(value);
+  const upper = normalized.toUpperCase();
+  return (
+    !upper ||
+    /^[\u2022*]+$/.test(normalized) ||
+    upper.startsWith('MY_') ||
+    upper.startsWith('YOUR_')
+  );
+}
+
+export function createEmailProvider(): EmailProvider {
+  const apiKey = stripSurroundingQuotes(process.env.RESEND_API_KEY || '');
+  if (!apiKey || isPlaceholderSecret(apiKey)) {
+    return new DevOutboxEmailProvider();
+  }
+
+  const rawFrom = stripSurroundingQuotes(process.env.EMAIL_FROM || '');
+  const from = rawFrom || 'NORUS QUOTEFLOW <noreply@norus.local>';
+  if (!isValidSenderAddress(from)) {
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error('EMAIL_FROM must contain a valid sender email address when Resend is enabled.');
+    }
+    if (process.env.NODE_ENV !== 'test') {
+      console.warn(
+        JSON.stringify({
+          level: 'warn',
+          event: 'resend_invalid_sender_fallback_dev_outbox',
+          nodeEnv: process.env.NODE_ENV || 'development',
+          ts: new Date().toISOString(),
+        })
+      );
+    }
+    return new DevOutboxEmailProvider();
+  }
+
+  return new ResendEmailProvider(apiKey, from);
 }

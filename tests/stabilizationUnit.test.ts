@@ -859,6 +859,7 @@ describe('Task 007 Stabilization Unit Suite', () => {
     assert.equal(resolveCookieSameSite(false, { COOKIE_SAMESITE: 'none' }), 'Lax');
 
     assert.equal(resolveTrustProxySetting({}), 1);
+    assert.equal(resolveTrustProxySetting({ TRUST_PROXY_HOPS: '••••' }), 1);
     assert.equal(resolveTrustProxySetting({ TRUST_PROXY_HOPS: '2' }), 2);
     assert.equal(resolveTrustProxySetting({ TRUST_PROXY_HOPS: 'false' }), false);
     assert.equal(resolveTrustProxySetting({ TRUST_PROXY_HOPS: '0' }), false);

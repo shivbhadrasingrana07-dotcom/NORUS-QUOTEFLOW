@@ -422,9 +422,12 @@ describe('Task 006/007: Temporary No-Login Demo Workspace & Security Isolation',
   it('Task 007: enforces safe DEMO_MODE defaults in dev/prod and fails closed if DEMO_MODE=true in production', async () => {
     // 1. Direct resolver matrix
     assert.equal(resolveDemoMode({ nodeEnv: 'development', envDemoMode: '' }), true);
+    assert.equal(resolveDemoMode({ nodeEnv: 'development', envDemoMode: '••••' }), true);
+    assert.equal(resolveDemoMode({ nodeEnv: 'development', envDemoMode: '"false"' }), false);
     assert.equal(resolveDemoMode({ nodeEnv: 'development', envDemoMode: 'false' }), false);
     assert.equal(resolveDemoMode({ nodeEnv: 'test', envDemoMode: '' }), true);
     assert.equal(resolveDemoMode({ nodeEnv: 'production', envDemoMode: '' }), false);
+    assert.equal(resolveDemoMode({ nodeEnv: 'production', envDemoMode: '••••' }), false);
     assert.equal(resolveDemoMode({ nodeEnv: 'production', envDemoMode: 'false' }), false);
 
     assert.throws(

@@ -88,13 +88,29 @@ export interface AppOptions {
   demoMode?: boolean;
 }
 
+function normalizeOptionalFlagEnv(rawValue: string | undefined): string {
+  let value = (rawValue ?? '').trim();
+  if (
+    value.length >= 2 &&
+    ((value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'")))
+  ) {
+    value = value.slice(1, -1).trim();
+  }
+  // Treat masked secret placeholders (e.g., "••••" or "****") as unset
+  if (/^[\u2022*]+$/.test(value)) {
+    return '';
+  }
+  return value.toLowerCase();
+}
+
 export function resolveDemoMode(params: {
   nodeEnv?: string;
   demoModeOverride?: boolean;
   envDemoMode?: string;
 } = {}): boolean {
-  const nodeEnv = (params.nodeEnv ?? process.env.NODE_ENV ?? 'development').trim().toLowerCase();
-  const rawEnv = (params.envDemoMode ?? process.env.DEMO_MODE ?? '').trim().toLowerCase();
+  const nodeEnv = normalizeOptionalFlagEnv(params.nodeEnv ?? process.env.NODE_ENV) || 'development';
+  const rawEnv = normalizeOptionalFlagEnv(params.envDemoMode ?? process.env.DEMO_MODE);
 
   if (nodeEnv === 'production') {
     if (params.demoModeOverride === true) {
@@ -134,7 +150,7 @@ export function resolveDemoMode(params: {
 export function resolveTrustProxySetting(
   env: Record<string, string | undefined> = process.env
 ): number | false {
-  const raw = (env.TRUST_PROXY_HOPS ?? '').trim().toLowerCase();
+  const raw = normalizeOptionalFlagEnv(env.TRUST_PROXY_HOPS);
   if (!raw) return 1;
   if (raw === 'false' || raw === '0') return false;
   if (/^\d+$/.test(raw)) {
@@ -1863,46 +1879,55 @@ const isDirectExecution =
 
 if (isDirectExecution) {
   const PORT = Number(process.env.PORT) || 3000;
-  const storageProvider = createObjectStorageProvider();
-  createApp({ enableVite: true, storageProvider })
-    .then((app) => {
-      const httpServer = app.listen(PORT, '0.0.0.0', () => {
-        logEvent('info', 'server_started', {
+  try {
+    const storageProvider = createObjectStorageProvider();
+    createApp({ enableVite: true, storageProvider })
+      .then((app) => {
+        const httpServer = app.listen(PORT, '0.0.0.0', () => {
+          logEvent('info', 'server_started', {
+            port: PORT,
+            nodeEnv: process.env.NODE_ENV || 'development',
+            demoMode: resolveDemoMode(),
+            storageProvider: storageProvider.mode,
+          });
+        });
+
+        httpServer.on('error', (err) => {
+          logEvent('error', 'server_listen_failed', {
+            port: PORT,
+            error: redactSensitiveText(err instanceof Error ? err.message : String(err)),
+          });
+          process.exit(1);
+        });
+
+        const intervalMinutes = Number(process.env.MAINTENANCE_INTERVAL_MINUTES ?? '360');
+        if (Number.isFinite(intervalMinutes) && intervalMinutes > 0 && isSqlEnvConfigured()) {
+          const timer = setInterval(() => {
+            runScheduledMaintenance({ db: defaultDb, storageProvider, lockPool: defaultPool }).catch(
+              (err) => {
+                logEvent('error', 'scheduled_maintenance_failed', {
+                  error: redactSensitiveText(err instanceof Error ? err.message : String(err)),
+                });
+              }
+            );
+          }, intervalMinutes * 60 * 1000);
+          timer.unref();
+        }
+      })
+      .catch((err) => {
+        logEvent('error', 'server_startup_failed', {
           port: PORT,
           nodeEnv: process.env.NODE_ENV || 'development',
-          demoMode: resolveDemoMode(),
-          storageProvider: storageProvider.mode,
-        });
-      });
-
-      httpServer.on('error', (err) => {
-        logEvent('error', 'server_listen_failed', {
-          port: PORT,
           error: redactSensitiveText(err instanceof Error ? err.message : String(err)),
         });
         process.exit(1);
       });
-
-      const intervalMinutes = Number(process.env.MAINTENANCE_INTERVAL_MINUTES ?? '360');
-      if (Number.isFinite(intervalMinutes) && intervalMinutes > 0 && isSqlEnvConfigured()) {
-        const timer = setInterval(() => {
-          runScheduledMaintenance({ db: defaultDb, storageProvider, lockPool: defaultPool }).catch(
-            (err) => {
-              logEvent('error', 'scheduled_maintenance_failed', {
-                error: redactSensitiveText(err instanceof Error ? err.message : String(err)),
-              });
-            }
-          );
-        }, intervalMinutes * 60 * 1000);
-        timer.unref();
-      }
-    })
-    .catch((err) => {
-      logEvent('error', 'server_startup_failed', {
-        port: PORT,
-        nodeEnv: process.env.NODE_ENV || 'development',
-        error: redactSensitiveText(err instanceof Error ? err.message : String(err)),
-      });
-      process.exit(1);
+  } catch (err) {
+    logEvent('error', 'server_startup_failed', {
+      port: PORT,
+      nodeEnv: process.env.NODE_ENV || 'development',
+      error: redactSensitiveText(err instanceof Error ? err.message : String(err)),
     });
+    process.exit(1);
+  }
 }

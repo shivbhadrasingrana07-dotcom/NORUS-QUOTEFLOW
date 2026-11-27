@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { eq } from 'drizzle-orm';
-import { isValidSenderAddress, ResendEmailProvider } from '../server/emailService.ts';
+import { createEmailProvider, isValidSenderAddress, ResendEmailProvider } from '../server/emailService.ts';
 import { runScheduledMaintenance } from '../server/maintenance.ts';
 import type { ObjectStorageProvider } from '../server/objectStorage.ts';
 import { LocalPrivateStorageProvider } from '../server/objectStorage.ts';
@@ -152,6 +152,38 @@ test('ResendEmailProvider validates senders, retries transient 503/429 failures,
     );
   } finally {
     globalThis.fetch = origFetch;
+  }
+});
+
+test('createEmailProvider handles quoted EMAIL_FROM, falls back in dev on invalid EMAIL_FROM, and fails closed in production', () => {
+  const origKey = process.env.RESEND_API_KEY;
+  const origFrom = process.env.EMAIL_FROM;
+  const origEnv = process.env.NODE_ENV;
+  try {
+    process.env.RESEND_API_KEY = 're_test_key';
+    process.env.EMAIL_FROM = '"NORUS QUOTEFLOW <noreply@norus.in>"';
+    process.env.NODE_ENV = 'development';
+    const quotedProvider = createEmailProvider();
+    assert.equal(quotedProvider.mode, 'resend');
+
+    process.env.EMAIL_FROM = 'not-an-email';
+    process.env.NODE_ENV = 'development';
+    const devFallback = createEmailProvider();
+    assert.equal(devFallback.mode, 'dev_outbox');
+
+    process.env.NODE_ENV = 'production';
+    assert.throws(() => createEmailProvider(), /EMAIL_FROM must contain a valid sender email address/);
+
+    process.env.RESEND_API_KEY = 'MY_RESEND_API_KEY';
+    const placeholderFallback = createEmailProvider();
+    assert.equal(placeholderFallback.mode, 'dev_outbox');
+  } finally {
+    if (origKey === undefined) delete process.env.RESEND_API_KEY;
+    else process.env.RESEND_API_KEY = origKey;
+    if (origFrom === undefined) delete process.env.EMAIL_FROM;
+    else process.env.EMAIL_FROM = origFrom;
+    if (origEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = origEnv;
   }
 });
 
