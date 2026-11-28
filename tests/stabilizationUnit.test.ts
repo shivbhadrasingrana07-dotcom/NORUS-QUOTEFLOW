@@ -1491,5 +1491,109 @@ describe('Task 007 Stabilization Unit Suite', () => {
     assert.match(demoDashHtml, /5-Minute Demo Walkthrough \(Synthetic Data/);
     assert.match(demoDashHtml, /DEMO-RFQ-2026-101/);
   });
+
+  it('Task 019A: updateMemberRole and removeMember lock parent organizations FOR UPDATE before checking last-owner invariant', async () => {
+    const { PgDataStore, StoreError } = await import('../server/pgStore.ts');
+    const { organizations, organizationMemberships } = await import('../src/db/schema.ts');
+
+    const observedQueries: Array<{ table: unknown; lockedForUpdate: boolean }> = [];
+    const ownerUser = {
+      id: 'user-owner-1',
+      email: 'owner@example.com',
+      fullName: 'Sole Owner',
+      title: 'Director',
+      emailVerified: true,
+    };
+    const ownerMem = {
+      id: 'mem-owner-1',
+      organizationId: 'org-lock-1',
+      userId: 'user-owner-1',
+      role: 'owner',
+      status: 'active',
+      createdAt: new Date('2026-01-01T00:00:00.000Z'),
+    };
+
+    const mockDb = {
+      async transaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
+        let queryIdx = 0;
+        const tx = {
+          select() {
+            let tbl: unknown = null;
+            let locked = false;
+            const currentIdx = queryIdx++;
+            const chain: Record<string, unknown> = {
+              from(t: unknown) {
+                tbl = t;
+                return chain;
+              },
+              innerJoin() {
+                return chain;
+              },
+              where() {
+                return chain;
+              },
+              for(mode: string) {
+                if (mode === 'update') locked = true;
+                return chain;
+              },
+              limit() {
+                observedQueries.push({ table: tbl, lockedForUpdate: locked });
+                if (tbl === organizations) {
+                  assert.equal(currentIdx, 0, 'organizations FOR UPDATE lock must execute first');
+                  assert.equal(locked, true, 'organizations row must be locked FOR UPDATE');
+                  return Promise.resolve([{ id: 'org-lock-1' }]);
+                }
+                if (tbl === organizationMemberships) {
+                  return Promise.resolve([{ membership: ownerMem, user: ownerUser }]);
+                }
+                return Promise.resolve([]);
+              },
+              then(resolve: (v: unknown) => void, reject?: (e: unknown) => void) {
+                observedQueries.push({ table: tbl, lockedForUpdate: locked });
+                if (tbl === organizationMemberships) {
+                  return Promise.resolve([{ id: ownerMem.id }]).then(resolve, reject);
+                }
+                return Promise.resolve([]).then(resolve, reject);
+              },
+            };
+            return chain;
+          },
+        };
+        return fn(tx);
+      },
+    } as unknown as DrizzleDb;
+
+    const store = new PgDataStore(mockDb);
+
+    await assert.rejects(
+      () =>
+        store.updateMemberRole({
+          organizationId: 'org-lock-1',
+          actorUserId: ownerUser.id,
+          actorName: ownerUser.fullName,
+          actorRole: 'owner',
+          targetUserId: ownerUser.id,
+          newRole: 'admin',
+        }),
+      (err: unknown) => err instanceof StoreError && err.statusCode === 409
+    );
+    assert.equal(observedQueries[0].table, organizations);
+    assert.equal(observedQueries[0].lockedForUpdate, true);
+
+    observedQueries.length = 0;
+    await assert.rejects(
+      () =>
+        store.removeMember({
+          organizationId: 'org-lock-1',
+          actorUserId: ownerUser.id,
+          actorName: ownerUser.fullName,
+          actorRole: 'owner',
+          targetUserId: ownerUser.id,
+        }),
+      (err: unknown) => err instanceof StoreError && err.statusCode === 409
+    );
+    assert.equal(observedQueries[0].table, organizations);
+    assert.equal(observedQueries[0].lockedForUpdate, true);
+  });
 });
 

@@ -894,6 +894,135 @@ test('P2-1 route unit: POST /quotes/extract preserves observed Gemini tokenUsage
   }
 });
 
+test('Task 019A route unit: missing or placeholder GEMINI_API_KEY returns 503 and releases quota reservation without fabricating tokens', async () => {
+  const ws = createInitialWorkspaceState();
+  const rfq = ws.rfqs[0];
+  const supplier = ws.suppliers[0];
+
+  let seq = 0;
+  const releasedCalls: Array<{ reservationId: string; tokenUsage: AiTokenUsageTelemetry | null | undefined }> = [];
+
+  const mockStorage: ObjectStorageProvider = {
+    mode: 'local',
+    async putObject() {},
+    async getObject() {
+      return { buffer: Buffer.alloc(0), contentType: 'application/octet-stream' };
+    },
+    async deleteObject() {},
+    async createSignedDownloadUrl() {
+      return { url: '/signed', expiresAt: new Date().toISOString() };
+    },
+    async checkReadiness() {
+      return { ok: true };
+    },
+  };
+
+  const spyStore = {
+    async getSessionContext(token: string) {
+      if (token !== 'unit-session-token') return null;
+      return {
+        sessionId: 'sess-unit-503',
+        csrfToken: 'unit-csrf-token',
+        user: {
+          id: 'user-unit',
+          email: 'buyer@example.com',
+          fullName: 'Unit Buyer',
+          title: 'Buyer',
+          emailVerified: true,
+          hasPassword: true,
+          hasGoogleLinked: false,
+        },
+        activeOrganization: {
+          id: 'org-unit',
+          slug: 'org-unit',
+          name: 'Unit Org',
+          countryCode: 'IN',
+          defaultCurrency: 'INR' as const,
+          taxRegime: 'INDIA_GST' as const,
+          defaultTaxCreditable: true,
+          role: 'buyer' as const,
+          planTier: 'starter' as const,
+        },
+        organizations: [],
+      };
+    },
+    async getExtractionContext() {
+      return { rfq, settings: ws.settings, supplierName: supplier.name };
+    },
+    async reserveExtractionAndStorageQuota() {
+      seq += 1;
+      return { kind: 'reserved' as const, reservationId: `res-503-${seq}`, periodMonth: '2026-11' };
+    },
+    async saveExtractedQuotation() {
+      throw new Error('saveExtractedQuotation must not be called when GEMINI_API_KEY is missing/placeholder');
+    },
+    async releaseExtractionReservation(params: {
+      reservationId: string;
+      tokenUsage?: AiTokenUsageTelemetry | null;
+    }) {
+      releasedCalls.push({ reservationId: params.reservationId, tokenUsage: params.tokenUsage });
+    },
+  } as unknown as PgDataStore;
+
+  const app = await createApp({
+    enableVite: false,
+    demoMode: false,
+    db: {} as never,
+    rateLimitStore: new MemoryRateLimitStore(),
+    store: spyStore,
+    storageProvider: mockStorage,
+  });
+
+  const server = http.createServer(app);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+  const baseUrl = `http://127.0.0.1:${port}`;
+
+  const postPngExtract = () => {
+    const form = new FormData();
+    form.set('supplierId', supplier.id);
+    form.set(
+      'file',
+      new Blob([new Uint8Array(createMinimalValidPng())], { type: 'image/png' }),
+      'quote.png'
+    );
+    return fetch(`${baseUrl}/api/rfqs/${rfq.id}/quotes/extract`, {
+      method: 'POST',
+      headers: {
+        Cookie: 'nf_session=unit-session-token',
+        'X-CSRF-Token': 'unit-csrf-token',
+      },
+      body: form,
+    });
+  };
+
+  const prevGeminiKey = process.env.GEMINI_API_KEY;
+  try {
+    // 1. Missing GEMINI_API_KEY -> 503 & reservation released cleanly
+    delete process.env.GEMINI_API_KEY;
+    const rMissing = await postPngExtract();
+    assert.equal(rMissing.status, 503);
+    assert.equal(releasedCalls.length, 1);
+    assert.equal(releasedCalls[0].tokenUsage?.usageAvailable, false);
+    assert.equal(releasedCalls[0].tokenUsage?.totalTokenCount, null);
+
+    // 2. Placeholder GEMINI_API_KEY -> 503 (never 502) & reservation released cleanly
+    process.env.GEMINI_API_KEY = 'MY_GEMINI_API_KEY';
+    const rPlaceholder = await postPngExtract();
+    assert.equal(rPlaceholder.status, 503);
+    assert.equal(releasedCalls.length, 2);
+    assert.equal(releasedCalls[1].tokenUsage?.usageAvailable, false);
+    assert.equal(releasedCalls[1].tokenUsage?.totalTokenCount, null);
+  } finally {
+    if (prevGeminiKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = prevGeminiKey;
+    await new Promise<void>((resolve, reject) => {
+      server.closeAllConnections?.();
+      server.close((err) => (err ? reject(err) : resolve()));
+    });
+  }
+});
+
 test(
   'PostgreSQL integration: quotas, concurrency race protection, idempotency retries, storage reclaim on delete, legacy safety, and token logs',
   { skip: isSafeTestDbConfigured() ? false : TEST_DB_SKIP_REASON },

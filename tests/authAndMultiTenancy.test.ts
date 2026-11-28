@@ -371,3 +371,120 @@ test(
     await srv.close();
   }
 });
+
+test(
+  'Task 019A PostgreSQL concurrency: simultaneous owner demotion/removal cannot leave an organization ownerless',
+  { skip: isSafeTestDbConfigured() ? false : TEST_DB_SKIP_REASON },
+  async () => {
+    const srv = await startIntegratedTestServer();
+    const tag = uniqueRunTag();
+
+    try {
+      const owner1Client = new TestCookieClient(srv.baseUrl);
+      const reg1 = await owner1Client.request('/api/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: `owner1-${tag}@example.com`,
+          password: 'Password1#2026!',
+          fullName: 'Owner One',
+          organizationName: `Concurrency Org ${tag}`,
+        }),
+      });
+      assert.equal(reg1.status, 201);
+      const body1 = (await reg1.json()) as {
+        user: { id: string };
+        activeOrganization: { id: string };
+      };
+      createdUserIds.push(body1.user.id);
+      createdOrgIds.push(body1.activeOrganization.id);
+
+      // Invite and accept second user, then promote second user to owner
+      const email2 = `owner2-${tag}@example.com`;
+      const invRes = await owner1Client.request('/api/organizations/current/invitations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: email2, role: 'admin' }),
+      });
+      assert.equal(invRes.status, 201);
+      const invMsg = srv.emailProvider.sent.find((m) => m.to === email2);
+      assert.ok(invMsg);
+      const invTokenMatch = invMsg.text.match(/\?invite=([^\s]+)/);
+      assert.ok(invTokenMatch);
+
+      const owner2Client = new TestCookieClient(srv.baseUrl);
+      const reg2 = await owner2Client.request('/api/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: email2,
+          password: 'Password2#2026!',
+          fullName: 'Owner Two',
+          inviteToken: decodeURIComponent(invTokenMatch[1]),
+        }),
+      });
+      assert.equal(reg2.status, 201);
+      const body2 = (await reg2.json()) as { user: { id: string } };
+      createdUserIds.push(body2.user.id);
+
+      const promoteRes = await owner1Client.request(
+        `/api/organizations/current/members/${body2.user.id}`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ role: 'owner' }),
+        }
+      );
+      assert.equal(promoteRes.status, 200);
+
+      // Race 1: Owner1 demotes Owner2 while Owner2 concurrently removes Owner1
+      const [demote2Res, remove1Res] = await Promise.all([
+        owner1Client.request(`/api/organizations/current/members/${body2.user.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ role: 'admin' }),
+        }),
+        owner2Client.request(`/api/organizations/current/members/${body1.user.id}`, {
+          method: 'DELETE',
+        }),
+      ]);
+
+      const statuses = [demote2Res.status, remove1Res.status].sort((a, b) => a - b);
+      // At most one can succeed (200), the second must be blocked (409 or 403 if already demoted)
+      assert.equal(statuses[0], 200);
+      assert.ok(
+        statuses[1] === 409 || statuses[1] === 403,
+        `Expected concurrent loser to receive 409 or 403, got ${statuses[1]}`
+      );
+
+      // Verify at least one active owner remains via whichever owner survived
+      const survivingClient = demote2Res.status === 200 ? owner1Client : owner2Client;
+      const membersRes = await survivingClient.request('/api/organizations/current/members');
+      assert.equal(membersRes.status, 200);
+      const membersJson = (await membersRes.json()) as {
+        members: Array<{ userId: string; role: string; status: string }>;
+      };
+      const activeOwners = membersJson.members.filter(
+        (m) => m.role === 'owner' && m.status === 'active'
+      );
+      assert.equal(activeOwners.length, 1);
+
+      // Race 2: Concurrent attempts to demote the sole remaining owner both fail with 409
+      const soleOwnerId = activeOwners[0].userId;
+      const [failDemoteA, failDemoteB] = await Promise.all([
+        survivingClient.request(`/api/organizations/current/members/${soleOwnerId}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ role: 'admin' }),
+        }),
+        survivingClient.request(`/api/organizations/current/members/${soleOwnerId}`, {
+          method: 'DELETE',
+        }),
+      ]);
+      assert.equal(failDemoteA.status, 409);
+      assert.equal(failDemoteB.status, 409);
+    } finally {
+      await srv.close();
+    }
+  }
+);

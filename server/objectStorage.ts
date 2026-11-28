@@ -1,7 +1,12 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { signHmac, verifyHmac } from './security.ts';
+import {
+  isPlaceholderSecret,
+  signHmac,
+  stripSurroundingQuotes,
+  verifyHmac,
+} from './security.ts';
 
 export interface SignedDownloadResult {
   url: string;
@@ -427,18 +432,52 @@ export class S3CompatibleStorageProvider implements ObjectStorageProvider {
   }
 }
 
-export function createObjectStorageProvider(): ObjectStorageProvider {
-  const mode = (process.env.STORAGE_PROVIDER || 'local').toLowerCase();
-  if (mode === 's3') {
-    const endpoint = process.env.S3_ENDPOINT?.trim();
-    const region = process.env.S3_REGION?.trim() || 'auto';
-    const bucket = process.env.S3_BUCKET?.trim();
-    const accessKeyId = process.env.S3_ACCESS_KEY_ID?.trim();
-    const secretAccessKey = process.env.S3_SECRET_ACCESS_KEY?.trim();
+export function createObjectStorageProvider(
+  env: Record<string, string | undefined> = process.env
+): ObjectStorageProvider {
+  const isProd = (env.NODE_ENV || '').trim().toLowerCase() === 'production';
+  const rawProvider = stripSurroundingQuotes(env.STORAGE_PROVIDER || '').toLowerCase();
+  const mode = rawProvider || (isProd ? '' : 'local');
 
-    if (!endpoint || !bucket || !accessKeyId || !secretAccessKey) {
+  if (isProd && mode !== 's3') {
+    throw new Error(
+      'Configuration error: STORAGE_PROVIDER=s3 with S3/R2 configuration is required in production (local storage is disabled in production). Failing closed.'
+    );
+  }
+
+  if (mode === 's3') {
+    const endpoint = stripSurroundingQuotes(env.S3_ENDPOINT || '');
+    const region = stripSurroundingQuotes(env.S3_REGION || '') || 'auto';
+    const bucket = stripSurroundingQuotes(env.S3_BUCKET || '');
+    const accessKeyId = stripSurroundingQuotes(env.S3_ACCESS_KEY_ID || '');
+    const secretAccessKey = stripSurroundingQuotes(env.S3_SECRET_ACCESS_KEY || '');
+
+    if (
+      !endpoint ||
+      isPlaceholderSecret(endpoint) ||
+      !bucket ||
+      isPlaceholderSecret(bucket) ||
+      !accessKeyId ||
+      isPlaceholderSecret(accessKeyId) ||
+      !secretAccessKey ||
+      isPlaceholderSecret(secretAccessKey)
+    ) {
       throw new Error(
-        'STORAGE_PROVIDER=s3 requires S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY_ID, and S3_SECRET_ACCESS_KEY. Failing closed.'
+        'Configuration error: STORAGE_PROVIDER=s3 requires valid S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY_ID, and S3_SECRET_ACCESS_KEY. Failing closed.'
+      );
+    }
+
+    let parsedEndpoint: URL;
+    try {
+      parsedEndpoint = new URL(endpoint);
+    } catch {
+      throw new Error(
+        'Configuration error: S3_ENDPOINT must be a valid http(s) URL. Failing closed.'
+      );
+    }
+    if (parsedEndpoint.protocol !== 'http:' && parsedEndpoint.protocol !== 'https:') {
+      throw new Error(
+        'Configuration error: S3_ENDPOINT must use http or https protocol. Failing closed.'
       );
     }
 
@@ -449,6 +488,12 @@ export function createObjectStorageProvider(): ObjectStorageProvider {
       accessKeyId,
       secretAccessKey,
     });
+  }
+
+  if (mode !== 'local') {
+    throw new Error(
+      'Configuration error: Invalid STORAGE_PROVIDER. Expected "s3" or "local".'
+    );
   }
 
   return new LocalPrivateStorageProvider();

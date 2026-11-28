@@ -447,10 +447,12 @@ describe('Task 006/007: Temporary No-Login Demo Workspace & Security Isolation',
     const prevNodeEnv = process.env.NODE_ENV;
     const prevDemoMode = process.env.DEMO_MODE;
     const prevSessionSecret = process.env.SESSION_SECRET;
+    const prevAppUrl = process.env.APP_URL;
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'norus-prod-check-'));
     try {
       process.env.NODE_ENV = 'production';
       process.env.SESSION_SECRET = '0123456789abcdef0123456789abcdef-prod-test';
+      process.env.APP_URL = 'https://quoteflow.example.com';
       process.env.DEMO_MODE = 'true';
 
       await assert.rejects(
@@ -478,6 +480,8 @@ describe('Task 006/007: Temporary No-Login Demo Workspace & Security Isolation',
       else process.env.DEMO_MODE = prevDemoMode;
       if (prevSessionSecret === undefined) delete process.env.SESSION_SECRET;
       else process.env.SESSION_SECRET = prevSessionSecret;
+      if (prevAppUrl === undefined) delete process.env.APP_URL;
+      else process.env.APP_URL = prevAppUrl;
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
@@ -1255,6 +1259,32 @@ describe('Task 006/007: Temporary No-Login Demo Workspace & Security Isolation',
     });
     assert.equal(failExit.code, 1);
     assert.match(failExit.out, /server_startup_failed|DEMO_MODE=true is forbidden/i);
+
+    // Direct server.ts process in production also fails closed when APP_URL is missing
+    const missingAppUrlExit = await new Promise<{ code: number | null; out: string }>((resolve) => {
+      const badChild = spawn(process.execPath, [tsxCli, 'server.ts'], {
+        cwd: process.cwd(),
+        env: {
+          PATH: process.env.PATH || '',
+          HOME: process.env.HOME || '',
+          NODE_ENV: 'production',
+          PORT: String(port),
+          SESSION_SECRET: 'task019a-prod-startup-secret-0123456789abcdef',
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let out = '';
+      badChild.stdout.on('data', (d) => {
+        out += d.toString();
+      });
+      badChild.stderr.on('data', (d) => {
+        out += d.toString();
+      });
+      badChild.once('exit', (code) => resolve({ code, out }));
+    });
+    assert.equal(missingAppUrlExit.code, 1);
+    assert.match(missingAppUrlExit.out, /APP_URL must be set/i);
+    assert.equal(missingAppUrlExit.out.includes('task019a-prod-startup-secret'), false);
   });
 });
 

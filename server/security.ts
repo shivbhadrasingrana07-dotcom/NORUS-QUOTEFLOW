@@ -8,14 +8,40 @@ const KEY_LEN = 64;
 
 let ephemeralDevSecret: string | null = null;
 
+export function stripSurroundingQuotes(value: string): string {
+  const trimmed = String(value || '').trim();
+  if (
+    trimmed.length >= 2 &&
+    ((trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+      (trimmed.startsWith("'") && trimmed.endsWith("'")))
+  ) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
+export function isPlaceholderSecret(value: string | undefined | null): boolean {
+  const normalized = stripSurroundingQuotes(value ?? '');
+  const upper = normalized.toUpperCase();
+  return (
+    !upper ||
+    /^[\u2022*]+$/.test(normalized) ||
+    upper.startsWith('MY_') ||
+    upper.startsWith('YOUR_') ||
+    upper === 'CHANGEME' ||
+    upper === 'REPLACE_ME' ||
+    upper === 'PLACEHOLDER'
+  );
+}
+
 export function getSigningSecret(): string {
-  const configured = process.env.SESSION_SECRET;
-  if (configured && configured.length >= 32) {
+  const configured = stripSurroundingQuotes(process.env.SESSION_SECRET || '');
+  if (configured && configured.length >= 32 && !isPlaceholderSecret(configured)) {
     return configured;
   }
   if (process.env.NODE_ENV === 'production') {
     throw new Error(
-      'SESSION_SECRET (>= 32 characters) must be configured in production. Failing closed.'
+      'SESSION_SECRET (>= 32 characters, non-placeholder) must be configured in production. Failing closed.'
     );
   }
   if (!ephemeralDevSecret) {

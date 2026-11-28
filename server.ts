@@ -56,12 +56,14 @@ import {
   clearAuthCookies,
   generateSecureToken,
   getSigningSecret,
+  isPlaceholderSecret,
   parseCookies,
   redactSensitiveText,
   resolveCookieSameSite,
   SESSION_COOKIE_NAME,
   setAuthCookies,
   signHmac,
+  stripSurroundingQuotes,
   verifyHmac,
 } from './server/security.ts';
 import {
@@ -96,6 +98,40 @@ export interface AppOptions {
   errorTrackerHook?: ErrorTrackerHook;
   demoMode?: boolean;
   store?: PgDataStore;
+  appUrl?: string;
+}
+
+export function validateHttpAppUrl(rawValue: string | undefined | null): string | null {
+  const cleaned = stripSurroundingQuotes(rawValue ?? '');
+  if (!cleaned || isPlaceholderSecret(cleaned)) {
+    return null;
+  }
+  try {
+    const parsed = new URL(cleaned);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return null;
+    }
+    if (!parsed.hostname || parsed.username || parsed.password) {
+      return null;
+    }
+    return parsed.origin + (parsed.pathname === '/' ? '' : parsed.pathname.replace(/\/+$/, ''));
+  } catch {
+    return null;
+  }
+}
+
+export function resolveProductionAppUrl(
+  params: { appUrlOverride?: string; env?: Record<string, string | undefined> } = {}
+): string {
+  const env = params.env ?? process.env;
+  const raw = params.appUrlOverride ?? env.APP_URL;
+  const valid = validateHttpAppUrl(raw);
+  if (!valid) {
+    throw new Error(
+      'Configuration error: APP_URL must be set to a valid, non-placeholder http(s) URL in production. Failing closed.'
+    );
+  }
+  return valid;
 }
 
 function normalizeOptionalFlagEnv(rawValue: string | undefined): string {
@@ -243,12 +279,12 @@ function safeTimingEqual(a: string, b: string): boolean {
 
 function getAllowedOrigins(): Set<string> {
   const origins = new Set<string>();
-  const appUrl = process.env.APP_URL?.trim();
+  const appUrl = validateHttpAppUrl(process.env.APP_URL);
   if (appUrl) {
     try {
       origins.add(new URL(appUrl).origin);
     } catch {
-      // Ignore malformed APP_URL placeholder
+      // Ignore malformed APP_URL
     }
   }
   const extra = process.env.ALLOWED_ORIGINS?.split(',') || [];
@@ -285,8 +321,6 @@ export async function createApp(options: AppOptions = {}) {
   const {
     enableVite = false,
     db = defaultDb,
-    storageProvider = createObjectStorageProvider(),
-    emailProvider = createEmailProvider(),
     firebaseVerifier = verifyFirebaseIdToken,
     generateContentOverride,
     authRateLimitMax = 25,
@@ -296,15 +330,26 @@ export async function createApp(options: AppOptions = {}) {
   } = options;
   const demoModeEnabled = resolveDemoMode({ demoModeOverride: demoMode });
 
+  let validatedProdAppUrl: string | null = null;
   if (process.env.NODE_ENV === 'production') {
-    // Fail closed if required production secrets/database configuration are missing
+    // Fail closed before initializing providers or mounting routes if required production configuration is missing/placeholder
     getSigningSecret();
-    if (!options.db && !isSqlEnvConfigured()) {
+    validatedProdAppUrl = resolveProductionAppUrl({ appUrlOverride: options.appUrl });
+    if (
+      !options.db &&
+      (!isSqlEnvConfigured() ||
+        isPlaceholderSecret(process.env.SQL_HOST) ||
+        isPlaceholderSecret(process.env.SQL_USER) ||
+        isPlaceholderSecret(process.env.SQL_DB_NAME))
+    ) {
       throw new Error(
         'PostgreSQL configuration (SQL_HOST, SQL_USER, SQL_PASSWORD, SQL_DB_NAME) is required in production.'
       );
     }
   }
+
+  const storageProvider = options.storageProvider ?? createObjectStorageProvider();
+  const emailProvider = options.emailProvider ?? createEmailProvider();
 
   const store = options.store ?? new PgDataStore(db);
   const rateLimitStore: RateLimitStore =
@@ -316,6 +361,8 @@ export async function createApp(options: AppOptions = {}) {
     options.demoRateLimitStore || new MemoryRateLimitStore(2000);
 
   const app = express();
+  app.locals.storageProvider = storageProvider;
+  app.locals.storageProviderMode = storageProvider.mode;
   app.disable('x-powered-by');
   app.set('trust proxy', resolveTrustProxySetting());
   app.use(createCorrelationMiddleware());
@@ -495,8 +542,12 @@ export async function createApp(options: AppOptions = {}) {
   }
 
   function getAppBaseUrl(req: Request): string {
-    if (process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL') {
-      return process.env.APP_URL.replace(/\/+$/, '');
+    if (validatedProdAppUrl) {
+      return validatedProdAppUrl;
+    }
+    const configuredAppUrl = validateHttpAppUrl(options.appUrl ?? process.env.APP_URL);
+    if (configuredAppUrl) {
+      return configuredAppUrl;
     }
     const proto =
       (typeof req.headers['x-forwarded-proto'] === 'string' &&
@@ -514,9 +565,7 @@ export async function createApp(options: AppOptions = {}) {
       database: 'postgresql',
       storageProvider: storageProvider.mode,
       emailProvider: emailProvider.mode,
-      geminiConfigured: Boolean(
-        process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'
-      ),
+      geminiConfigured: !isPlaceholderSecret(process.env.GEMINI_API_KEY),
       googleAuthConfigured: isGoogleAuthConfigured(),
       timestamp: new Date().toISOString(),
       uptimeSec: Math.floor(process.uptime()),
@@ -2007,14 +2056,15 @@ const isDirectExecution =
 if (isDirectExecution) {
   const PORT = Number(process.env.PORT) || 3000;
   try {
-    const storageProvider = createObjectStorageProvider();
-    createApp({ enableVite: true, storageProvider })
+    const demoModeAtBoot = resolveDemoMode();
+    createApp({ enableVite: true })
       .then((app) => {
+        const storageProvider = app.locals.storageProvider as ObjectStorageProvider;
         const httpServer = app.listen(PORT, '0.0.0.0', () => {
           logEvent('info', 'server_started', {
             port: PORT,
             nodeEnv: process.env.NODE_ENV || 'development',
-            demoMode: resolveDemoMode(),
+            demoMode: demoModeAtBoot,
             storageProvider: storageProvider.mode,
           });
         });

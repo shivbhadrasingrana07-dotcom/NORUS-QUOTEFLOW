@@ -11,6 +11,7 @@ import {
   SourceTrace,
 } from '../src/types.ts';
 import { recomputeQuotation } from './normalization.ts';
+import { isPlaceholderSecret, stripSurroundingQuotes } from './security.ts';
 import {
   colIndexToLetter,
   MAX_SPREADSHEET_BYTES,
@@ -110,10 +111,10 @@ function sanitizeErrorMessage(raw: string): string {
 }
 
 function getGeminiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
+  const apiKey = stripSurroundingQuotes(process.env.GEMINI_API_KEY || '');
+  if (!apiKey || isPlaceholderSecret(apiKey)) {
     throw new ExtractionServiceError(
-      'GEMINI_API_KEY is not configured. Add it in Settings > Secrets to extract supplier quotations.',
+      'GEMINI_API_KEY is not configured. Add a valid key in server configuration to extract supplier quotations.',
       503
     );
   }
@@ -652,7 +653,7 @@ async function callWithTimeoutAndRetry(
       return result;
     } catch (err) {
       lastErr = err;
-      if (err instanceof ExtractionServiceError && err.statusCode === 504) {
+      if (err instanceof ExtractionServiceError) {
         throw err;
       }
       const msg = err instanceof Error ? err.message : String(err);

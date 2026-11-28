@@ -1,4 +1,8 @@
-import { redactSensitiveText } from './security.ts';
+import {
+  isPlaceholderSecret,
+  redactSensitiveText,
+  stripSurroundingQuotes,
+} from './security.ts';
 
 export interface EmailMessage {
   to: string;
@@ -161,47 +165,38 @@ export class ResendEmailProvider implements EmailProvider {
   }
 }
 
-function stripSurroundingQuotes(value: string): string {
-  const trimmed = String(value || '').trim();
-  if (
-    trimmed.length >= 2 &&
-    ((trimmed.startsWith('"') && trimmed.endsWith('"')) ||
-      (trimmed.startsWith("'") && trimmed.endsWith("'")))
-  ) {
-    return trimmed.slice(1, -1).trim();
-  }
-  return trimmed;
-}
-
-function isPlaceholderSecret(value: string): boolean {
-  const normalized = stripSurroundingQuotes(value);
-  const upper = normalized.toUpperCase();
-  return (
-    !upper ||
-    /^[\u2022*]+$/.test(normalized) ||
-    upper.startsWith('MY_') ||
-    upper.startsWith('YOUR_')
-  );
-}
-
-export function createEmailProvider(): EmailProvider {
-  const apiKey = stripSurroundingQuotes(process.env.RESEND_API_KEY || '');
+export function createEmailProvider(
+  env: Record<string, string | undefined> = process.env
+): EmailProvider {
+  const isProd = (env.NODE_ENV || '').trim().toLowerCase() === 'production';
+  const apiKey = stripSurroundingQuotes(env.RESEND_API_KEY || '');
   if (!apiKey || isPlaceholderSecret(apiKey)) {
+    if (isProd) {
+      throw new Error(
+        'Configuration error: RESEND_API_KEY must be configured in production (DevOutboxEmailProvider fallback is disabled in production). Failing closed.'
+      );
+    }
     return new DevOutboxEmailProvider();
   }
 
-  const rawFrom = stripSurroundingQuotes(process.env.EMAIL_FROM || '');
+  const rawFrom = stripSurroundingQuotes(env.EMAIL_FROM || '');
+  if (isProd) {
+    if (!rawFrom || isPlaceholderSecret(rawFrom) || !isValidSenderAddress(rawFrom)) {
+      throw new Error(
+        'Configuration error: EMAIL_FROM must contain a valid non-placeholder sender email address in production. Failing closed.'
+      );
+    }
+    return new ResendEmailProvider(apiKey, rawFrom);
+  }
+
   const from = rawFrom || 'NORUS QUOTEFLOW <noreply@norus.local>';
   if (!isValidSenderAddress(from)) {
-    if (process.env.NODE_ENV === 'production') {
-      throw new Error('EMAIL_FROM must contain a valid sender email address when Resend is enabled.');
-    }
-    if (process.env.NODE_ENV !== 'test') {
+    if (env.NODE_ENV !== 'test') {
       console.warn(
         JSON.stringify({
           level: 'warn',
           event: 'resend_invalid_sender_fallback_dev_outbox',
-          nodeEnv: process.env.NODE_ENV || 'development',
+          nodeEnv: env.NODE_ENV || 'development',
           ts: new Date().toISOString(),
         })
       );

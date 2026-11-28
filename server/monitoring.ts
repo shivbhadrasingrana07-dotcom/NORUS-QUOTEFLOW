@@ -6,7 +6,7 @@ import type { NextFunction, Request, Response } from 'express';
 import type { DrizzleDb } from '../src/db/index.ts';
 import type { EmailProvider } from './emailService.ts';
 import type { ObjectStorageProvider } from './objectStorage.ts';
-import { redactSensitiveText } from './security.ts';
+import { isPlaceholderSecret, redactSensitiveText } from './security.ts';
 
 export function isGoogleAuthConfigured(configPath?: string): boolean {
   try {
@@ -200,7 +200,7 @@ export async function checkDependencyReadiness(params: {
       },
       email: emailStatus,
       gemini: {
-        configured: Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'),
+        configured: !isPlaceholderSecret(process.env.GEMINI_API_KEY),
       },
       googleAuth: {
         configured: isGoogleAuthConfigured(),

@@ -5,10 +5,14 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { eq } from 'drizzle-orm';
+import { createApp, resolveProductionAppUrl } from '../server.ts';
 import { createEmailProvider, isValidSenderAddress, ResendEmailProvider } from '../server/emailService.ts';
 import { runScheduledMaintenance } from '../server/maintenance.ts';
-import type { ObjectStorageProvider } from '../server/objectStorage.ts';
-import { LocalPrivateStorageProvider } from '../server/objectStorage.ts';
+import {
+  createObjectStorageProvider,
+  LocalPrivateStorageProvider,
+  type ObjectStorageProvider,
+} from '../server/objectStorage.ts';
 import {
   BootstrapError,
   bootstrapFirstOwnerDirect,
@@ -155,7 +159,7 @@ test('ResendEmailProvider validates senders, retries transient 503/429 failures,
   }
 });
 
-test('createEmailProvider handles quoted EMAIL_FROM, falls back in dev on invalid EMAIL_FROM, and fails closed in production', () => {
+test('createEmailProvider handles quoted EMAIL_FROM, falls back in dev/test, and fails closed in production', () => {
   const origKey = process.env.RESEND_API_KEY;
   const origFrom = process.env.EMAIL_FROM;
   const origEnv = process.env.NODE_ENV;
@@ -171,12 +175,36 @@ test('createEmailProvider handles quoted EMAIL_FROM, falls back in dev on invali
     const devFallback = createEmailProvider();
     assert.equal(devFallback.mode, 'dev_outbox');
 
-    process.env.NODE_ENV = 'production';
-    assert.throws(() => createEmailProvider(), /EMAIL_FROM must contain a valid sender email address/);
-
+    // Non-production missing/placeholder RESEND_API_KEY continues to use DevOutboxEmailProvider
     process.env.RESEND_API_KEY = 'MY_RESEND_API_KEY';
-    const placeholderFallback = createEmailProvider();
-    assert.equal(placeholderFallback.mode, 'dev_outbox');
+    process.env.NODE_ENV = 'test';
+    assert.equal(createEmailProvider().mode, 'dev_outbox');
+
+    // Production must fail closed on invalid, placeholder, or missing EMAIL_FROM and missing/placeholder RESEND_API_KEY
+    process.env.NODE_ENV = 'production';
+    process.env.RESEND_API_KEY = 're_live_SUPER_SECRET_SHOULD_NOT_LEAK';
+    process.env.EMAIL_FROM = 'not-an-email';
+    assert.throws(
+      () => createEmailProvider(),
+      (err: Error) => {
+        assert.match(err.message, /EMAIL_FROM must contain a valid non-placeholder sender email address in production/);
+        assert.equal(err.message.includes('re_live_SUPER_SECRET_SHOULD_NOT_LEAK'), false);
+        return true;
+      }
+    );
+
+    delete process.env.EMAIL_FROM;
+    assert.throws(() => createEmailProvider(), /EMAIL_FROM must contain a valid non-placeholder sender email address in production/);
+
+    process.env.EMAIL_FROM = 'MY_EMAIL_FROM';
+    assert.throws(() => createEmailProvider(), /EMAIL_FROM must contain a valid non-placeholder sender email address in production/);
+
+    process.env.EMAIL_FROM = 'NORUS <noreply@norus.in>';
+    process.env.RESEND_API_KEY = 'MY_RESEND_API_KEY';
+    assert.throws(() => createEmailProvider(), /RESEND_API_KEY must be configured in production/);
+
+    delete process.env.RESEND_API_KEY;
+    assert.throws(() => createEmailProvider(), /RESEND_API_KEY must be configured in production/);
   } finally {
     if (origKey === undefined) delete process.env.RESEND_API_KEY;
     else process.env.RESEND_API_KEY = origKey;
@@ -184,6 +212,118 @@ test('createEmailProvider handles quoted EMAIL_FROM, falls back in dev on invali
     else process.env.EMAIL_FROM = origFrom;
     if (origEnv === undefined) delete process.env.NODE_ENV;
     else process.env.NODE_ENV = origEnv;
+  }
+});
+
+test('Task 019A: production startup rejects missing/placeholder APP_URL, local/missing storage, and silent dev email while preserving dev/test', async () => {
+  // 1. Storage factory: dev/test defaults local; prod forbids local/missing/placeholder S3
+  assert.equal(createObjectStorageProvider({ NODE_ENV: 'development' }).mode, 'local');
+  assert.equal(createObjectStorageProvider({ NODE_ENV: 'test', STORAGE_PROVIDER: 'local' }).mode, 'local');
+
+  assert.throws(
+    () => createObjectStorageProvider({ NODE_ENV: 'production' }),
+    /STORAGE_PROVIDER=s3.*required in production/i
+  );
+  assert.throws(
+    () => createObjectStorageProvider({ NODE_ENV: 'production', STORAGE_PROVIDER: 'local' }),
+    /STORAGE_PROVIDER=s3.*required in production/i
+  );
+  assert.throws(
+    () =>
+      createObjectStorageProvider({
+        NODE_ENV: 'production',
+        STORAGE_PROVIDER: 's3',
+        S3_ENDPOINT: 'https://r2.example.com',
+        S3_BUCKET: 'norus-private',
+        S3_ACCESS_KEY_ID: 'MY_ACCESS_KEY',
+        S3_SECRET_ACCESS_KEY: 'super-secret-value-never-leak',
+      }),
+    (err: Error) => {
+      assert.match(err.message, /STORAGE_PROVIDER=s3 requires valid/);
+      assert.equal(err.message.includes('super-secret-value-never-leak'), false);
+      return true;
+    }
+  );
+  const validProdStorage = createObjectStorageProvider({
+    NODE_ENV: 'production',
+    STORAGE_PROVIDER: 's3',
+    S3_ENDPOINT: 'https://r2.example.com',
+    S3_BUCKET: 'norus-private',
+    S3_ACCESS_KEY_ID: 'AKIAVALIDKEY123',
+    S3_SECRET_ACCESS_KEY: 'valid-secret-key-abc',
+  });
+  assert.equal(validProdStorage.mode, 's3');
+
+  // 2. APP_URL validation in production
+  assert.throws(() => resolveProductionAppUrl({ env: {} }), /APP_URL must be set/i);
+  assert.throws(() => resolveProductionAppUrl({ env: { APP_URL: 'MY_APP_URL' } }), /APP_URL must be set/i);
+  assert.throws(() => resolveProductionAppUrl({ env: { APP_URL: '••••' } }), /APP_URL must be set/i);
+  assert.throws(() => resolveProductionAppUrl({ env: { APP_URL: 'ftp://bad.example.com' } }), /APP_URL must be set/i);
+  assert.equal(
+    resolveProductionAppUrl({ env: { APP_URL: '"https://app.norus.in/"' } }),
+    'https://app.norus.in'
+  );
+
+  // 3. Full createApp() startup ordering in NODE_ENV=production
+  const trackedKeys = [
+    'NODE_ENV',
+    'DEMO_MODE',
+    'SESSION_SECRET',
+    'APP_URL',
+    'STORAGE_PROVIDER',
+    'S3_ENDPOINT',
+    'S3_BUCKET',
+    'S3_ACCESS_KEY_ID',
+    'S3_SECRET_ACCESS_KEY',
+    'RESEND_API_KEY',
+    'EMAIL_FROM',
+  ] as const;
+  const saved: Record<string, string | undefined> = {};
+  for (const k of trackedKeys) saved[k] = process.env[k];
+
+  try {
+    process.env.NODE_ENV = 'production';
+    delete process.env.DEMO_MODE;
+    process.env.SESSION_SECRET = '0123456789abcdef0123456789abcdef-prod-test';
+
+    // Missing APP_URL
+    delete process.env.APP_URL;
+    await assert.rejects(() => createApp({ enableVite: false, db: {} as never }), /APP_URL must be set/i);
+
+    // Placeholder APP_URL
+    process.env.APP_URL = 'MY_APP_URL';
+    await assert.rejects(() => createApp({ enableVite: false, db: {} as never }), /APP_URL must be set/i);
+
+    // Valid APP_URL, missing/local storage rejected
+    process.env.APP_URL = 'https://app.norus.in';
+    process.env.STORAGE_PROVIDER = 'local';
+    await assert.rejects(
+      () => createApp({ enableVite: false, db: {} as never }),
+      /STORAGE_PROVIDER=s3.*required in production/i
+    );
+
+    // Valid S3 storage, missing/placeholder Resend rejected
+    process.env.STORAGE_PROVIDER = 's3';
+    process.env.S3_ENDPOINT = 'https://r2.example.com';
+    process.env.S3_BUCKET = 'norus-private';
+    process.env.S3_ACCESS_KEY_ID = 'AKIAVALIDKEY123';
+    process.env.S3_SECRET_ACCESS_KEY = 'valid-secret-key-abc';
+    delete process.env.RESEND_API_KEY;
+    await assert.rejects(
+      () => createApp({ enableVite: false, db: {} as never }),
+      /RESEND_API_KEY must be configured in production/i
+    );
+
+    // All required production settings configured cleanly -> succeeds
+    process.env.RESEND_API_KEY = 're_live_valid_test_key';
+    process.env.EMAIL_FROM = 'NORUS QUOTEFLOW <noreply@norus.in>';
+    const prodApp = await createApp({ enableVite: false, db: {} as never });
+    assert.equal(typeof prodApp, 'function');
+  } finally {
+    for (const k of trackedKeys) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
   }
 });
 

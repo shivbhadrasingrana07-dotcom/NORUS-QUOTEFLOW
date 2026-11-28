@@ -1192,6 +1192,17 @@ export class PgDataStore {
       }
 
       return await this.db.transaction(async (tx) => {
+        const [orgRow] = await tx
+          .select({ id: organizations.id })
+          .from(organizations)
+          .where(eq(organizations.id, params.organizationId))
+          .for('update')
+          .limit(1);
+
+        if (!orgRow) {
+          throw new StoreError(404, 'Organization not found.');
+        }
+
         const [target] = await tx
           .select({ membership: organizationMemberships, user: users })
           .from(organizationMemberships)
@@ -1276,6 +1287,17 @@ export class PgDataStore {
   }): Promise<void> {
     try {
       await this.db.transaction(async (tx) => {
+        const [orgRow] = await tx
+          .select({ id: organizations.id })
+          .from(organizations)
+          .where(eq(organizations.id, params.organizationId))
+          .for('update')
+          .limit(1);
+
+        if (!orgRow) {
+          throw new StoreError(404, 'Organization not found.');
+        }
+
         const [target] = await tx
           .select({ membership: organizationMemberships, user: users })
           .from(organizationMemberships)
