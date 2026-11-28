@@ -16,6 +16,7 @@ import {
   TEST_DB_SKIP_REASON,
   TestCookieClient,
   uniqueRunTag,
+  verifyRegisteredUserEmail,
 } from './_helpers.ts';
 
 const createdOrgIds: string[] = [];
@@ -77,6 +78,7 @@ test(
     assert.equal(regBody.activeOrganization.role, 'owner');
     createdUserIds.push(regBody.user.id);
     createdOrgIds.push(regBody.activeOrganization.id);
+    await verifyRegisteredUserEmail(srv.baseUrl, srv.emailProvider, `owner-${tag}@example.com`);
 
     // 4. Create RFQ
     const rfqRes = await ownerClient.request('/api/rfqs', {
@@ -496,6 +498,11 @@ test(
       };
       createdUserIds.push(regBody.user.id);
       createdOrgIds.push(regBody.activeOrganization.id);
+      await verifyRegisteredUserEmail(
+        srv.baseUrl,
+        srv.emailProvider,
+        `owner-0072-${tag}@example.com`
+      );
 
       const sup = (await (
         await ownerClient.request('/api/suppliers', {
@@ -710,6 +717,7 @@ test(
       };
       createdUserIds.push(regBody.user.id);
       createdOrgIds.push(regBody.activeOrganization.id);
+      await verifyRegisteredUserEmail(srv.baseUrl, srv.emailProvider, `conc-009-${tag}@example.com`);
 
       const sup = (await (
         await ownerClient.request('/api/suppliers', {

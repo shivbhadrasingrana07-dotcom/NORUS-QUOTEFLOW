@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { sql } from 'drizzle-orm';
 import type { NextFunction, Request, Response } from 'express';
 import type { DrizzleDb } from '../src/db/index.ts';
@@ -113,6 +114,78 @@ export function getClientIp(req: Request): string {
   return req.ip || req.socket?.remoteAddress || 'unknown';
 }
 
+const BASIC_EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+export function normalizeEmailForRateLimit(rawEmail: unknown): string | null {
+  if (typeof rawEmail !== 'string') return null;
+  const normalized = rawEmail.trim().toLowerCase();
+  if (!normalized || normalized.length > 320) return null;
+  if (!BASIC_EMAIL_RE.test(normalized)) return null;
+  return normalized;
+}
+
+export function hashEmailRateLimitIdentity(normalizedEmail: string): string {
+  return crypto.createHash('sha256').update(normalizedEmail, 'utf8').digest('hex').slice(0, 32);
+}
+
+function applyRateLimitHeaders(res: Response, result: RateLimitCheckResult) {
+  res.setHeader('X-RateLimit-Limit', String(result.limit));
+  res.setHeader('X-RateLimit-Remaining', String(result.remaining));
+  res.setHeader('X-RateLimit-Reset', String(Math.ceil(result.resetAt.getTime() / 1000)));
+}
+
+export interface RateLimitRuleSpec {
+  namespace: string;
+  limit: number;
+  windowMs: number;
+  keyFn: (req: Request) => string | null;
+}
+
+/**
+ * Evaluates multiple rate-limit buckets sequentially (typically IP first, then account/email).
+ * Short-circuits immediately if an earlier bucket is exhausted so a blocked IP cannot continue
+ * poisoning downstream per-account buckets.
+ */
+export function createMultiKeyRateLimitMiddleware(params: {
+  store: RateLimitStore;
+  rules: RateLimitRuleSpec[];
+}) {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      let tightestResult: RateLimitCheckResult | null = null;
+
+      for (const rule of params.rules) {
+        const identity = rule.keyFn(req);
+        if (!identity) continue;
+
+        const bucketKey = `${rule.namespace}:${identity}`.slice(0, 180);
+        const result = await params.store.consume(bucketKey, rule.limit, rule.windowMs);
+
+        if (!result.allowed) {
+          applyRateLimitHeaders(res, result);
+          const retrySec = Math.max(1, Math.ceil((result.resetAt.getTime() - Date.now()) / 1000));
+          res.setHeader('Retry-After', String(retrySec));
+          return res.status(429).json({
+            error: 'Rate limit exceeded. Please wait before retrying.',
+          });
+        }
+
+        if (!tightestResult || result.remaining < tightestResult.remaining) {
+          tightestResult = result;
+        }
+      }
+
+      if (tightestResult) {
+        applyRateLimitHeaders(res, tightestResult);
+      }
+
+      next();
+    } catch (err) {
+      next(err);
+    }
+  };
+}
+
 export function createRateLimitMiddleware(params: {
   store: RateLimitStore;
   namespace: string;
@@ -120,26 +193,15 @@ export function createRateLimitMiddleware(params: {
   windowMs: number;
   keyFn?: (req: Request) => string;
 }) {
-  return async (req: Request, res: Response, next: NextFunction) => {
-    try {
-      const identity = params.keyFn ? params.keyFn(req) : getClientIp(req);
-      const bucketKey = `${params.namespace}:${identity}`.slice(0, 180);
-      const result = await params.store.consume(bucketKey, params.limit, params.windowMs);
-
-      res.setHeader('X-RateLimit-Limit', String(result.limit));
-      res.setHeader('X-RateLimit-Remaining', String(result.remaining));
-      res.setHeader('X-RateLimit-Reset', String(Math.ceil(result.resetAt.getTime() / 1000)));
-
-      if (!result.allowed) {
-        const retrySec = Math.max(1, Math.ceil((result.resetAt.getTime() - Date.now()) / 1000));
-        res.setHeader('Retry-After', String(retrySec));
-        return res.status(429).json({
-          error: 'Rate limit exceeded. Please wait before retrying.',
-        });
-      }
-      next();
-    } catch (err) {
-      next(err);
-    }
-  };
+  return createMultiKeyRateLimitMiddleware({
+    store: params.store,
+    rules: [
+      {
+        namespace: params.namespace,
+        limit: params.limit,
+        windowMs: params.windowMs,
+        keyFn: (req) => (params.keyFn ? params.keyFn(req) : getClientIp(req)),
+      },
+    ],
+  });
 }

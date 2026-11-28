@@ -261,7 +261,7 @@ export function OrganizationView({
           <div className="flex items-center gap-2 text-[#92400E]">
             <MailCheck className="w-4 h-4 shrink-0" />
             <span>
-              Your email <strong>{user.email}</strong> is not verified yet.
+              Your email <strong>{user.email}</strong> is not verified yet. Verify your email to unlock team invitations and AI quotation extraction.
             </span>
           </div>
           <button
@@ -478,6 +478,11 @@ export function OrganizationView({
 
             {canManageTeam ? (
               <>
+                {!user.emailVerified && (
+                  <div className="p-2.5 bg-[#FFFBEB] border border-[#FDE68A] text-[#92400E] rounded-md text-[11px]">
+                    Verify your email address above before sending team invitations.
+                  </div>
+                )}
                 <form onSubmit={handleInviteSubmit} className="space-y-3">
                   <input
                     type="email"

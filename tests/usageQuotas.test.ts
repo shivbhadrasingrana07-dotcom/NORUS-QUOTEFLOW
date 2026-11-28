@@ -43,6 +43,7 @@ import {
   isSafeTestDbConfigured,
   startIntegratedTestServer,
   uniqueRunTag,
+  verifyRegisteredUserEmail,
 } from './_helpers.ts';
 
 const createdOrgIds: string[] = [];
@@ -1115,6 +1116,7 @@ test(
       createdOrgIds.push(orgId);
       createdUserIds.push(regBody.user.id);
       assert.equal(regBody.activeOrganization.planTier, 'starter');
+      await verifyRegisteredUserEmail(srv.baseUrl, srv.emailProvider, `quota-${tag}@example.com`);
 
       // PATCH /api/settings ignores planTier & quota overrides
       const spoofRes = await client.request('/api/settings', {
@@ -1272,6 +1274,11 @@ test(
       };
       createdOrgIds.push(otherBody.activeOrganization.id);
       createdUserIds.push(otherBody.user.id);
+      await verifyRegisteredUserEmail(
+        srv.baseUrl,
+        srv.emailProvider,
+        `quota-other-${tag}@example.com`
+      );
 
       const otherSup = (await (
         await otherClient.request('/api/suppliers', {

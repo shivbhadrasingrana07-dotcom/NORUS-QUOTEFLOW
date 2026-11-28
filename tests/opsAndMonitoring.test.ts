@@ -46,6 +46,7 @@ import {
   TEST_DB_SKIP_REASON,
   TestCookieClient,
   uniqueRunTag,
+  verifyRegisteredUserEmail,
 } from './_helpers.ts';
 
 const createdOrgIds: string[] = [];
@@ -1107,6 +1108,7 @@ test(
     };
     createdUserIds.push(regJson.user.id);
     createdOrgIds.push(regJson.activeOrganization.id);
+    await verifyRegisteredUserEmail(degradedSrv.baseUrl, degradedSrv.emailProvider, `mon-${tag}@example.com`);
 
     const supRes = await client.request('/api/suppliers', {
       method: 'POST',

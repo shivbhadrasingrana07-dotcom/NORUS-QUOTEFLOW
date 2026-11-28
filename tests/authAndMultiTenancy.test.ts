@@ -9,6 +9,7 @@ import {
   TEST_DB_SKIP_REASON,
   TestCookieClient,
   uniqueRunTag,
+  verifyRegisteredUserEmail,
 } from './_helpers.ts';
 
 const createdOrgIds: string[] = [];
@@ -249,6 +250,7 @@ test(
     };
     createdUserIds.push(bodyA.user.id);
     createdOrgIds.push(bodyA.activeOrganization.id);
+    await verifyRegisteredUserEmail(srv.baseUrl, srv.emailProvider, `orgA-${tag}@example.com`);
 
     // Tenant A creates second organization & switches between orgs
     const secondOrgRes = await clientA.request('/api/organizations', {
@@ -399,8 +401,20 @@ test(
       createdUserIds.push(body1.user.id);
       createdOrgIds.push(body1.activeOrganization.id);
 
-      // Invite and accept second user, then promote second user to owner
       const email2 = `owner2-${tag}@example.com`;
+      // Unverified owner cannot send external team invitations
+      const unverifiedInvRes = await owner1Client.request('/api/organizations/current/invitations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: email2, role: 'admin' }),
+      });
+      assert.equal(unverifiedInvRes.status, 403);
+      const unverifiedInvBody = (await unverifiedInvRes.json()) as { code?: string };
+      assert.equal(unverifiedInvBody.code, 'EMAIL_VERIFICATION_REQUIRED');
+
+      await verifyRegisteredUserEmail(srv.baseUrl, srv.emailProvider, `owner1-${tag}@example.com`);
+
+      // Invite and accept second user, then promote second user to owner
       const invRes = await owner1Client.request('/api/organizations/current/invitations', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

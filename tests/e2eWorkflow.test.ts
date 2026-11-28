@@ -15,6 +15,7 @@ import {
   TEST_DB_SKIP_REASON,
   TestCookieClient,
   uniqueRunTag,
+  verifyRegisteredUserEmail,
 } from './_helpers.ts';
 
 const createdOrgIds: string[] = [];
@@ -267,6 +268,7 @@ test(
     };
     assert.equal(buyerAuth.activeOrganization.role, 'buyer');
     createdUserIds.push(buyerAuth.user.id);
+    await verifyRegisteredUserEmail(srv.baseUrl, srv.emailProvider, buyerEmail);
 
     const approverClient = new TestCookieClient(srv.baseUrl);
     const googleApprover = await approverClient.request('/api/auth/google', {

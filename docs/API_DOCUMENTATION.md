@@ -41,31 +41,31 @@ All routes below operate exclusively on an isolated, in-memory synthetic dataset
 - `POST /api/demo-workspace/rfqs/:rfqId/award`, `POST /api/demo-workspace/awards/:awardId/decide`, & `POST /api/demo-workspace/awards/:awardId/withdraw` — Validates awards via shared `validateAwardSubmission` (`src/lib/awardValidation.ts`: rejects existing `pending` (`409`) or `approved` (`409`) awards while preserving `rejected` award history, enforces 100% BOM coverage, `isLineQuantitySufficient` with `QUANTITY_EPSILON = 1e-4` (`422`), verified quotes, valid math, full package completeness, cent-accurate `isExceedingL1Total` `nonL1Justification`, `commercialExceptionAccepted` when `missingFreightWarning` is true, and `acceptedAlternateLineIds` when `alternate_spec` lines are selected), supports withdrawing `pending` recommendations (`withdraw`), and updates synthetic demo price memory upon approval.
 - `GET /api/demo-workspace/documents/:docId/signed-url` & `GET /api/demo-workspace/documents/:docId/content` — Requires an existing active session (`hasSession`, returning `404` on unknown/missing session IDs without allocating) and serves genuine synthetic sample PDF/XLSX or uploaded demo files using HMAC-signed URLs scoped to `demo:${docId}:${demoSessionId}:${exp}` (`403` on tampered signature, `404` across demo sessions).
 
-### `POST /api/auth/register` *(Rate Limited)*
-Creates a password user account, creates a personal organization (or accepts an `inviteToken`), queues a verification email, and sets `nf_session`.
+### `POST /api/auth/register` *(Rate Limited: `12/15m` per IP + `5/15m` per normalized email)*
+Creates a password user account (`emailVerified: false`), creates a personal organization (or accepts an `inviteToken`), queues a verification email, and sets `nf_session`.
 - **Body:** `{ email, password, fullName, title?, organizationName?, inviteToken? }`
-- **Responses:** `201 Created`, `400 Bad Request` (invalid email or weak password), `403 Forbidden` (invite email mismatch), `409 Conflict` (email exists).
+- **Responses:** `201 Created`, `400 Bad Request` (invalid email or weak password), `403 Forbidden` (invite email mismatch), `409 Conflict` (email exists), `429 Too Many Requests` (with `Retry-After`).
 
-### `POST /api/auth/login` *(Rate Limited)*
+### `POST /api/auth/login` *(Rate Limited: `25/15m` per IP + `10/15m` per normalized email)*
 Verifies email + `scrypt` password hash and sets `nf_session`.
-- **Responses:** `200 OK`, `400 Bad Request`, `401 Unauthorized`, `429 Too Many Requests`.
+- **Responses:** `200 OK`, `400 Bad Request`, `401 Unauthorized`, `429 Too Many Requests` (with `Retry-After`; non-enumerating across existing vs. unknown emails).
 
-### `POST /api/auth/google` *(Rate Limited)*
+### `POST /api/auth/google` *(Rate Limited: `25/15m` per IP)*
 Verifies Firebase Google `idToken` via `firebase-admin` (`verifyIdToken` validating RS256 signature against Google X.509 certificates, `exp`, `aud`, and `iss`; revocation lookup opt-in via `FIREBASE_CHECK_REVOKED=true`), enforces `email_verified === true` before linking to an existing password account, optionally accepts `inviteToken` for both new and existing users, and sets `nf_session`.
 - **Body:** `{ idToken, inviteToken? }`
-- **Responses:** `200 OK`, `400 Bad Request`, `401 Unauthorized`, `403 Forbidden` (unverified email link attempt or invite email mismatch).
+- **Responses:** `200 OK`, `400 Bad Request`, `401 Unauthorized`, `403 Forbidden` (unverified email link attempt or invite email mismatch), `429 Too Many Requests`.
 
-### `POST /api/auth/logout` *(Auth + CSRF)*
+### `POST /api/auth/logout` *(Rate Limited: `30/15m` per IP + Auth + CSRF)*
 Revokes the active PostgreSQL session row and clears `nf_session`.
 
-### `POST /api/auth/verify-email` *(Rate Limited)*
+### `POST /api/auth/verify-email` *(Rate Limited: `15/15m` per IP)*
 Validates `{ token }` (`SHA-256` lookup, rejects expired or reused tokens) and marks `emailVerified = true`.
 
-### `POST /api/auth/resend-verification` *(Auth + CSRF + Rate Limited)*
+### `POST /api/auth/resend-verification` *(Auth + CSRF + Rate Limited: `12/15m` per IP + `5/15m` per account)*
 Re-issues a 24-hour verification link via `EmailProvider`.
 
-### `POST /api/auth/forgot-password` & `POST /api/auth/reset-password` *(Rate Limited)*
-Issues a 1-hour reset token (generic `200` response prevents email enumeration) and resets password while revoking all existing sessions for that user.
+### `POST /api/auth/forgot-password` & `POST /api/auth/reset-password` *(Rate Limited: forgot `10/15m` IP + `4/15m` email; reset `10/15m` IP)*
+Issues a 1-hour reset token (generic `200` and symmetric `429` limits prevent email enumeration) and resets password while revoking all existing sessions for that user.
 
 ### `GET /api/auth/sessions` *(Auth)* & `DELETE /api/auth/sessions/:sessionId` *(Auth + CSRF)*
 Lists active non-revoked sessions and lets the user revoke specific sessions.
@@ -87,7 +87,7 @@ Lists active members in the active organization.
 Updates role or removes member. Enforces `canAssignRole` hierarchy (`admin` cannot promote to or modify `owner`) and rejects demoting/removing the last remaining `owner` (`409 Conflict`).
 
 ### `GET /api/organizations/current/invitations`, `POST /api/organizations/current/invitations`, `DELETE /api/organizations/current/invitations/:invitationId` *(Auth + CSRF + `org:members:invite`)*
-Creates 7-day email-bound invitations (`409` if already an active member), lists invitations, or revokes pending invitations.
+Creates 7-day email-bound invitations (`POST` also requires `emailVerified === true`, returning `403` `code: "EMAIL_VERIFICATION_REQUIRED"` for unverified accounts; `409` if already an active member), lists invitations, or revokes pending invitations.
 
 ### `POST /api/invitations/accept` *(Auth + CSRF)*
 Accepts an invitation `{ token }` for an already signed-in user whose account email matches the invitation email (`403` on mismatch).
@@ -116,8 +116,8 @@ Creates a supplier profile with per-organization duplicate name/Tax ID protectio
 ### `POST /api/items` *(`item:write` — `owner`, `admin`, `buyer`)*
 Adds a catalog item to the organization's Item Price Memory.
 
-### `POST /api/rfqs/:rfqId/quotes/extract` *(`quotation:extract` + `extractRateLimiter`)*
-Accepts `multipart/form-data` (`supplierId`, optional `file`, optional `rawEmailText`, optional `Idempotency-Key` header/field `[A-Za-z0-9._-]{8,128}`), validates file magic bytes (`PDF`, `XLSX`, `XLS` [UTF-8 delimited text tables accepted; legacy binary OLE2 `.xls` rejected with structured `415` save-as-`.xlsx`/`.csv` guidance], `CSV`, `PNG`, `JPG`, `WEBP`; max 25 MB), pre-parses spreadsheets in the isolated worker before reserving quota, atomically reserves monthly extraction + actual byte storage quota under an `organizations FOR UPDATE` lock (`429` `MONTHLY_EXTRACTION_QUOTA_EXCEEDED` / `STORAGE_QUOTA_EXCEEDED` when exhausted; `200` replay on committed `Idempotency-Key`; `409` on in-flight duplicate key), extracts fields + Gemini `usageMetadata` telemetry via `geminiExtractor.ts`, uploads any binary file to private object storage (`stored_documents` + `documentId`), commits the reservation and `ai_token_usage_logs` entry atomically, and releases the reservation on any failure so failed extractions do not consume monthly document quota.
+### `POST /api/rfqs/:rfqId/quotes/extract` *(`quotation:extract` + Verified Email + `extractRateLimiter`)*
+Requires `emailVerified === true` (`403` `code: "EMAIL_VERIFICATION_REQUIRED"` before consuming rate limit, storage, quota, or Gemini API calls), accepts `multipart/form-data` (`supplierId`, optional `file`, optional `rawEmailText`, optional `Idempotency-Key` header/field `[A-Za-z0-9._-]{8,128}`), validates file magic bytes (`PDF`, `XLSX`, `XLS` [UTF-8 delimited text tables accepted; legacy binary OLE2 `.xls` rejected with structured `415` save-as-`.xlsx`/`.csv` guidance], `CSV`, `PNG`, `JPG`, `WEBP`; max 25 MB), pre-parses spreadsheets in the isolated worker before reserving quota, atomically reserves monthly extraction + actual byte storage quota under an `organizations FOR UPDATE` lock (`429` `MONTHLY_EXTRACTION_QUOTA_EXCEEDED` / `STORAGE_QUOTA_EXCEEDED` when exhausted; `200` replay on committed `Idempotency-Key`; `409` on in-flight duplicate key), extracts fields + Gemini `usageMetadata` telemetry via `geminiExtractor.ts`, uploads any binary file to private object storage (`stored_documents` + `documentId`), commits the reservation and `ai_token_usage_logs` entry atomically, and releases the reservation on any failure so failed extractions do not consume monthly document quota.
 
 ### `PATCH /api/quotations/:quoteId`, `PATCH /api/quotations/:quoteId/lines/:lineId`, `POST /api/quotations/:quoteId/verify`, `DELETE /api/quotations/:quoteId`
 - Edit requires `quotation:edit` and rejects (`409 Conflict`) quotes referenced by a `pending` or `approved` award; header/line edits clear `isVerified` / `verifiedBy` / `verifiedAt` (and `verifiedField` when changing `matchStatus` away from `alternate_spec`) and validate non-empty `quoteReference`, integer `leadTimeDays`, and strict 4-value `matchStatus` (`400`).

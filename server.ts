@@ -51,9 +51,12 @@ import {
 } from './server/objectStorage.ts';
 import { PgDataStore, type SessionAuthContext, StoreError } from './server/pgStore.ts';
 import {
+  createMultiKeyRateLimitMiddleware,
   createRateLimitMiddleware,
   getClientIp,
+  hashEmailRateLimitIdentity,
   MemoryRateLimitStore,
+  normalizeEmailForRateLimit,
   PostgresRateLimitStore,
   type RateLimitStore,
 } from './server/rateLimiter.ts';
@@ -107,6 +110,19 @@ export interface AppOptions {
   store?: PgDataStore;
   appUrl?: string;
 }
+
+export const AUTH_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000;
+
+export const AUTH_RATE_LIMIT_POLICIES = {
+  login: { ipMax: 25, emailMax: 10 },
+  register: { ipMax: 12, emailMax: 5 },
+  forgotPassword: { ipMax: 10, emailMax: 4 },
+  verifyEmail: { ipMax: 15 },
+  resendVerification: { ipMax: 12, accountMax: 5 },
+  resetPassword: { ipMax: 10 },
+  google: { ipMax: 25 },
+  logout: { ipMax: 30 },
+} as const;
 
 export function validateHttpAppUrl(rawValue: string | undefined | null): string | null {
   const cleaned = stripSurroundingQuotes(rawValue ?? '');
@@ -418,12 +434,125 @@ export async function createApp(options: AppOptions = {}) {
     limits: { fileSize: 25 * 1024 * 1024 },
   });
 
-  const authRateLimiter = createRateLimitMiddleware({
+  const hasCustomAuthLimit = options.authRateLimitMax !== undefined;
+  const resolveIpCap = (policyDefault: number, scaleWithHigherOverride = false): number => {
+    if (!hasCustomAuthLimit) return policyDefault;
+    return scaleWithHigherOverride ? authRateLimitMax : Math.min(policyDefault, authRateLimitMax);
+  };
+  const resolveAccountCap = (policyDefault: number): number =>
+    hasCustomAuthLimit ? Math.min(policyDefault, authRateLimitMax) : policyDefault;
+
+  const normalizedEmailIdentity = (req: Request): string | null => {
+    const email = normalizeEmailForRateLimit((req.body as { email?: unknown } | undefined)?.email);
+    return email ? hashEmailRateLimitIdentity(email) : null;
+  };
+
+  const loginRateLimiter = createMultiKeyRateLimitMiddleware({
     store: rateLimitStore,
-    namespace: 'auth',
-    limit: authRateLimitMax,
-    windowMs: 15 * 60 * 1000,
-    keyFn: (req) => `${getClientIp(req)}:${req.path}`,
+    rules: [
+      {
+        namespace: 'auth:ip:login',
+        limit: resolveIpCap(AUTH_RATE_LIMIT_POLICIES.login.ipMax, true),
+        windowMs: AUTH_RATE_LIMIT_WINDOW_MS,
+        keyFn: (req) => getClientIp(req),
+      },
+      {
+        namespace: 'auth:email:login',
+        limit: resolveAccountCap(AUTH_RATE_LIMIT_POLICIES.login.emailMax),
+        windowMs: AUTH_RATE_LIMIT_WINDOW_MS,
+        keyFn: normalizedEmailIdentity,
+      },
+    ],
+  });
+
+  const registerRateLimiter = createMultiKeyRateLimitMiddleware({
+    store: rateLimitStore,
+    rules: [
+      {
+        namespace: 'auth:ip:register',
+        limit: resolveIpCap(AUTH_RATE_LIMIT_POLICIES.register.ipMax),
+        windowMs: AUTH_RATE_LIMIT_WINDOW_MS,
+        keyFn: (req) => getClientIp(req),
+      },
+      {
+        namespace: 'auth:email:register',
+        limit: resolveAccountCap(AUTH_RATE_LIMIT_POLICIES.register.emailMax),
+        windowMs: AUTH_RATE_LIMIT_WINDOW_MS,
+        keyFn: normalizedEmailIdentity,
+      },
+    ],
+  });
+
+  const forgotPasswordRateLimiter = createMultiKeyRateLimitMiddleware({
+    store: rateLimitStore,
+    rules: [
+      {
+        namespace: 'auth:ip:forgot-password',
+        limit: resolveIpCap(AUTH_RATE_LIMIT_POLICIES.forgotPassword.ipMax),
+        windowMs: AUTH_RATE_LIMIT_WINDOW_MS,
+        keyFn: (req) => getClientIp(req),
+      },
+      {
+        namespace: 'auth:email:forgot-password',
+        limit: resolveAccountCap(AUTH_RATE_LIMIT_POLICIES.forgotPassword.emailMax),
+        windowMs: AUTH_RATE_LIMIT_WINDOW_MS,
+        keyFn: normalizedEmailIdentity,
+      },
+    ],
+  });
+
+  const verifyEmailRateLimiter = createRateLimitMiddleware({
+    store: rateLimitStore,
+    namespace: 'auth:ip:verify-email',
+    limit: resolveIpCap(AUTH_RATE_LIMIT_POLICIES.verifyEmail.ipMax),
+    windowMs: AUTH_RATE_LIMIT_WINDOW_MS,
+    keyFn: (req) => getClientIp(req),
+  });
+
+  const resendVerificationRateLimiter = createMultiKeyRateLimitMiddleware({
+    store: rateLimitStore,
+    rules: [
+      {
+        namespace: 'auth:ip:resend-verification',
+        limit: resolveIpCap(AUTH_RATE_LIMIT_POLICIES.resendVerification.ipMax),
+        windowMs: AUTH_RATE_LIMIT_WINDOW_MS,
+        keyFn: (req) => getClientIp(req),
+      },
+      {
+        namespace: 'auth:account:resend-verification',
+        limit: resolveAccountCap(AUTH_RATE_LIMIT_POLICIES.resendVerification.accountMax),
+        windowMs: AUTH_RATE_LIMIT_WINDOW_MS,
+        keyFn: (req) => {
+          if (!req.auth) return null;
+          const email = normalizeEmailForRateLimit(req.auth.user.email);
+          return email ? hashEmailRateLimitIdentity(email) : req.auth.user.id;
+        },
+      },
+    ],
+  });
+
+  const resetPasswordRateLimiter = createRateLimitMiddleware({
+    store: rateLimitStore,
+    namespace: 'auth:ip:reset-password',
+    limit: resolveIpCap(AUTH_RATE_LIMIT_POLICIES.resetPassword.ipMax),
+    windowMs: AUTH_RATE_LIMIT_WINDOW_MS,
+    keyFn: (req) => getClientIp(req),
+  });
+
+  const googleAuthRateLimiter = createRateLimitMiddleware({
+    store: rateLimitStore,
+    namespace: 'auth:ip:google',
+    limit: resolveIpCap(AUTH_RATE_LIMIT_POLICIES.google.ipMax, true),
+    windowMs: AUTH_RATE_LIMIT_WINDOW_MS,
+    keyFn: (req) => getClientIp(req),
+  });
+
+  const logoutRateLimiter = createRateLimitMiddleware({
+    store: rateLimitStore,
+    namespace: 'auth:ip:logout',
+    limit: resolveIpCap(AUTH_RATE_LIMIT_POLICIES.logout.ipMax),
+    windowMs: AUTH_RATE_LIMIT_WINDOW_MS,
+    keyFn: (req) => getClientIp(req),
   });
 
   const extractRateLimiter = createRateLimitMiddleware({
@@ -526,6 +655,20 @@ export async function createApp(options: AppOptions = {}) {
       }
       next();
     };
+  }
+
+  function requireVerifiedEmail(req: Request, res: Response, next: NextFunction) {
+    if (!req.auth) {
+      return res.status(401).json({ error: 'Authentication required. Please sign in.' });
+    }
+    if (!req.auth.user.emailVerified) {
+      return res.status(403).json({
+        error:
+          'Email verification is required before performing this action. Please verify your email address first.',
+        code: 'EMAIL_VERIFICATION_REQUIRED',
+      });
+    }
+    next();
   }
 
   function buildAuthResponse(ctx: SessionAuthContext) {
@@ -971,7 +1114,7 @@ export async function createApp(options: AppOptions = {}) {
     }
   });
 
-  app.post('/api/auth/register', authRateLimiter, async (req, res, next) => {
+  app.post('/api/auth/register', registerRateLimiter, async (req, res, next) => {
     try {
       const { email, password, fullName, title, organizationName, inviteToken } = req.body || {};
       const result = await store.registerWithPassword({
@@ -1001,7 +1144,7 @@ export async function createApp(options: AppOptions = {}) {
     }
   });
 
-  app.post('/api/auth/login', authRateLimiter, async (req, res, next) => {
+  app.post('/api/auth/login', loginRateLimiter, async (req, res, next) => {
     try {
       const { email, password } = req.body || {};
       const result = await store.loginWithPassword({
@@ -1017,7 +1160,7 @@ export async function createApp(options: AppOptions = {}) {
     }
   });
 
-  app.post('/api/auth/google', authRateLimiter, async (req, res, next) => {
+  app.post('/api/auth/google', googleAuthRateLimiter, async (req, res, next) => {
     try {
       const { idToken, inviteToken } = req.body || {};
       if (typeof idToken !== 'string' || !idToken.trim()) {
@@ -1053,7 +1196,7 @@ export async function createApp(options: AppOptions = {}) {
     }
   });
 
-  app.post('/api/auth/logout', requireAuth, requireCsrf, async (req, res, next) => {
+  app.post('/api/auth/logout', logoutRateLimiter, requireAuth, requireCsrf, async (req, res, next) => {
     try {
       const cookies = parseCookies(req);
       const token = cookies[SESSION_COOKIE_NAME];
@@ -1067,7 +1210,7 @@ export async function createApp(options: AppOptions = {}) {
     }
   });
 
-  app.post('/api/auth/verify-email', authRateLimiter, async (req, res, next) => {
+  app.post('/api/auth/verify-email', verifyEmailRateLimiter, async (req, res, next) => {
     try {
       const { token } = req.body || {};
       const user = await store.verifyEmailByToken(typeof token === 'string' ? token.trim() : '');
@@ -1081,7 +1224,7 @@ export async function createApp(options: AppOptions = {}) {
     '/api/auth/resend-verification',
     requireAuth,
     requireCsrf,
-    authRateLimiter,
+    resendVerificationRateLimiter,
     async (req, res, next) => {
       try {
         if (req.auth!.user.emailVerified) {
@@ -1101,7 +1244,7 @@ export async function createApp(options: AppOptions = {}) {
     }
   );
 
-  app.post('/api/auth/forgot-password', authRateLimiter, async (req, res, next) => {
+  app.post('/api/auth/forgot-password', forgotPasswordRateLimiter, async (req, res, next) => {
     try {
       const { email } = req.body || {};
       if (typeof email === 'string' && email.trim()) {
@@ -1124,7 +1267,7 @@ export async function createApp(options: AppOptions = {}) {
     }
   });
 
-  app.post('/api/auth/reset-password', authRateLimiter, async (req, res, next) => {
+  app.post('/api/auth/reset-password', resetPasswordRateLimiter, async (req, res, next) => {
     try {
       const { token, newPassword } = req.body || {};
       await store.resetPasswordByToken(
@@ -1289,6 +1432,7 @@ export async function createApp(options: AppOptions = {}) {
     requireCsrf,
     mutationRateLimiter,
     requireOrgAndPermission('org:members:invite'),
+    requireVerifiedEmail,
     async (req, res, next) => {
       try {
         const { email, role } = req.body || {};
@@ -1505,6 +1649,7 @@ export async function createApp(options: AppOptions = {}) {
     requireAuth,
     requireCsrf,
     requireOrgAndPermission('quotation:extract'),
+    requireVerifiedEmail,
     extractRateLimiter,
     upload.single('file'),
     async (req, res, next) => {

@@ -86,6 +86,8 @@ export default function App() {
   const [createModalOpen, setCreateModalOpen] = useState(false);
   const [loadingSample, setLoadingSample] = useState(false);
   const [resettingDemo, setResettingDemo] = useState(false);
+  const [resendingVerification, setResendingVerification] = useState(false);
+  const [verificationNotice, setVerificationNotice] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
   const clearUrlParams = useCallback(() => {
@@ -187,6 +189,31 @@ export default function App() {
         return;
       }
 
+      // Auto-verify email link if signed-in user opens an ?verify=... link
+      if (urlTokens.verify) {
+        try {
+          const verifyRes = await fetch('/api/auth/verify-email', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ token: urlTokens.verify }),
+          });
+          clearUrlParams();
+          if (verifyRes.ok) {
+            setVerificationNotice('Your email address has been verified.');
+            const verifiedMe = await apiJson<AuthStatePayload>('/api/auth/me');
+            csrfTokenRef.current = verifiedMe.csrfToken;
+            setAuthState(verifiedMe);
+            me.user = verifiedMe.user;
+          } else {
+            const errBody = await verifyRes.json().catch(() => null);
+            setActionError(errBody?.error || 'Email verification link is invalid or has expired.');
+          }
+        } catch {
+          setActionError('Unable to verify email link.');
+        }
+      }
+
       // Auto-accept invite link if signed-in user opens an ?invite=... link
       if (urlTokens.invite && me.csrfToken) {
         try {
@@ -220,7 +247,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [apiJson, applyDemoResponse, clearUrlParams, urlTokens.invite]);
+  }, [apiJson, applyDemoResponse, clearUrlParams, urlTokens.invite, urlTokens.verify]);
 
   useEffect(() => {
     refreshAll();
@@ -288,6 +315,20 @@ export default function App() {
       setActionError(err instanceof Error ? err.message : 'Failed to reset demo workspace.');
     } finally {
       setResettingDemo(false);
+    }
+  };
+
+  const handleResendVerificationBanner = async () => {
+    if (resendingVerification) return;
+    try {
+      setActionError(null);
+      setResendingVerification(true);
+      await apiJson('/api/auth/resend-verification', { method: 'POST' });
+      setVerificationNotice(`Verification email sent to ${authState?.user?.email}.`);
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Failed to resend verification email.');
+    } finally {
+      setResendingVerification(false);
     }
   };
 
@@ -577,7 +618,39 @@ export default function App() {
             </div>
           </div>
         )}
+        {!demoMode && !authState.user.emailVerified && (
+          <div className="bg-[#FFFBEB] border-b border-[#FDE68A] px-4 sm:px-6 lg:px-8 py-2.5">
+            <div className="max-w-[1360px] mx-auto flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+              <div className="text-[#92400E]">
+                <span className="font-semibold mr-1.5">Verify your email address:</span>
+                <span>
+                  Verification for <strong>{authState.user.email}</strong> is required before running AI quotation extraction or inviting team members.
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={handleResendVerificationBanner}
+                disabled={resendingVerification}
+                className="px-2.5 py-1 bg-white border border-[#F59E0B] text-[#92400E] font-medium rounded hover:bg-amber-50 self-start sm:self-auto shrink-0 disabled:opacity-50"
+              >
+                {resendingVerification ? 'Sending...' : 'Resend Verification Email'}
+              </button>
+            </div>
+          </div>
+        )}
         <div className="max-w-[1360px] mx-auto px-4 sm:px-6 lg:px-8 py-6">
+          {verificationNotice && (
+            <div className="mb-4 px-4 py-2.5 bg-[#ECFDF5] border border-[#A7F3D0] text-[#059669] text-xs rounded-lg flex items-center justify-between gap-3">
+              <span>{verificationNotice}</span>
+              <button
+                type="button"
+                onClick={() => setVerificationNotice(null)}
+                className="font-medium underline shrink-0"
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
           {actionError && (
             <div className="mb-4 px-4 py-2.5 bg-[#FEF2F2] border border-[#FECACA] text-[#DC2626] text-xs rounded-lg flex items-center justify-between gap-3">
               <span>{actionError}</span>

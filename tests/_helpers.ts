@@ -391,3 +391,29 @@ export function createMinimalValidPng(): Buffer {
 export function uniqueRunTag(): string {
   return `${Date.now().toString(36)}-${crypto.randomBytes(3).toString('hex')}`;
 }
+
+export async function verifyRegisteredUserEmail(
+  baseUrl: string,
+  emailProvider: DevOutboxEmailProvider,
+  email: string
+): Promise<void> {
+  const normalized = email.trim().toLowerCase();
+  const verifyMsg = [...emailProvider.sent]
+    .reverse()
+    .find((m) => m.to.trim().toLowerCase() === normalized && /\?verify=([^\s]+)/.test(m.text));
+  if (!verifyMsg) {
+    throw new Error(`No verification email queued for ${normalized}`);
+  }
+  const match = verifyMsg.text.match(/\?verify=([^\s]+)/);
+  if (!match) {
+    throw new Error(`Missing verify token in queued email for ${normalized}`);
+  }
+  const verifyRes = await fetch(`${baseUrl}/api/auth/verify-email`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: decodeURIComponent(match[1]) }),
+  });
+  if (verifyRes.status !== 200) {
+    throw new Error(`Expected 200 verifying ${normalized}, got ${verifyRes.status}`);
+  }
+}
