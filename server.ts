@@ -57,6 +57,7 @@ import {
   generateSecureToken,
   getSigningSecret,
   isPlaceholderSecret,
+  normalizeOptionalEnvValue,
   parseCookies,
   redactSensitiveText,
   resolveCookieSameSite,
@@ -212,7 +213,7 @@ export function buildProductionCspPolicy(
   env: Record<string, string | undefined> = process.env
 ): string {
   let s3Origin = '';
-  const rawS3 = (env.S3_ENDPOINT || '').trim();
+  const rawS3 = normalizeOptionalEnvValue(env.S3_ENDPOINT);
   if (rawS3) {
     try {
       s3Origin = new URL(rawS3).origin;
@@ -222,7 +223,7 @@ export function buildProductionCspPolicy(
   }
 
   let firebaseFrameOrigin = '';
-  const explicitAuthDomain = (env.FIREBASE_AUTH_DOMAIN || '').trim();
+  const explicitAuthDomain = normalizeOptionalEnvValue(env.FIREBASE_AUTH_DOMAIN);
   if (explicitAuthDomain) {
     firebaseFrameOrigin = explicitAuthDomain.startsWith('https://')
       ? explicitAuthDomain
@@ -287,10 +288,10 @@ function getAllowedOrigins(): Set<string> {
       // Ignore malformed APP_URL
     }
   }
-  const extra = process.env.ALLOWED_ORIGINS?.split(',') || [];
+  const extra = normalizeOptionalEnvValue(process.env.ALLOWED_ORIGINS).split(',');
   for (const item of extra) {
-    const trimmed = item.trim();
-    if (!trimmed) continue;
+    const trimmed = normalizeOptionalEnvValue(item);
+    if (!trimmed || isPlaceholderSecret(trimmed)) continue;
     try {
       origins.add(new URL(trimmed).origin);
     } catch {
@@ -378,7 +379,7 @@ export async function createApp(options: AppOptions = {}) {
       'Permissions-Policy',
       'camera=(), microphone=(), geolocation=(), payment=()'
     );
-    const cspMode = (process.env.CSP_MODE || '').trim().toLowerCase();
+    const cspMode = normalizeOptionalEnvValue(process.env.CSP_MODE).toLowerCase();
     if (cspMode === 'enforce') {
       res.setHeader('Content-Security-Policy', buildProductionCspPolicy());
     } else if (process.env.NODE_ENV === 'production' || cspMode === 'report-only') {
@@ -2077,7 +2078,8 @@ if (isDirectExecution) {
           process.exit(1);
         });
 
-        const intervalMinutes = Number(process.env.MAINTENANCE_INTERVAL_MINUTES ?? '360');
+        const rawInterval = normalizeOptionalEnvValue(process.env.MAINTENANCE_INTERVAL_MINUTES);
+        const intervalMinutes = Number(rawInterval || '360');
         if (Number.isFinite(intervalMinutes) && intervalMinutes > 0 && isSqlEnvConfigured()) {
           const timer = setInterval(() => {
             runScheduledMaintenance({ db: defaultDb, storageProvider, lockPool: defaultPool }).catch(

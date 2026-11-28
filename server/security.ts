@@ -20,6 +20,19 @@ export function stripSurroundingQuotes(value: string): string {
   return trimmed;
 }
 
+export function isMaskedEnvPlaceholder(value: string | undefined | null): boolean {
+  const normalized = stripSurroundingQuotes(value ?? '');
+  return /^[\u2022*]+$/.test(normalized);
+}
+
+export function normalizeOptionalEnvValue(value: string | undefined | null): string {
+  const normalized = stripSurroundingQuotes(value ?? '');
+  if (!normalized || /^[\u2022*]+$/.test(normalized)) {
+    return '';
+  }
+  return normalized;
+}
+
 export function isPlaceholderSecret(value: string | undefined | null): boolean {
   const normalized = stripSurroundingQuotes(value ?? '');
   const upper = normalized.toUpperCase();
@@ -152,7 +165,7 @@ export function resolveCookieSameSite(
   secure: boolean,
   env: Record<string, string | undefined> = process.env
 ): 'None' | 'Lax' | 'Strict' {
-  const configured = (env.COOKIE_SAMESITE || '').trim().toLowerCase();
+  const configured = normalizeOptionalEnvValue(env.COOKIE_SAMESITE).toLowerCase();
   if (configured === 'strict') return 'Strict';
   if (configured === 'lax') return 'Lax';
   if (configured === 'none') return secure ? 'None' : 'Lax';

@@ -216,12 +216,20 @@ test('createEmailProvider handles quoted EMAIL_FROM, falls back in dev/test, and
 });
 
 test('Task 019A: production startup rejects missing/placeholder APP_URL, local/missing storage, and silent dev email while preserving dev/test', async () => {
-  // 1. Storage factory: dev/test defaults local; prod forbids local/missing/placeholder S3
+  // 1. Storage factory: dev/test defaults local (including masked runtime placeholders); prod forbids local/missing/placeholder/masked S3
   assert.equal(createObjectStorageProvider({ NODE_ENV: 'development' }).mode, 'local');
+  assert.equal(
+    createObjectStorageProvider({ NODE_ENV: 'development', STORAGE_PROVIDER: '••••' }).mode,
+    'local'
+  );
   assert.equal(createObjectStorageProvider({ NODE_ENV: 'test', STORAGE_PROVIDER: 'local' }).mode, 'local');
 
   assert.throws(
     () => createObjectStorageProvider({ NODE_ENV: 'production' }),
+    /STORAGE_PROVIDER=s3.*required in production/i
+  );
+  assert.throws(
+    () => createObjectStorageProvider({ NODE_ENV: 'production', STORAGE_PROVIDER: '••••' }),
     /STORAGE_PROVIDER=s3.*required in production/i
   );
   assert.throws(

@@ -6,7 +6,7 @@ import type { NextFunction, Request, Response } from 'express';
 import type { DrizzleDb } from '../src/db/index.ts';
 import type { EmailProvider } from './emailService.ts';
 import type { ObjectStorageProvider } from './objectStorage.ts';
-import { isPlaceholderSecret, redactSensitiveText } from './security.ts';
+import { isPlaceholderSecret, normalizeOptionalEnvValue, redactSensitiveText } from './security.ts';
 
 export function isGoogleAuthConfigured(configPath?: string): boolean {
   try {
@@ -217,11 +217,19 @@ export function dispatchErrorTrackerHook(
     Promise.resolve(hook(payload)).catch(() => undefined);
     return;
   }
-  const webhookUrl = process.env.ERROR_WEBHOOK_URL?.trim();
-  if (webhookUrl && process.env.NODE_ENV !== 'test') {
+  const rawWebhookUrl = normalizeOptionalEnvValue(process.env.ERROR_WEBHOOK_URL);
+  if (rawWebhookUrl && process.env.NODE_ENV !== 'test') {
+    let validWebhook = false;
+    try {
+      const parsed = new URL(rawWebhookUrl);
+      validWebhook = parsed.protocol === 'http:' || parsed.protocol === 'https:';
+    } catch {
+      validWebhook = false;
+    }
+    if (!validWebhook) return;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 3000);
-    fetch(webhookUrl, {
+    fetch(rawWebhookUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(sanitizeValue(payload)),

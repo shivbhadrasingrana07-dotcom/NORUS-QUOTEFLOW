@@ -117,9 +117,20 @@ export function normalizePlanTier(raw: unknown): OrganizationPlanTier {
 export function resolveDefaultNewOrgPlan(
   env: Record<string, string | undefined> = process.env
 ): OrganizationPlanTier {
-  const configured = env.DEFAULT_NEW_ORG_PLAN?.trim().toLowerCase();
-  if (configured && VALID_PLAN_TIERS.has(configured as OrganizationPlanTier)) {
-    return configured as OrganizationPlanTier;
+  let configured = (env.DEFAULT_NEW_ORG_PLAN || '').trim();
+  if (
+    configured.length >= 2 &&
+    ((configured.startsWith('"') && configured.endsWith('"')) ||
+      (configured.startsWith("'") && configured.endsWith("'")))
+  ) {
+    configured = configured.slice(1, -1).trim();
+  }
+  if (!configured || /^[\u2022*]+$/.test(configured)) {
+    return 'starter';
+  }
+  const lower = configured.toLowerCase();
+  if (VALID_PLAN_TIERS.has(lower as OrganizationPlanTier)) {
+    return lower as OrganizationPlanTier;
   }
   return 'starter';
 }

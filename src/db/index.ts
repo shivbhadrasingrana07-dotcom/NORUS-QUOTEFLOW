@@ -2,7 +2,11 @@ import fs from 'fs';
 import { drizzle } from 'drizzle-orm/node-postgres';
 import { Pool } from 'pg';
 import * as schema from './schema.ts';
-import { redactSensitiveText } from '../../server/security.ts';
+import {
+  isMaskedEnvPlaceholder,
+  normalizeOptionalEnvValue,
+  redactSensitiveText,
+} from '../../server/security.ts';
 
 declare global {
   var _postgresPool: Pool | undefined;
@@ -10,26 +14,27 @@ declare global {
 
 export function isSqlEnvConfigured(): boolean {
   return Boolean(
-    process.env.SQL_HOST &&
-      process.env.SQL_USER &&
+    normalizeOptionalEnvValue(process.env.SQL_HOST) &&
+      normalizeOptionalEnvValue(process.env.SQL_USER) &&
       process.env.SQL_PASSWORD !== undefined &&
-      process.env.SQL_DB_NAME
+      !isMaskedEnvPlaceholder(process.env.SQL_PASSWORD) &&
+      normalizeOptionalEnvValue(process.env.SQL_DB_NAME)
   );
 }
 
 export function buildPgSslConfig(
   env: Record<string, string | undefined> = process.env
 ): { rejectUnauthorized: boolean; ca?: string } | undefined {
-  if ((env.SQL_SSL || '').trim().toLowerCase() !== 'true') {
+  if (normalizeOptionalEnvValue(env.SQL_SSL).toLowerCase() !== 'true') {
     return undefined;
   }
-  const host = (env.SQL_HOST || '').trim();
+  const host = normalizeOptionalEnvValue(env.SQL_HOST);
   // Cloud SQL Auth Proxy / Unix domain socket connections do not use TCP TLS
   if (host.startsWith('/')) {
     return undefined;
   }
 
-  const rawCa = env.SQL_SSL_CA?.trim();
+  const rawCa = normalizeOptionalEnvValue(env.SQL_SSL_CA);
   let ca: string | undefined;
   if (rawCa) {
     if (rawCa.includes('BEGIN CERTIFICATE')) {
@@ -43,7 +48,8 @@ export function buildPgSslConfig(
     }
   }
 
-  const allowSelfSigned = (env.SQL_SSL_ALLOW_SELF_SIGNED || '').trim().toLowerCase() === 'true';
+  const allowSelfSigned =
+    normalizeOptionalEnvValue(env.SQL_SSL_ALLOW_SELF_SIGNED).toLowerCase() === 'true';
   return {
     rejectUnauthorized: !allowSelfSigned,
     ...(ca ? { ca } : {}),
@@ -52,12 +58,20 @@ export function buildPgSslConfig(
 
 export const createPool = () => {
   if (!global._postgresPool) {
+    const rawPort = normalizeOptionalEnvValue(process.env.SQL_PORT);
+    const parsedPort = /^\d+$/.test(rawPort) ? Number(rawPort) : undefined;
     global._postgresPool = new Pool({
-      host: process.env.SQL_HOST,
-      port: process.env.SQL_PORT ? Number(process.env.SQL_PORT) : undefined,
-      user: process.env.SQL_USER,
-      password: process.env.SQL_PASSWORD,
-      database: process.env.SQL_DB_NAME,
+      host: normalizeOptionalEnvValue(process.env.SQL_HOST) || undefined,
+      port:
+        parsedPort && Number.isSafeInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65535
+          ? parsedPort
+          : undefined,
+      user: normalizeOptionalEnvValue(process.env.SQL_USER) || undefined,
+      password:
+        process.env.SQL_PASSWORD !== undefined && !isMaskedEnvPlaceholder(process.env.SQL_PASSWORD)
+          ? process.env.SQL_PASSWORD
+          : undefined,
+      database: normalizeOptionalEnvValue(process.env.SQL_DB_NAME) || undefined,
       ssl: buildPgSslConfig(process.env),
       max: 10,
       connectionTimeoutMillis: 15000,

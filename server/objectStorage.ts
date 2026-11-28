@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import {
   isPlaceholderSecret,
+  normalizeOptionalEnvValue,
   signHmac,
   stripSurroundingQuotes,
   verifyHmac,
@@ -84,7 +85,9 @@ export class LocalPrivateStorageProvider implements ObjectStorageProvider {
 
   constructor(rootDir?: string) {
     this.rootDir = path.resolve(
-      rootDir || process.env.LOCAL_STORAGE_DIR || path.join(process.cwd(), 'data', 'private-storage')
+      rootDir ||
+        normalizeOptionalEnvValue(process.env.LOCAL_STORAGE_DIR) ||
+        path.join(process.cwd(), 'data', 'private-storage')
     );
   }
 
@@ -436,7 +439,7 @@ export function createObjectStorageProvider(
   env: Record<string, string | undefined> = process.env
 ): ObjectStorageProvider {
   const isProd = (env.NODE_ENV || '').trim().toLowerCase() === 'production';
-  const rawProvider = stripSurroundingQuotes(env.STORAGE_PROVIDER || '').toLowerCase();
+  const rawProvider = normalizeOptionalEnvValue(env.STORAGE_PROVIDER).toLowerCase();
   const mode = rawProvider || (isProd ? '' : 'local');
 
   if (isProd && mode !== 's3') {

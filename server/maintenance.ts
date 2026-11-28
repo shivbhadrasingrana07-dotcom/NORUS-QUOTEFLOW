@@ -13,7 +13,7 @@ import {
 } from '../src/db/schema.ts';
 import { logEvent } from './monitoring.ts';
 import type { ObjectStorageProvider } from './objectStorage.ts';
-import { redactSensitiveText } from './security.ts';
+import { normalizeOptionalEnvValue, redactSensitiveText } from './security.ts';
 
 export interface MaintenanceSummary {
   startedAt: string;
@@ -314,7 +314,7 @@ export async function runScheduledMaintenance(params: {
     if (params.storageProvider.mode === 'local') {
       const targetDir =
         params.localStorageDir ||
-        process.env.LOCAL_STORAGE_DIR ||
+        normalizeOptionalEnvValue(process.env.LOCAL_STORAGE_DIR) ||
         path.join(process.cwd(), 'data', 'private-storage');
       cleanedTempStorageFiles = await cleanStaleTempFiles(
         path.resolve(targetDir),
