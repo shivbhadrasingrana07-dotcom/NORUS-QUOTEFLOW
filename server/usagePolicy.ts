@@ -95,6 +95,15 @@ export class QuotaExceededError extends Error {
   }
 }
 
+export class IdempotencyConflictError extends Error {
+  statusCode: number;
+  constructor(message: string, statusCode = 409) {
+    super(message);
+    this.name = 'IdempotencyConflictError';
+    this.statusCode = statusCode;
+  }
+}
+
 export function normalizePlanTier(raw: unknown): OrganizationPlanTier {
   if (typeof raw === 'string') {
     const lower = raw.trim().toLowerCase() as OrganizationPlanTier;
@@ -289,6 +298,7 @@ export class InMemoryUsageQuotaCoordinator {
   private readonly monthly = new Map<string, MemoryMonthlyRow>();
   private readonly reservations = new Map<string, MemoryReservationRow>();
   private readonly storedDocBytesByDocId = new Map<string, { orgId: string; bytes: number }>();
+  private readonly deletedQuotationIds = new Set<string>();
   public readonly tokenLogs: Array<
     AiTokenUsageTelemetry & {
       id: string;
@@ -371,7 +381,20 @@ export class InMemoryUsageQuotaCoordinator {
           existing.idempotencyKey === params.idempotencyKey &&
           (existing.status === 'reserved' || existing.status === 'committed')
         ) {
+          if (
+            existing.rfqId !== params.rfqId ||
+            existing.supplierId !== params.supplierId
+          ) {
+            throw new IdempotencyConflictError(
+              'Idempotency-Key was already used for a different RFQ or supplier.'
+            );
+          }
           if (existing.status === 'committed' && existing.quotationId) {
+            if (this.deletedQuotationIds.has(existing.quotationId)) {
+              throw new IdempotencyConflictError(
+                'The quotation created by this Idempotency-Key was deleted. Retry with a new Idempotency-Key.'
+              );
+            }
             return { kind: 'idempotent_hit', quotationId: existing.quotationId };
           }
           if (existing.status === 'reserved') {
@@ -545,8 +568,15 @@ export class InMemoryUsageQuotaCoordinator {
     }
   }
 
-  deleteStoredDocument(documentId: string) {
+  deleteStoredDocument(documentId: string, quotationId?: string) {
     this.storedDocBytesByDocId.delete(documentId);
+    if (quotationId) {
+      this.deletedQuotationIds.add(quotationId);
+    }
+  }
+
+  markQuotationDeleted(quotationId: string) {
+    this.deletedQuotationIds.add(quotationId);
   }
 
   getSummary(orgId: string, now: Date = new Date()): OrganizationUsageSummary {

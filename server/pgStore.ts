@@ -2844,21 +2844,44 @@ export class PgDataStore {
             .limit(1);
 
           if (existingRes) {
+            if (
+              existingRes.rfqId !== params.rfqId ||
+              existingRes.supplierId !== params.supplierId
+            ) {
+              throw new StoreError(
+                409,
+                'Idempotency-Key was already used for a different RFQ or supplier.'
+              );
+            }
             if (existingRes.status === 'reserved') {
               throw new StoreError(
                 409,
                 'An extraction request with this Idempotency-Key is already in progress.'
               );
             }
-            if (existingRes.status === 'committed' && existingRes.quotationId) {
+            if (existingRes.status === 'committed') {
+              if (!existingRes.quotationId) {
+                throw new StoreError(
+                  409,
+                  'Committed Idempotency-Key does not reference an available quotation. Retry with a new Idempotency-Key.'
+                );
+              }
               const existingQuote = await this.loadQuotationByIdTx(
                 tx,
                 params.organizationId,
                 existingRes.quotationId
               );
-              if (existingQuote) {
-                return { kind: 'idempotent_hit', quotation: existingQuote };
+              if (
+                !existingQuote ||
+                existingQuote.rfqId !== params.rfqId ||
+                existingQuote.supplierId !== params.supplierId
+              ) {
+                throw new StoreError(
+                  409,
+                  'The quotation created by this Idempotency-Key was deleted or no longer matches this RFQ and supplier. Retry with a new Idempotency-Key.'
+                );
               }
+              return { kind: 'idempotent_hit', quotation: existingQuote };
             }
           }
         }
@@ -3017,7 +3040,12 @@ export class PgDataStore {
           await tx
             .update(aiExtractionReservations)
             .set({ status: 'released', finalizedAt: now })
-            .where(eq(aiExtractionReservations.id, resRow.id));
+            .where(
+              and(
+                eq(aiExtractionReservations.id, resRow.id),
+                eq(aiExtractionReservations.status, 'reserved')
+              )
+            );
         }
 
         if (params.tokenUsage) {
@@ -3307,6 +3335,7 @@ export class PgDataStore {
                 eq(aiExtractionReservations.organizationId, params.organizationId)
               )
             )
+            .for('update')
             .limit(1);
 
           if (!resRow || resRow.status !== 'reserved') {
@@ -3319,7 +3348,7 @@ export class PgDataStore {
           usagePeriodMonth = resRow.periodMonth;
           committedIncrement = 1;
 
-          await tx
+          const updatedRes = await tx
             .update(aiExtractionReservations)
             .set({
               status: 'committed',
@@ -3327,7 +3356,20 @@ export class PgDataStore {
               documentId: q.documentId,
               finalizedAt: now,
             })
-            .where(eq(aiExtractionReservations.id, resRow.id));
+            .where(
+              and(
+                eq(aiExtractionReservations.id, resRow.id),
+                eq(aiExtractionReservations.status, 'reserved')
+              )
+            )
+            .returning({ id: aiExtractionReservations.id });
+
+          if (updatedRes.length !== 1) {
+            throw new StoreError(
+              409,
+              'Extraction quota reservation expired or was already finalized.'
+            );
+          }
         }
 
         if (committedIncrement > 0 || params.tokenUsage) {

@@ -6,6 +6,7 @@ import multer from 'multer';
 import path from 'path';
 import { pathToFileURL } from 'url';
 import { createServer as createViteServer } from 'vite';
+import type { AiTokenUsageTelemetry } from './src/types.ts';
 import { db as defaultDb, type DrizzleDb, isSqlEnvConfigured, pool as defaultPool } from './src/db/index.ts';
 import { createEmailProvider, type EmailProvider } from './server/emailService.ts';
 import { validateUploadedFile } from './server/fileSecurity.ts';
@@ -94,6 +95,7 @@ export interface AppOptions {
   demoExtractLimitMax?: number;
   errorTrackerHook?: ErrorTrackerHook;
   demoMode?: boolean;
+  store?: PgDataStore;
 }
 
 function normalizeOptionalFlagEnv(rawValue: string | undefined): string {
@@ -304,7 +306,7 @@ export async function createApp(options: AppOptions = {}) {
     }
   }
 
-  const store = new PgDataStore(db);
+  const store = options.store ?? new PgDataStore(db);
   const rateLimitStore: RateLimitStore =
     options.rateLimitStore ||
     (options.db || isSqlEnvConfigured()
@@ -1461,6 +1463,7 @@ export async function createApp(options: AppOptions = {}) {
       let uploadedKeyForRollback: string | null = null;
       let reservationIdForRollback: string | null = null;
       let activeOrgIdForRollback: string | null = null;
+      let observedTokenUsageForRollback: AiTokenUsageTelemetry | null = null;
       try {
         const org = req.auth!.activeOrganization!;
         activeOrgIdForRollback = org.id;
@@ -1553,6 +1556,7 @@ export async function createApp(options: AppOptions = {}) {
           skipInlineDataUrl: true,
           generateContentOverride,
         });
+        observedTokenUsageForRollback = tokenUsage;
 
         let storedDoc = null;
         if (file) {
@@ -1592,6 +1596,7 @@ export async function createApp(options: AppOptions = {}) {
         });
         reservationIdForRollback = null;
         uploadedKeyForRollback = null;
+        observedTokenUsageForRollback = null;
 
         logEvent('info', 'ai_extraction_completed', {
           requestId: req.requestId,
@@ -1621,7 +1626,7 @@ export async function createApp(options: AppOptions = {}) {
           const observedUsage =
             err instanceof ExtractionServiceError && err.tokenUsage
               ? err.tokenUsage
-              : {
+              : observedTokenUsageForRollback ?? {
                   model: GEMINI_EXTRACTION_MODEL,
                   usageAvailable: false,
                   promptTokenCount: null,

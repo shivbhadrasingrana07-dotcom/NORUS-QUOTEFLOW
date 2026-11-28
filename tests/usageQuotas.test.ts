@@ -1,14 +1,22 @@
+import http from 'node:http';
+import { AddressInfo } from 'node:net';
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { eq } from 'drizzle-orm';
+import { createApp } from '../server.ts';
 import {
   ExtractionServiceError,
   extractQuotationWithTelemetry,
   normalizeGeminiUsageMetadata,
 } from '../server/geminiExtractor.ts';
+import { runScheduledMaintenance } from '../server/maintenance.ts';
+import type { ObjectStorageProvider } from '../server/objectStorage.ts';
+import { type PgDataStore, StoreError } from '../server/pgStore.ts';
+import { MemoryRateLimitStore } from '../server/rateLimiter.ts';
 import { createInitialWorkspaceState } from '../server/seedData.ts';
 import {
   GIBIBYTE,
+  IdempotencyConflictError,
   InMemoryUsageQuotaCoordinator,
   PLAN_POLICIES,
   QuotaExceededError,
@@ -24,6 +32,7 @@ import {
   organizationMonthlyUsage,
   organizations,
 } from '../src/db/schema.ts';
+import type { AiTokenUsageTelemetry } from '../src/types.ts';
 import {
   TEST_DB_SKIP_REASON,
   TestCookieClient,
@@ -433,6 +442,458 @@ test('DEMO_MODE extraction remains isolated and unaffected by production quota e
   }
 });
 
+test('P1-1 unit: Idempotency-Key rejects RFQ/supplier mismatches and deleted quotations while preserving org isolation and released retries', () => {
+  const coord = new InMemoryUsageQuotaCoordinator();
+  const now = new Date('2026-11-20T10:00:00.000Z');
+  coord.registerOrganization({ id: 'org-a', planTier: 'starter' });
+  coord.registerOrganization({ id: 'org-b', planTier: 'starter' });
+
+  // Released failure can be retried cleanly with same key
+  const firstFail = coord.reserve({
+    organizationId: 'org-a',
+    rfqId: 'rfq-1',
+    supplierId: 'sup-1',
+    reservedBytes: 512,
+    idempotencyKey: 'shared-key-0001',
+    now,
+  });
+  assert.equal(firstFail.kind, 'reserved');
+  if (firstFail.kind === 'reserved') {
+    coord.release({ reservationId: firstFail.reservationId, now });
+  }
+
+  const retryOk = coord.reserve({
+    organizationId: 'org-a',
+    rfqId: 'rfq-1',
+    supplierId: 'sup-1',
+    reservedBytes: 512,
+    idempotencyKey: 'shared-key-0001',
+    now,
+  });
+  assert.equal(retryOk.kind, 'reserved');
+  if (retryOk.kind === 'reserved') {
+    coord.commit({
+      reservationId: retryOk.reservationId,
+      quotationId: 'q-a-1',
+      documentId: 'doc-a-1',
+      storedBytes: 512,
+      now,
+    });
+  }
+
+  // Legitimate replay: same org, same key, same RFQ & supplier
+  assert.deepEqual(
+    coord.reserve({
+      organizationId: 'org-a',
+      rfqId: 'rfq-1',
+      supplierId: 'sup-1',
+      reservedBytes: 512,
+      idempotencyKey: 'shared-key-0001',
+      now,
+    }),
+    { kind: 'idempotent_hit', quotationId: 'q-a-1' }
+  );
+
+  // Different RFQ -> 409 Conflict
+  assert.throws(
+    () =>
+      coord.reserve({
+        organizationId: 'org-a',
+        rfqId: 'rfq-2',
+        supplierId: 'sup-1',
+        reservedBytes: 512,
+        idempotencyKey: 'shared-key-0001',
+        now,
+      }),
+    (err: unknown) => err instanceof IdempotencyConflictError && err.statusCode === 409
+  );
+
+  // Different supplier -> 409 Conflict
+  assert.throws(
+    () =>
+      coord.reserve({
+        organizationId: 'org-a',
+        rfqId: 'rfq-1',
+        supplierId: 'sup-2',
+        reservedBytes: 512,
+        idempotencyKey: 'shared-key-0001',
+        now,
+      }),
+    (err: unknown) => err instanceof IdempotencyConflictError && err.statusCode === 409
+  );
+
+  // Another organization using the same key stays completely isolated
+  const orgBRes = coord.reserve({
+    organizationId: 'org-b',
+    rfqId: 'rfq-b-1',
+    supplierId: 'sup-b-1',
+    reservedBytes: 256,
+    idempotencyKey: 'shared-key-0001',
+    now,
+  });
+  assert.equal(orgBRes.kind, 'reserved');
+
+  // Deleting original quotation triggers deterministic 409 conflict on replay
+  coord.deleteStoredDocument('doc-a-1', 'q-a-1');
+  assert.throws(
+    () =>
+      coord.reserve({
+        organizationId: 'org-a',
+        rfqId: 'rfq-1',
+        supplierId: 'sup-1',
+        reservedBytes: 512,
+        idempotencyKey: 'shared-key-0001',
+        now,
+      }),
+    (err: unknown) => err instanceof IdempotencyConflictError && err.statusCode === 409
+  );
+});
+
+test('P1-2 unit: maintenance expiry cleanup guards status="reserved" and cannot overwrite concurrently committed rows', async () => {
+  const now = new Date('2026-11-27T12:00:00.000Z');
+  const past = new Date('2026-11-27T11:00:00.000Z');
+  const future = new Date('2026-11-27T13:00:00.000Z');
+
+  type SimRow = { id: string; status: 'reserved' | 'committed' | 'released'; expiresAt: Date };
+  const rows: SimRow[] = [
+    { id: 'res-expired', status: 'reserved', expiresAt: past },
+    { id: 'res-racing-commit', status: 'reserved', expiresAt: past },
+    { id: 'res-active', status: 'reserved', expiresAt: future },
+    { id: 'res-already-committed', status: 'committed', expiresAt: past },
+  ];
+
+  let simulateCommitBetweenSelectAndUpdate = true;
+  let capturedWhereSqlChunks = '';
+
+  const inspectSqlObject = (node: unknown): string => {
+    if (!node || typeof node !== 'object') return String(node ?? '');
+    const obj = node as { value?: unknown; name?: string; queryChunks?: unknown[] };
+    if (typeof obj.name === 'string') return obj.name;
+    if (Array.isArray(obj.value)) return obj.value.join('');
+    if (Array.isArray(obj.queryChunks)) return obj.queryChunks.map(inspectSqlObject).join(' ');
+    return '';
+  };
+
+  const mockDb = {
+    select() {
+      let tbl: unknown;
+      const chain: Record<string, unknown> = {
+        from(t: unknown) {
+          tbl = t;
+          return chain;
+        },
+        where() {
+          return chain;
+        },
+        limit() {
+          if (tbl === aiExtractionReservations) {
+            return Promise.resolve(
+              rows
+                .filter((r) => r.status === 'reserved' && r.expiresAt <= now)
+                .map((r) => ({ id: r.id }))
+            );
+          }
+          return Promise.resolve([]);
+        },
+      };
+      return chain;
+    },
+    delete() {
+      const chain: Record<string, unknown> = {
+        where() {
+          return chain;
+        },
+        returning() {
+          return Promise.resolve([]);
+        },
+      };
+      return chain;
+    },
+    update(tbl: unknown) {
+      let patch: Partial<SimRow> = {};
+      const chain: Record<string, unknown> = {
+        set(p: Partial<SimRow>) {
+          patch = p;
+          return chain;
+        },
+        where(cond: unknown) {
+          if (tbl === aiExtractionReservations) {
+            capturedWhereSqlChunks = inspectSqlObject(cond);
+          }
+          return chain;
+        },
+        returning() {
+          if (tbl !== aiExtractionReservations) return Promise.resolve([]);
+          if (simulateCommitBetweenSelectAndUpdate) {
+            simulateCommitBetweenSelectAndUpdate = false;
+            const raced = rows.find((r) => r.id === 'res-racing-commit');
+            if (raced) raced.status = 'committed';
+          }
+          // Enforce the atomic SQL predicate status = 'reserved' AND expiresAt <= now
+          assert.ok(capturedWhereSqlChunks.includes('status'));
+          assert.ok(capturedWhereSqlChunks.includes('expires_at'));
+          const updatedIds: Array<{ id: string }> = [];
+          for (const r of rows) {
+            if (
+              (r.id === 'res-expired' || r.id === 'res-racing-commit') &&
+              r.status === 'reserved' &&
+              r.expiresAt <= now
+            ) {
+              r.status = patch.status ?? r.status;
+              updatedIds.push({ id: r.id });
+            }
+          }
+          return Promise.resolve(updatedIds);
+        },
+      };
+      return chain;
+    },
+  };
+
+  const mockStorage: ObjectStorageProvider = {
+    mode: 'local',
+    async putObject() {},
+    async getObject() {
+      return { buffer: Buffer.alloc(0), contentType: 'application/octet-stream' };
+    },
+    async deleteObject() {},
+    async createSignedDownloadUrl() {
+      return { url: '/x', expiresAt: now.toISOString() };
+    },
+    async checkReadiness() {
+      return { ok: true };
+    },
+  };
+
+  const firstRun = await runScheduledMaintenance({
+    db: mockDb as never,
+    storageProvider: mockStorage,
+    lockPool: null,
+    localStorageDir: '/tmp/norus-nonexistent-maint-dir',
+    now,
+  });
+  assert.equal(firstRun.releasedExpiredReservations, 1);
+  assert.equal(rows.find((r) => r.id === 'res-expired')?.status, 'released');
+  assert.equal(rows.find((r) => r.id === 'res-racing-commit')?.status, 'committed');
+  assert.equal(rows.find((r) => r.id === 'res-active')?.status, 'reserved');
+  assert.equal(rows.find((r) => r.id === 'res-already-committed')?.status, 'committed');
+
+  // Re-run is strictly idempotent
+  const secondRun = await runScheduledMaintenance({
+    db: mockDb as never,
+    storageProvider: mockStorage,
+    lockPool: null,
+    localStorageDir: '/tmp/norus-nonexistent-maint-dir',
+    now,
+  });
+  assert.equal(secondRun.releasedExpiredReservations, 0);
+});
+
+test('P2-1 route unit: POST /quotes/extract preserves observed Gemini tokenUsage across storage and DB failures without double-counting', async () => {
+  const ws = createInitialWorkspaceState();
+  const rfq = ws.rfqs[0];
+  const supplier = ws.suppliers[0];
+
+  let nextPutThrows = false;
+  let nextSaveThrows = false;
+  let nextGeminiBehavior: 'with_usage' | 'without_usage' | 'pre_response_fail' = 'with_usage';
+  let seq = 0;
+
+  const deletedKeys: string[] = [];
+  const committedCalls: Array<{ reservationId: string | null | undefined; tokenUsage: AiTokenUsageTelemetry | null | undefined }> = [];
+  const releasedCalls: Array<{ reservationId: string; tokenUsage: AiTokenUsageTelemetry | null | undefined }> = [];
+
+  const mockStorage: ObjectStorageProvider = {
+    mode: 'local',
+    async putObject() {
+      if (nextPutThrows) {
+        nextPutThrows = false;
+        throw new Error('Simulated S3 timeout');
+      }
+    },
+    async getObject() {
+      return { buffer: Buffer.alloc(0), contentType: 'application/octet-stream' };
+    },
+    async deleteObject(key: string) {
+      deletedKeys.push(key);
+    },
+    async createSignedDownloadUrl() {
+      return { url: '/signed', expiresAt: new Date().toISOString() };
+    },
+    async checkReadiness() {
+      return { ok: true };
+    },
+  };
+
+  const spyStore = {
+    async getSessionContext(token: string) {
+      if (token !== 'unit-session-token') return null;
+      return {
+        sessionId: 'sess-unit',
+        csrfToken: 'unit-csrf-token',
+        user: {
+          id: 'user-unit',
+          email: 'buyer@example.com',
+          fullName: 'Unit Buyer',
+          title: 'Buyer',
+          emailVerified: true,
+          hasPassword: true,
+          hasGoogleLinked: false,
+        },
+        activeOrganization: {
+          id: 'org-unit',
+          slug: 'org-unit',
+          name: 'Unit Org',
+          countryCode: 'IN',
+          defaultCurrency: 'INR' as const,
+          taxRegime: 'INDIA_GST' as const,
+          defaultTaxCreditable: true,
+          role: 'buyer' as const,
+          planTier: 'starter' as const,
+        },
+        organizations: [],
+      };
+    },
+    async getExtractionContext() {
+      return { rfq, settings: ws.settings, supplierName: supplier.name };
+    },
+    async reserveExtractionAndStorageQuota() {
+      seq += 1;
+      return { kind: 'reserved' as const, reservationId: `res-unit-${seq}`, periodMonth: '2026-11' };
+    },
+    async saveExtractedQuotation(params: {
+      quotation: (typeof ws.quotations)[number];
+      reservationId?: string | null;
+      tokenUsage?: AiTokenUsageTelemetry | null;
+    }) {
+      if (nextSaveThrows) {
+        nextSaveThrows = false;
+        throw new StoreError(409, 'Simulated DB save failure');
+      }
+      committedCalls.push({ reservationId: params.reservationId, tokenUsage: params.tokenUsage });
+      return params.quotation;
+    },
+    async releaseExtractionReservation(params: {
+      reservationId: string;
+      tokenUsage?: AiTokenUsageTelemetry | null;
+    }) {
+      releasedCalls.push({ reservationId: params.reservationId, tokenUsage: params.tokenUsage });
+    },
+  } as unknown as PgDataStore;
+
+  const app = await createApp({
+    enableVite: false,
+    demoMode: false,
+    db: {} as never,
+    rateLimitStore: new MemoryRateLimitStore(),
+    store: spyStore,
+    storageProvider: mockStorage,
+    generateContentOverride: async () => {
+      if (nextGeminiBehavior === 'pre_response_fail') {
+        throw new Error('Upstream Gemini socket reset');
+      }
+      const baseText = JSON.stringify({
+        quoteReference: 'P2-1-TEST',
+        currency: 'INR',
+        taxIncludedInRates: false,
+        missingFreightWarning: false,
+        lines: [],
+      });
+      if (nextGeminiBehavior === 'without_usage') {
+        return { text: baseText };
+      }
+      return {
+        text: baseText,
+        usageMetadata: {
+          promptTokenCount: 310,
+          candidatesTokenCount: 100,
+          totalTokenCount: 410,
+          thoughtsTokenCount: 0,
+        },
+      };
+    },
+  });
+
+  const server = http.createServer(app);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address() as AddressInfo;
+  const baseUrl = `http://127.0.0.1:${port}`;
+
+  const postPngExtract = () => {
+    const form = new FormData();
+    form.set('supplierId', supplier.id);
+    form.set(
+      'file',
+      new Blob([new Uint8Array(createMinimalValidPng())], { type: 'image/png' }),
+      'quote.png'
+    );
+    return fetch(`${baseUrl}/api/rfqs/${rfq.id}/quotes/extract`, {
+      method: 'POST',
+      headers: {
+        Cookie: 'nf_session=unit-session-token',
+        'X-CSRF-Token': 'unit-csrf-token',
+      },
+      body: form,
+    });
+  };
+
+  try {
+    // 1. Gemini succeeds with usageMetadata, then object storage putObject fails
+    nextGeminiBehavior = 'with_usage';
+    nextPutThrows = true;
+    const r1 = await postPngExtract();
+    assert.equal(r1.status, 500);
+    assert.equal(releasedCalls.length, 1);
+    assert.equal(releasedCalls[0].tokenUsage?.usageAvailable, true);
+    assert.equal(releasedCalls[0].tokenUsage?.promptTokenCount, 310);
+    assert.equal(releasedCalls[0].tokenUsage?.candidatesTokenCount, 100);
+    assert.equal(releasedCalls[0].tokenUsage?.totalTokenCount, 410);
+    assert.equal(committedCalls.length, 0);
+
+    // 2. Gemini succeeds with usageMetadata, then DB persistence fails (storage object rolled back + tokens preserved)
+    nextGeminiBehavior = 'with_usage';
+    nextSaveThrows = true;
+    const r2 = await postPngExtract();
+    assert.equal(r2.status, 409);
+    assert.equal(deletedKeys.length, 1);
+    assert.equal(releasedCalls.length, 2);
+    assert.equal(releasedCalls[1].tokenUsage?.usageAvailable, true);
+    assert.equal(releasedCalls[1].tokenUsage?.totalTokenCount, 410);
+    assert.equal(committedCalls.length, 0);
+
+    // 3. Gemini succeeds with missing usageMetadata, then storage fails
+    nextGeminiBehavior = 'without_usage';
+    nextPutThrows = true;
+    const r3 = await postPngExtract();
+    assert.equal(r3.status, 500);
+    assert.equal(releasedCalls.length, 3);
+    assert.equal(releasedCalls[2].tokenUsage?.usageAvailable, false);
+    assert.equal(releasedCalls[2].tokenUsage?.totalTokenCount, null);
+
+    // 4. Gemini fails before returning a response
+    nextGeminiBehavior = 'pre_response_fail';
+    const r4 = await postPngExtract();
+    assert.equal(r4.status, 502);
+    assert.equal(releasedCalls.length, 4);
+    assert.equal(releasedCalls[3].tokenUsage?.usageAvailable, false);
+    assert.equal(releasedCalls[3].tokenUsage?.totalTokenCount, null);
+
+    // 5. Successful extraction records token telemetry once & never invokes release
+    nextGeminiBehavior = 'with_usage';
+    const r5 = await postPngExtract();
+    assert.equal(r5.status, 201);
+    assert.equal(committedCalls.length, 1);
+    assert.equal(committedCalls[0].tokenUsage?.usageAvailable, true);
+    assert.equal(committedCalls[0].tokenUsage?.totalTokenCount, 410);
+    assert.equal(releasedCalls.length, 4);
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      server.closeAllConnections?.();
+      server.close((err) => (err ? reject(err) : resolve()));
+    });
+  }
+});
+
 test(
   'PostgreSQL integration: quotas, concurrency race protection, idempotency retries, storage reclaim on delete, legacy safety, and token logs',
   { skip: isSafeTestDbConfigured() ? false : TEST_DB_SKIP_REASON },
@@ -624,13 +1085,100 @@ test(
       assert.equal(afterIdempUsage.extractions.committed, 1);
       assert.equal(afterIdempUsage.tokens.unavailableEventsCount, 1);
 
-      // Set strict storage + extraction overrides to test storage enforcement, delete reclaim, and parallel concurrency
+      const rfq2Res = await client.request('/api/rfqs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: `Quota RFQ 2 ${tag}`,
+          items: [{ description: 'SS304 Nut', quantity: 5, uom: 'pcs' }],
+          invitedSupplierIds: [sup.id],
+        }),
+      });
+      const rfq2 = (await rfq2Res.json()) as { id: string };
+
+      const sup2Res = await client.request('/api/suppliers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: `Sup2-${tag}`, taxId: `27ALT${tag.slice(0, 6).toUpperCase()}` }),
+      });
+      const sup2 = (await sup2Res.json()) as { id: string };
+
+      // P1-1: Reusing same Idempotency-Key for a different RFQ or different supplier returns 409 Conflict
+      const diffRfqForm = new FormData();
+      diffRfqForm.set('supplierId', sup.id);
+      diffRfqForm.set('rawEmailText', 'Should not return rfq1 quotation');
+      const diffRfqRes = await client.request(`/api/rfqs/${rfq2.id}/quotes/extract`, {
+        method: 'POST',
+        headers: { 'Idempotency-Key': `idemp-${tag}-1` },
+        body: diffRfqForm,
+      });
+      assert.equal(diffRfqRes.status, 409);
+
+      const diffSupForm = new FormData();
+      diffSupForm.set('supplierId', sup2.id);
+      diffSupForm.set('rawEmailText', 'Should not return sup1 quotation');
+      const diffSupRes = await client.request(`/api/rfqs/${rfq.id}/quotes/extract`, {
+        method: 'POST',
+        headers: { 'Idempotency-Key': `idemp-${tag}-1` },
+        body: diffSupForm,
+      });
+      assert.equal(diffSupRes.status, 409);
+
+      // P1-1: Another organization using the exact same Idempotency-Key succeeds independently with zero cross-tenant exposure
+      const otherClient = new TestCookieClient(srv.baseUrl);
+      const otherReg = await otherClient.request('/api/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: `quota-other-${tag}@example.com`,
+          password: 'StrongPassword#2026',
+          fullName: 'Other Org Tester',
+          organizationName: `Other Quota Org ${tag}`,
+        }),
+      });
+      assert.equal(otherReg.status, 201);
+      const otherBody = (await otherReg.json()) as {
+        user: { id: string };
+        activeOrganization: { id: string };
+      };
+      createdOrgIds.push(otherBody.activeOrganization.id);
+      createdUserIds.push(otherBody.user.id);
+
+      const otherSup = (await (
+        await otherClient.request('/api/suppliers', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: `OtherSup-${tag}` }),
+        })
+      ).json()) as { id: string };
+      const otherRfq = (await (
+        await otherClient.request('/api/rfqs', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            title: `Other RFQ ${tag}`,
+            items: [{ description: 'Item', quantity: 2, uom: 'pcs' }],
+            invitedSupplierIds: [otherSup.id],
+          }),
+        })
+      ).json()) as { id: string };
+      const otherForm = new FormData();
+      otherForm.set('supplierId', otherSup.id);
+      otherForm.set('rawEmailText', 'Other org quote with identical idempotency key');
+      const otherExtract = await otherClient.request(`/api/rfqs/${otherRfq.id}/quotes/extract`, {
+        method: 'POST',
+        headers: { 'Idempotency-Key': `idemp-${tag}-1` },
+        body: otherForm,
+      });
+      assert.equal(otherExtract.status, 201);
+
+      // P2-2: Tight storage limit -> upload PNG #1 -> reject PNG #2 (429) -> DELETE PNG #1 -> upload PNG #2 WITHOUT raising limit
       const pngBuf = createMinimalValidPng();
       const singlePngSize = pngBuf.byteLength;
       await db
         .update(organizations)
         .set({
-          monthlyExtractionLimitOverride: 3, // already 1 used -> 2 slots left
+          monthlyExtractionLimitOverride: 10,
           storageLimitBytesOverride: singlePngSize + 10, // room for 1 PNG, not 2
         })
         .where(eq(organizations.id, orgId));
@@ -640,33 +1188,73 @@ test(
       uploadForm1.set('file', new Blob([new Uint8Array(pngBuf)], { type: 'image/png' }), 'quote1.png');
       const up1 = await client.request(`/api/rfqs/${rfq.id}/quotes/extract`, {
         method: 'POST',
+        headers: { 'Idempotency-Key': `idemp-${tag}-png1` },
         body: uploadForm1,
       });
       assert.equal(up1.status, 201);
       const qPng1 = (await up1.json()) as { id: string };
 
-      const uploadForm2 = new FormData();
-      uploadForm2.set('supplierId', sup.id);
-      uploadForm2.set('file', new Blob([new Uint8Array(pngBuf)], { type: 'image/png' }), 'quote2.png');
+      const usageAfterPng1 = (await (await client.request('/api/organization/usage')).json()) as {
+        storage: { usedBytes: number; activeReservedBytes: number };
+      };
+      assert.equal(usageAfterPng1.storage.usedBytes, singlePngSize);
+      assert.equal(usageAfterPng1.storage.activeReservedBytes, 0);
+
+      const uploadForm2Blocked = new FormData();
+      uploadForm2Blocked.set('supplierId', sup.id);
+      uploadForm2Blocked.set('file', new Blob([new Uint8Array(pngBuf)], { type: 'image/png' }), 'quote2.png');
       const up2 = await client.request(`/api/rfqs/${rfq.id}/quotes/extract`, {
         method: 'POST',
-        body: uploadForm2,
+        body: uploadForm2Blocked,
       });
       assert.equal(up2.status, 429);
       const up2Body = (await up2.json()) as { code: string };
       assert.equal(up2Body.code, 'STORAGE_QUOTA_EXCEEDED');
 
-      // Delete first PNG quotation -> storage reclaimed immediately -> next PNG succeeds (3rd extraction slot)
+      // Delete first PNG quotation -> storage reclaimed immediately
       const delRes = await client.request(`/api/quotations/${qPng1.id}`, {
         method: 'DELETE',
       });
       assert.equal(delRes.status, 200);
 
-      // Raise extraction override to 4 and allow storage for parallel concurrency test (2 slots left: used 2, limit 4)
+      // P1-1: Replaying the deleted quotation's Idempotency-Key returns deterministic 409 (never 500)
+      const deletedReplayForm = new FormData();
+      deletedReplayForm.set('supplierId', sup.id);
+      deletedReplayForm.set('file', new Blob([new Uint8Array(pngBuf)], { type: 'image/png' }), 'quote1.png');
+      const deletedReplayRes = await client.request(`/api/rfqs/${rfq.id}/quotes/extract`, {
+        method: 'POST',
+        headers: { 'Idempotency-Key': `idemp-${tag}-png1` },
+        body: deletedReplayForm,
+      });
+      assert.equal(deletedReplayRes.status, 409);
+
+      const usageAfterDelete = (await (await client.request('/api/organization/usage')).json()) as {
+        storage: { usedBytes: number; activeReservedBytes: number };
+      };
+      assert.equal(usageAfterDelete.storage.usedBytes, 0);
+      assert.equal(usageAfterDelete.storage.activeReservedBytes, 0);
+
+      // Upload second PNG WITHOUT increasing storageLimitBytesOverride -> succeeds
+      const uploadForm2Ok = new FormData();
+      uploadForm2Ok.set('supplierId', sup.id);
+      uploadForm2Ok.set('file', new Blob([new Uint8Array(pngBuf)], { type: 'image/png' }), 'quote2.png');
+      const up2Retry = await client.request(`/api/rfqs/${rfq.id}/quotes/extract`, {
+        method: 'POST',
+        body: uploadForm2Ok,
+      });
+      assert.equal(up2Retry.status, 201);
+
+      const usageAfterPng2 = (await (await client.request('/api/organization/usage')).json()) as {
+        storage: { usedBytes: number; activeReservedBytes: number };
+      };
+      assert.equal(usageAfterPng2.storage.usedBytes, singlePngSize);
+      assert.equal(usageAfterPng2.storage.activeReservedBytes, 0);
+
+      // Parallel concurrency test: currently committed = 3 (qNoMeta, qPng1, qPng2); set limit = 5 -> 2 slots left
       await db
         .update(organizations)
         .set({
-          monthlyExtractionLimitOverride: 4,
+          monthlyExtractionLimitOverride: 5,
           storageLimitBytesOverride: singlePngSize * 10,
         })
         .where(eq(organizations.id, orgId));
@@ -685,6 +1273,89 @@ test(
       );
       assert.equal(parallelStatuses.filter((s) => s === 201).length, 2);
       assert.equal(parallelStatuses.filter((s) => s === 429).length, 2);
+
+      // P1-2 PG test: maintenance releases expired 'reserved' row and NEVER overwrites 'committed' row (even with past expiresAt)
+      const pastExpiry = new Date(Date.now() - 60_000);
+      const futureExpiry = new Date(Date.now() + 600_000);
+      const expResId = `res-pg-exp-${tag}`;
+      const actResId = `res-pg-act-${tag}`;
+      const commPastResId = `res-pg-comm-${tag}`;
+      const periodMonth = getUtcPeriodBounds().periodMonth;
+
+      await db.insert(aiExtractionReservations).values([
+        {
+          id: expResId,
+          organizationId: orgId,
+          periodMonth,
+          rfqId: rfq.id,
+          supplierId: sup.id,
+          idempotencyKey: null,
+          reservedBytes: 123,
+          status: 'reserved',
+          expiresAt: pastExpiry,
+        },
+        {
+          id: actResId,
+          organizationId: orgId,
+          periodMonth,
+          rfqId: rfq.id,
+          supplierId: sup.id,
+          idempotencyKey: null,
+          reservedBytes: 123,
+          status: 'reserved',
+          expiresAt: futureExpiry,
+        },
+        {
+          id: commPastResId,
+          organizationId: orgId,
+          periodMonth,
+          rfqId: rfq.id,
+          supplierId: sup.id,
+          idempotencyKey: null,
+          reservedBytes: 123,
+          status: 'committed',
+          quotationId: qNoMeta.id,
+          expiresAt: pastExpiry,
+          finalizedAt: pastExpiry,
+        },
+      ]);
+
+      const maint1 = await runScheduledMaintenance({
+        db,
+        storageProvider: srv.storageProvider,
+        localStorageDir: srv.storageDir,
+      });
+      assert.ok((maint1.releasedExpiredReservations ?? 0) >= 1);
+
+      const [expAfter] = await db
+        .select()
+        .from(aiExtractionReservations)
+        .where(eq(aiExtractionReservations.id, expResId));
+      const [actAfter] = await db
+        .select()
+        .from(aiExtractionReservations)
+        .where(eq(aiExtractionReservations.id, actResId));
+      const [commAfter] = await db
+        .select()
+        .from(aiExtractionReservations)
+        .where(eq(aiExtractionReservations.id, commPastResId));
+      assert.equal(expAfter?.status, 'released');
+      assert.equal(actAfter?.status, 'reserved');
+      assert.equal(commAfter?.status, 'committed');
+
+      // Re-running maintenance is idempotent
+      const maint2 = await runScheduledMaintenance({
+        db,
+        storageProvider: srv.storageProvider,
+        localStorageDir: srv.storageDir,
+      });
+      assert.equal(maint2.releasedExpiredReservations, 0);
+
+      // Clean up active synthetic test reservation before final assertion
+      await db
+        .update(aiExtractionReservations)
+        .set({ status: 'released' })
+        .where(eq(aiExtractionReservations.id, actResId));
 
       // Legacy plan org bypasses starter quota cleanly
       await db
@@ -705,19 +1376,18 @@ test(
       });
       assert.equal(legacyRes.status, 201);
 
-      const periodMonth = getUtcPeriodBounds().periodMonth;
       const [monthlyDbRow] = await db
         .select()
         .from(organizationMonthlyUsage)
         .where(eq(organizationMonthlyUsage.organizationId, orgId));
       assert.equal(monthlyDbRow.periodMonth, periodMonth);
-      assert.equal(monthlyDbRow.committedExtractions, 5);
+      assert.equal(monthlyDbRow.committedExtractions, 6);
 
       const tokRows = await db
         .select()
         .from(aiTokenUsageLogs)
         .where(eq(aiTokenUsageLogs.organizationId, orgId));
-      assert.ok(tokRows.length >= 6);
+      assert.ok(tokRows.length >= 7);
 
       const resRows = await db
         .select()

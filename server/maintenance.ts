@@ -343,9 +343,13 @@ export async function runScheduledMaintenance(params: {
         .update(aiExtractionReservations)
         .set({ status: 'released', finalizedAt: now })
         .where(
-          inArray(
-            aiExtractionReservations.id,
-            staleReservations.map((r) => r.id)
+          and(
+            inArray(
+              aiExtractionReservations.id,
+              staleReservations.map((r) => r.id)
+            ),
+            eq(aiExtractionReservations.status, 'reserved'),
+            lte(aiExtractionReservations.expiresAt, now)
           )
         )
         .returning({ id: aiExtractionReservations.id });
