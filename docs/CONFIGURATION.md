@@ -8,7 +8,7 @@
 | `SQL_PORT` | No | `5432` | PostgreSQL port |
 | `SQL_DB_NAME` | Yes (runtime) | *(unset)* | PostgreSQL database name |
 | `SQL_USER` | Yes (runtime) | *(unset)* | PostgreSQL application user |
-| `SQL_PASSWORD` | Yes (runtime) | *(unset)* | PostgreSQL application password |
+| `SQL_PASSWORD` | Yes (runtime; **non-placeholder in prod**) | *(unset)* | PostgreSQL application password. In `NODE_ENV=production`, rejects missing, empty, masked (`••••`/`****`), and placeholder values (`MY_*`, `YOUR_*`, `CHANGEME`, `REPLACE_ME`, `PLACEHOLDER`, including quoted values); empty `""` remains compatible with local non-production trust auth while masked values are treated as unconfigured |
 | `SQL_SSL` | No | `false` | Set `'true'` for TCP TLS PostgreSQL connections (`rejectUnauthorized: true` enforced by default; bypassed on Cloud SQL Unix socket `/...`) |
 | `SQL_SSL_CA` | No | *(unset)* | Optional PostgreSQL TLS CA certificate (inline PEM content or local `.pem` file path) passed to `pg.Pool` when `SQL_SSL=true` |
 | `SQL_SSL_ALLOW_SELF_SIGNED` | No | `false` | Set `'true'` only when connecting to a private non-CA self-signed PostgreSQL endpoint (`rejectUnauthorized: false`) |
@@ -20,7 +20,7 @@
 | `STORAGE_PROVIDER` | No | `local` | `'local'` (private filesystem `data/private-storage/`) or `'s3'` (AWS SigV4 object storage) |
 | `LOCAL_STORAGE_DIR` | No | `data/private-storage` | Private local object storage directory when `STORAGE_PROVIDER=local` |
 | `S3_ENDPOINT` | If `STORAGE_PROVIDER=s3` | *(unset)* | S3 / Cloudflare R2 / MinIO endpoint URL |
-| `S3_REGION` | No | `auto` | S3 region for SigV4 signing (`us-east-1`, `ap-south-1`, `auto`) |
+| `S3_REGION` | No | `auto` | S3 region for SigV4 signing (`us-east-1`, `ap-south-1`, `auto`); unset, empty, or masked (`••••`/`****`) values resolve to `auto`, while configured regions trim surrounding quotes/whitespace |
 | `S3_BUCKET` | If `STORAGE_PROVIDER=s3` | *(unset)* | Private bucket name (block all public access) |
 | `S3_ACCESS_KEY_ID` | If `STORAGE_PROVIDER=s3` | *(unset)* | S3 access key ID |
 | `S3_SECRET_ACCESS_KEY` | If `STORAGE_PROVIDER=s3` | *(unset)* | S3 secret access key |

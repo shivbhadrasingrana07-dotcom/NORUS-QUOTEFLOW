@@ -450,7 +450,7 @@ export function createObjectStorageProvider(
 
   if (mode === 's3') {
     const endpoint = stripSurroundingQuotes(env.S3_ENDPOINT || '');
-    const region = stripSurroundingQuotes(env.S3_REGION || '') || 'auto';
+    const region = normalizeOptionalEnvValue(env.S3_REGION) || 'auto';
     const bucket = stripSurroundingQuotes(env.S3_BUCKET || '');
     const accessKeyId = stripSurroundingQuotes(env.S3_ACCESS_KEY_ID || '');
     const secretAccessKey = stripSurroundingQuotes(env.S3_SECRET_ACCESS_KEY || '');

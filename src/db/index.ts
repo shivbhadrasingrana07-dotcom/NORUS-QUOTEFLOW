@@ -4,22 +4,54 @@ import { Pool } from 'pg';
 import * as schema from './schema.ts';
 import {
   isMaskedEnvPlaceholder,
+  isPlaceholderSecret,
   normalizeOptionalEnvValue,
   redactSensitiveText,
+  stripSurroundingQuotes,
 } from '../../server/security.ts';
 
 declare global {
   var _postgresPool: Pool | undefined;
 }
 
-export function isSqlEnvConfigured(): boolean {
+export function resolveSqlPassword(
+  env: Record<string, string | undefined> = process.env
+): string | undefined {
+  if (env.SQL_PASSWORD === undefined || isMaskedEnvPlaceholder(env.SQL_PASSWORD)) {
+    return undefined;
+  }
+  return stripSurroundingQuotes(env.SQL_PASSWORD);
+}
+
+export function isSqlEnvConfigured(
+  env: Record<string, string | undefined> = process.env
+): boolean {
+  const isProd = normalizeOptionalEnvValue(env.NODE_ENV).toLowerCase() === 'production';
+  const passwordValid = isProd
+    ? !isPlaceholderSecret(env.SQL_PASSWORD)
+    : env.SQL_PASSWORD !== undefined && !isMaskedEnvPlaceholder(env.SQL_PASSWORD);
   return Boolean(
-    normalizeOptionalEnvValue(process.env.SQL_HOST) &&
-      normalizeOptionalEnvValue(process.env.SQL_USER) &&
-      process.env.SQL_PASSWORD !== undefined &&
-      !isMaskedEnvPlaceholder(process.env.SQL_PASSWORD) &&
-      normalizeOptionalEnvValue(process.env.SQL_DB_NAME)
+    normalizeOptionalEnvValue(env.SQL_HOST) &&
+      normalizeOptionalEnvValue(env.SQL_USER) &&
+      passwordValid &&
+      normalizeOptionalEnvValue(env.SQL_DB_NAME)
   );
+}
+
+export function validateProductionSqlConfig(
+  env: Record<string, string | undefined> = process.env
+): void {
+  if (
+    !isSqlEnvConfigured(env) ||
+    isPlaceholderSecret(env.SQL_HOST) ||
+    isPlaceholderSecret(env.SQL_USER) ||
+    isPlaceholderSecret(env.SQL_PASSWORD) ||
+    isPlaceholderSecret(env.SQL_DB_NAME)
+  ) {
+    throw new Error(
+      'PostgreSQL configuration (SQL_HOST, SQL_USER, SQL_PASSWORD, SQL_DB_NAME) must be non-placeholder and is required in production. Failing closed.'
+    );
+  }
 }
 
 export function buildPgSslConfig(
@@ -67,10 +99,7 @@ export const createPool = () => {
           ? parsedPort
           : undefined,
       user: normalizeOptionalEnvValue(process.env.SQL_USER) || undefined,
-      password:
-        process.env.SQL_PASSWORD !== undefined && !isMaskedEnvPlaceholder(process.env.SQL_PASSWORD)
-          ? process.env.SQL_PASSWORD
-          : undefined,
+      password: resolveSqlPassword(process.env),
       database: normalizeOptionalEnvValue(process.env.SQL_DB_NAME) || undefined,
       ssl: buildPgSslConfig(process.env),
       max: 10,

@@ -23,6 +23,11 @@ import { PgDataStore, StoreError } from '../server/pgStore.ts';
 import { adminAuth, verifyFirebaseIdToken } from '../server/firebase-admin.ts';
 import { generateSecureToken, sha256Hex } from '../server/security.ts';
 import {
+  isSqlEnvConfigured,
+  resolveSqlPassword,
+  validateProductionSqlConfig,
+} from '../src/db/index.ts';
+import {
   invitations,
   organizationMemberships,
   organizations,
@@ -327,6 +332,215 @@ test('Task 019A: production startup rejects missing/placeholder APP_URL, local/m
     process.env.EMAIL_FROM = 'NORUS QUOTEFLOW <noreply@norus.in>';
     const prodApp = await createApp({ enableVite: false, db: {} as never });
     assert.equal(typeof prodApp, 'function');
+  } finally {
+    for (const k of trackedKeys) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  }
+});
+
+test('Task 019A.2: S3_REGION normalizes missing, empty, masked, and quoted masked values to "auto" while preserving valid regions and validation', async () => {
+  const baseEnv = {
+    NODE_ENV: 'production',
+    STORAGE_PROVIDER: 's3',
+    S3_ENDPOINT: 'https://r2.example.com',
+    S3_BUCKET: 'norus-private',
+    S3_ACCESS_KEY_ID: 'AKIAVALIDKEY123',
+    S3_SECRET_ACCESS_KEY: 'valid-secret-key-abc',
+  };
+
+  async function resolveSignedRegion(regionInput: string | undefined): Promise<string> {
+    const provider = createObjectStorageProvider({
+      ...baseEnv,
+      ...(regionInput === undefined ? {} : { S3_REGION: regionInput }),
+    });
+    assert.equal(provider.mode, 's3');
+    const signed = await provider.createSignedDownloadUrl({
+      documentId: 'doc-1',
+      storageKey: 'orgs/org-1/docs/doc-1/quote.pdf',
+      organizationId: 'org-1',
+      filename: 'quote.pdf',
+    });
+    const credential = new URL(signed.url).searchParams.get('X-Amz-Credential') || '';
+    const parts = credential.split('/');
+    return parts[2] || '';
+  }
+
+  assert.equal(await resolveSignedRegion(undefined), 'auto');
+  assert.equal(await resolveSignedRegion(''), 'auto');
+  assert.equal(await resolveSignedRegion('   '), 'auto');
+  assert.equal(await resolveSignedRegion('••••'), 'auto');
+  assert.equal(await resolveSignedRegion('****'), 'auto');
+  assert.equal(await resolveSignedRegion('"••••"'), 'auto');
+  assert.equal(await resolveSignedRegion("'****'"), 'auto');
+  assert.equal(await resolveSignedRegion('auto'), 'auto');
+  assert.equal(await resolveSignedRegion('ap-south-1'), 'ap-south-1');
+  assert.equal(await resolveSignedRegion(' "us-east-1" '), 'us-east-1');
+
+  // Existing S3 endpoint and credential fail-closed validation remains intact even when S3_REGION is valid
+  assert.throws(
+    () =>
+      createObjectStorageProvider({
+        ...baseEnv,
+        S3_REGION: 'ap-south-1',
+        S3_ENDPOINT: 'ftp://invalid.example.com',
+      }),
+    /S3_ENDPOINT must use http or https/i
+  );
+  assert.throws(
+    () =>
+      createObjectStorageProvider({
+        ...baseEnv,
+        S3_REGION: 'ap-south-1',
+        S3_SECRET_ACCESS_KEY: 'MY_S3_SECRET',
+      }),
+    /STORAGE_PROVIDER=s3 requires valid/i
+  );
+});
+
+test('Task 019A.2: SQL_PASSWORD rejects missing, empty, masked, and placeholder values in production while preserving valid passwords and dev/test compatibility', async () => {
+  const validProdSql = {
+    NODE_ENV: 'production',
+    SQL_HOST: '127.0.0.1',
+    SQL_USER: 'norus_app',
+    SQL_DB_NAME: 'quoteflow',
+  };
+
+  // 1. Production rejects missing, empty, masked, and placeholder SQL_PASSWORD values
+  const badProdPasswords: Array<string | undefined> = [
+    undefined,
+    '',
+    '   ',
+    '""',
+    '••••',
+    '****',
+    '"••••"',
+    'MY_SQL_PASSWORD',
+    'my_db_pass',
+    'YOUR_SQL_PASSWORD',
+    'your_secret',
+    'CHANGEME',
+    'changeme',
+    '"CHANGEME"',
+    'REPLACE_ME',
+    'replace_me',
+    'PLACEHOLDER',
+    'placeholder',
+  ];
+
+  for (const badPassword of badProdPasswords) {
+    const envCase: Record<string, string | undefined> = { ...validProdSql };
+    if (badPassword !== undefined) {
+      envCase.SQL_PASSWORD = badPassword;
+    }
+    assert.equal(
+      isSqlEnvConfigured(envCase),
+      false,
+      `Expected isSqlEnvConfigured to reject production SQL_PASSWORD=${String(badPassword)}`
+    );
+    assert.throws(
+      () => validateProductionSqlConfig(envCase),
+      /PostgreSQL configuration.*required in production/i
+    );
+  }
+
+  // 2. Production accepts legitimate unquoted and quoted passwords
+  const legitimateSecret = 'NorusProdDbPass#2026!';
+  assert.equal(
+    isSqlEnvConfigured({ ...validProdSql, SQL_PASSWORD: legitimateSecret }),
+    true
+  );
+  assert.doesNotThrow(() =>
+    validateProductionSqlConfig({ ...validProdSql, SQL_PASSWORD: legitimateSecret })
+  );
+  assert.doesNotThrow(() =>
+    validateProductionSqlConfig({ ...validProdSql, SQL_PASSWORD: `"${legitimateSecret}"` })
+  );
+  assert.equal(resolveSqlPassword({ SQL_PASSWORD: `"${legitimateSecret}"` }), legitimateSecret);
+
+  // 3. Development/test compatibility: empty SQL_PASSWORD="" still supported for local trust auth, while masked values stay ignored
+  assert.equal(
+    isSqlEnvConfigured({
+      NODE_ENV: 'development',
+      SQL_HOST: '127.0.0.1',
+      SQL_USER: 'postgres',
+      SQL_PASSWORD: '',
+      SQL_DB_NAME: 'quoteflow_dev',
+    }),
+    true
+  );
+  assert.equal(
+    isSqlEnvConfigured({
+      NODE_ENV: 'test',
+      SQL_HOST: '127.0.0.1',
+      SQL_USER: 'postgres',
+      SQL_PASSWORD: '',
+      SQL_DB_NAME: 'quoteflow_test',
+    }),
+    true
+  );
+  assert.equal(resolveSqlPassword({ SQL_PASSWORD: '' }), '');
+  assert.equal(resolveSqlPassword({ SQL_PASSWORD: '••••' }), undefined);
+  assert.equal(
+    isSqlEnvConfigured({
+      NODE_ENV: 'development',
+      SQL_HOST: '127.0.0.1',
+      SQL_USER: 'postgres',
+      SQL_PASSWORD: '••••',
+      SQL_DB_NAME: 'quoteflow_dev',
+    }),
+    false
+  );
+
+  // 4. Full createApp() production boot enforces SQL_PASSWORD without DB socket connection when options.db is omitted
+  const trackedKeys = [
+    'NODE_ENV',
+    'DEMO_MODE',
+    'SESSION_SECRET',
+    'APP_URL',
+    'STORAGE_PROVIDER',
+    'S3_ENDPOINT',
+    'S3_BUCKET',
+    'S3_ACCESS_KEY_ID',
+    'S3_SECRET_ACCESS_KEY',
+    'RESEND_API_KEY',
+    'EMAIL_FROM',
+    'SQL_HOST',
+    'SQL_USER',
+    'SQL_PASSWORD',
+    'SQL_DB_NAME',
+  ] as const;
+  const saved: Record<string, string | undefined> = {};
+  for (const k of trackedKeys) saved[k] = process.env[k];
+
+  try {
+    process.env.NODE_ENV = 'production';
+    delete process.env.DEMO_MODE;
+    process.env.SESSION_SECRET = '0123456789abcdef0123456789abcdef-prod-test';
+    process.env.APP_URL = 'https://app.norus.in';
+    process.env.STORAGE_PROVIDER = 's3';
+    process.env.S3_ENDPOINT = 'https://r2.example.com';
+    process.env.S3_BUCKET = 'norus-private';
+    process.env.S3_ACCESS_KEY_ID = 'AKIAVALIDKEY123';
+    process.env.S3_SECRET_ACCESS_KEY = 'valid-secret-key-abc';
+    process.env.RESEND_API_KEY = 're_live_valid_test_key';
+    process.env.EMAIL_FROM = 'NORUS QUOTEFLOW <noreply@norus.in>';
+    process.env.SQL_HOST = '127.0.0.1';
+    process.env.SQL_USER = 'norus_app';
+    process.env.SQL_DB_NAME = 'quoteflow';
+
+    for (const bad of ['••••', 'MY_SQL_PASSWORD', 'YOUR_SQL_PASSWORD', 'CHANGEME', 'REPLACE_ME', 'PLACEHOLDER', '']) {
+      process.env.SQL_PASSWORD = bad;
+      await assert.rejects(
+        () => createApp({ enableVite: false }),
+        /PostgreSQL configuration.*required in production/i
+      );
+    }
+
+    process.env.SQL_PASSWORD = legitimateSecret;
+    const app = await createApp({ enableVite: false });
+    assert.equal(typeof app, 'function');
   } finally {
     for (const k of trackedKeys) {
       if (saved[k] === undefined) delete process.env[k];

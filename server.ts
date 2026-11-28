@@ -7,7 +7,13 @@ import path from 'path';
 import { pathToFileURL } from 'url';
 import { createServer as createViteServer } from 'vite';
 import type { AiTokenUsageTelemetry } from './src/types.ts';
-import { db as defaultDb, type DrizzleDb, isSqlEnvConfigured, pool as defaultPool } from './src/db/index.ts';
+import {
+  db as defaultDb,
+  type DrizzleDb,
+  isSqlEnvConfigured,
+  pool as defaultPool,
+  validateProductionSqlConfig,
+} from './src/db/index.ts';
 import { createEmailProvider, type EmailProvider } from './server/emailService.ts';
 import { validateUploadedFile } from './server/fileSecurity.ts';
 import {
@@ -336,16 +342,8 @@ export async function createApp(options: AppOptions = {}) {
     // Fail closed before initializing providers or mounting routes if required production configuration is missing/placeholder
     getSigningSecret();
     validatedProdAppUrl = resolveProductionAppUrl({ appUrlOverride: options.appUrl });
-    if (
-      !options.db &&
-      (!isSqlEnvConfigured() ||
-        isPlaceholderSecret(process.env.SQL_HOST) ||
-        isPlaceholderSecret(process.env.SQL_USER) ||
-        isPlaceholderSecret(process.env.SQL_DB_NAME))
-    ) {
-      throw new Error(
-        'PostgreSQL configuration (SQL_HOST, SQL_USER, SQL_PASSWORD, SQL_DB_NAME) is required in production.'
-      );
+    if (!options.db) {
+      validateProductionSqlConfig();
     }
   }
 
